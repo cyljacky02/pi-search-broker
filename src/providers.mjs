@@ -8,14 +8,14 @@ export const ACTION = Object.freeze({
   RETRY: 'retry',            // provider-wide transient problem: back off and retry, no account penalty
   PASSTHROUGH: 'passthrough' // the request itself was rejected: return it to the client
 });
-/** How a failure changes the account's state (applied by the account pool when a reservation fails). */
+/** What a failure says about the account. pool/health.mjs decides what each one does to account state. */
 export const EFFECT = Object.freeze({
-  AUTH: 'auth',             // disabled until re-enabled
-  BLOCKED: 'blocked',       // provider revoked access; disabled until re-enabled
-  QUOTA: 'quota',           // out of credit until the next reset / promo change
-  RATE_LIMIT: 'rate-limit', // cooldown from Retry-After
-  FORBIDDEN: 'forbidden',   // 10-minute cooldown
-  UPSTREAM: 'upstream'      // 10-second cooldown after a 5xx or network failure
+  AUTH: 'auth',             // the key is not accepted
+  BLOCKED: 'blocked',       // the provider revoked access
+  QUOTA: 'quota',           // out of credit
+  RATE_LIMIT: 'rate-limit', // too many requests (see the verdict's retryAfterMs)
+  FORBIDDEN: 'forbidden',   // refused for an undocumented reason
+  UPSTREAM: 'upstream'      // the provider failed (5xx or network)
 });
 /** How a failure is reported if every account ends up failing. */
 export const EXHAUST = Object.freeze({
@@ -48,10 +48,19 @@ export function redact(text, secrets = []) {
 }
 const clip = (s, secrets) => redact(s, secrets).slice(0, 500);
 
+/** Retry-After as milliseconds from `now`: delta-seconds or an HTTP date. 0 when absent or unusable. */
+export function retryAfterMs(headers, now) {
+  const value = headers?.get?.('retry-after');
+  if (typeof value !== 'string') return 0;
+  if (/^\d+(\.\d+)?$/.test(value.trim())) return Math.round(Number(value.trim()) * 1000);
+  const d = Date.parse(value);
+  return Number.isFinite(d) ? Math.max(0, d - now) : 0;
+}
+
 /** Rules shared by both providers; returns null when the provider-specific rules decide. */
-function commonVerdict(status, tag) {
+function commonVerdict(status, tag, headers, now) {
   if (status === 401) return verdict(ACTION.ROTATE, EFFECT.AUTH, EXHAUST.QUOTA, tag);
-  if (status === 429) return verdict(ACTION.ROTATE, EFFECT.RATE_LIMIT, EXHAUST.QUOTA, tag);
+  if (status === 429) return verdict(ACTION.ROTATE, EFFECT.RATE_LIMIT, EXHAUST.QUOTA, tag, { retryAfterMs: retryAfterMs(headers, now) });
   if (status >= 500) return verdict(ACTION.ROTATE, EFFECT.UPSTREAM, EXHAUST.TRANSIENT, tag);
   return null;
 }
@@ -107,14 +116,15 @@ const exa = Object.freeze({
     return typeof raw === 'string' && REQUEST_ID.test(raw) ? raw : null;
   },
 
-  classify(path, status, parsed, headers) {
+  /** Verdict for a non-2xx reply: { action, effect, exhaust, tag, once?, retryAfterMs? } (see ACTION / EFFECT / EXHAUST). */
+  classify(status, parsed, headers, now = Date.now()) {
     const tag = exaTag(parsed);
     if (status === 503) return verdict(ACTION.RETRY, null, EXHAUST.TRANSIENT, tag); // SERVICE_OVERLOADED: not billed
     if (status === 429 && String(headers?.get?.('x-ratelimit-scope') || '').toLowerCase() === 'network') {
       // A network-scoped limit hits every account behind this IP; rotating would just burn through them.
       return verdict(ACTION.PASSTHROUGH, null, EXHAUST.QUOTA, tag);
     }
-    const common = commonVerdict(status, tag);
+    const common = commonVerdict(status, tag, headers, now);
     if (common) return common;
     if (status === 402) {
       // X402_PAYMENT_REQUIRED means no key reached Exa at all: a broker/config problem, not an empty balance.
@@ -185,8 +195,8 @@ const tavily = Object.freeze({
   reportedCost: (data) => (isNonNegativeNumber(data?.usage?.credits) ? data.usage.credits : null),
   requestId: (data) => (typeof data?.request_id === 'string' && REQUEST_ID.test(data.request_id) ? data.request_id : null),
 
-  classify(_path, status) {
-    const common = commonVerdict(status, null);
+  classify(status, _parsed, headers, now = Date.now()) {
+    const common = commonVerdict(status, null, headers, now);
     if (common) return common;
     if (status === 402 || status === 432 || status === 433) return verdict(ACTION.ROTATE, EFFECT.QUOTA, EXHAUST.QUOTA);
     // Undocumented for /search: short cooldown rather than a permanent disable.

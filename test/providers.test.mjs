@@ -6,7 +6,7 @@ import { PROVIDERS, ACTION, EFFECT } from '../src/providers.mjs';
 const quote = (provider, path, body) => PROVIDERS[provider].quote(path, body);
 
 test('Exa 402 X402_PAYMENT_REQUIRED is a credential problem, other 402 is quota; network 429 passes through', () => {
-  const classify = (...args) => PROVIDERS.exa.classify('/search', ...args);
+  const classify = (...args) => PROVIDERS.exa.classify(...args);
   assert.equal(classify(402, { tag: 'X402_PAYMENT_REQUIRED' }).effect, EFFECT.AUTH);
   assert.equal(classify(402, { tag: 'NO_MORE_CREDITS' }).effect, EFFECT.QUOTA);
   const network = { get: (h) => (h === 'x-ratelimit-scope' ? 'network' : null) };
@@ -56,4 +56,17 @@ test('Exa /credits parsing', () => {
   const r = PROVIDERS.exa.balance.parse({ credits_usd: 42.5, expiring_credits: [{ amount_usd: 30, expires_at: '2026-12-01T00:00:00Z' }], metadata: { generated_at: '2026-11-09T05:59:00Z' } });
   assert.equal(r.remaining, 42.5);
   assert.deepEqual(r.details.expiringCredits, [{ amountUsd: 30, expiresAt: '2026-12-01T00:00:00Z' }]);
+});
+
+test('A 429 verdict carries Retry-After in ms, from delta-seconds or an HTTP date', () => {
+  const now = Date.parse('2026-11-09T06:00:00Z');
+  const headers = (value) => new Headers(value === undefined ? {} : { 'retry-after': value });
+  const classify = (h) => PROVIDERS.tavily.classify(429, null, h, now);
+  assert.equal(classify(headers('45')).retryAfterMs, 45000);
+  assert.equal(classify(headers('1.5')).retryAfterMs, 1500);
+  assert.equal(classify(headers('Mon, 09 Nov 2026 06:01:00 GMT')).retryAfterMs, 60000);
+  assert.equal(classify(headers('Mon, 09 Nov 2026 05:00:00 GMT')).retryAfterMs, 0, 'a date in the past means now');
+  assert.equal(classify(headers('soon')).retryAfterMs, 0);
+  assert.equal(classify(headers()).retryAfterMs, 0);
+  assert.equal(classify(headers('45')).effect, EFFECT.RATE_LIMIT);
 });

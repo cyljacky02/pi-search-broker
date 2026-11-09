@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAccountPool } from '../src/pool.mjs';
 import { fileStore, memoryStore } from '../src/pool/store.mjs';
+import { nextCreditChange } from '../src/pool/allocation.mjs';
 import { ROUTES, EFFECT } from '../src/providers.mjs';
 import { config, exa, tavily, DATE } from './helpers.mjs';
 
@@ -143,4 +144,22 @@ test('fileStore persists state without keys; a read-only fileStore never writes'
     writeFileSync(path, JSON.stringify({ version: 99, accounts: {} }));
     assert.throws(() => poolOf(cfg, { ms: DATE }, fileStore(path)), /Unsupported/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// Internal seam: the quota retry calendar, as a table.
+test('An out-of-credit account is retried at the earliest monthly reset or upcoming promo expiry', () => {
+  const now = Date.parse('2026-11-09T06:00:00Z');
+  const monthly = (resetDay) => ({ id: `m${resetDay}`, period: 'monthly', limit: 10, resetDay });
+  const promo = (expiresAt) => ({ id: `p${expiresAt}`, period: 'once', limit: 10, expiresAt });
+  const cases = [
+    [[monthly(1)], '2026-12-01T00:00:00.000Z'],
+    [[monthly(1), monthly(15)], '2026-11-15T00:00:00.000Z'],
+    [[monthly(1), promo('2026-11-20T00:00:00Z')], '2026-11-20T00:00:00.000Z'],
+    [[monthly(1), promo('2026-11-01T00:00:00Z')], '2026-12-01T00:00:00.000Z', 'an already-expired promo changes nothing'],
+    [[{ id: 'bonus', period: 'once', limit: 10, expires: 'never' }], null]
+  ];
+  for (const [allocations, expected, why] of cases) {
+    const at = nextCreditChange(allocations, now);
+    assert.equal(at ? new Date(at).toISOString() : null, expected, why);
+  }
 });

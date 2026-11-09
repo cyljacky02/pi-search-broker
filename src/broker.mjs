@@ -13,12 +13,6 @@ const MAX_ERROR_BODY = 64 * 1024;
 const STREAM_REJECTED = 'Streaming responses (stream: true) are not supported by the local search broker';
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function retryAfterMs(value, now) {
-  if (typeof value !== 'string') return 0;
-  if (/^\d+(\.\d+)?$/.test(value.trim())) return Math.round(Number(value.trim()) * 1000);
-  const d = Date.parse(value);
-  return Number.isFinite(d) ? Math.max(0, d - now) : 0;
-}
 async function readErrorJson(response) {
   let text = '';
   try { text = (await response.text()).slice(0, MAX_ERROR_BODY); } catch { /* treat as empty */ }
@@ -75,10 +69,10 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
       if (!upstream.ok) {
         const code = upstream.status;
         const parsed = await readErrorJson(upstream);
-        const verdict = policy.classify(route.path, code, parsed, upstream.headers);
+        const verdict = policy.classify(code, parsed, upstream.headers, now());
         reservation.fail({
-          status: code, effect: verdict.effect, tag: verdict.tag, requestId: policy.requestId(parsed, upstream.headers),
-          retryAfterMs: retryAfterMs(upstream.headers.get('retry-after'), now())
+          status: code, effect: verdict.effect, tag: verdict.tag, retryAfterMs: verdict.retryAfterMs,
+          requestId: policy.requestId(parsed, upstream.headers)
         });
         const upstreamError = { done: { status: code >= 400 && code < 500 ? code : 502, body: policy.sanitizeError(code, parsed, secrets) } };
         if (verdict.action === ACTION.PASSTHROUGH) return upstreamError;

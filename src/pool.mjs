@@ -2,15 +2,14 @@
 // Reservation, which ends exactly once; everything else (allocation windows, promo-first ordering, held credit,
 // cooldowns, quota re-opening, persistence, the attempt log) stays behind this interface.
 // Never exposes key material in persisted state or user-facing status.
-import { monthlyWindow } from './config.mjs';
-import { EFFECT, PROVIDERS } from './providers.mjs';
+import { PROVIDERS } from './providers.mjs';
 import { round6, isNonNegativeNumber } from './numbers.mjs';
 import { STATE_VERSION } from './pool/store.mjs';
+import { windowOf, isActive, spendingOrder } from './pool/allocation.mjs';
+import { applyFailure, recover, isUsable } from './pool/health.mjs';
 
 const capAtZero = (n) => Math.max(0, n);
-const COOLDOWN_MS = Object.freeze({ [EFFECT.FORBIDDEN]: 10 * 60 * 1000, [EFFECT.UPSTREAM]: 10 * 1000 });
 const RECENT_LIMIT = 50;
-const expiryOf = (a) => (a.expiresAt ? Date.parse(a.expiresAt) : Infinity);
 
 /**
  * @param accounts  validated config accounts (with resolved keys; the keys never leave this process)
@@ -35,18 +34,15 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
       const entry = state.accounts[account.id] ?? { buckets: {}, disabled: null, cooldownUntil: 0, blockedUntil: 0, requests: 0, failures: 0 };
       entry.buckets ??= {};
       entry.possiblyBilled ??= 0;
+      let newWindow = false;
       for (const allocation of account.allocations) {
-        const window = allocation.period === 'monthly' ? monthlyWindow(now(), allocation.resetDay ?? 1).key : 'once';
+        const window = windowOf(allocation, now());
         if (entry.buckets[allocation.id]?.window !== window) {
           entry.buckets[allocation.id] = { window, spent: 0, exactCalls: 0, estimatedCalls: 0 };
-          if (entry.disabled === 'quota') { entry.disabled = null; entry.blockedUntil = 0; }
+          newWindow = true;
         }
       }
-      if (entry.disabled === 'quota' && entry.blockedUntil && now() >= entry.blockedUntil) {
-        entry.disabled = null;
-        entry.blockedUntil = 0;
-      }
-      if (entry.cooldownUntil && entry.cooldownUntil <= now()) { entry.cooldownUntil = 0; entry.cooldownReason = null; }
+      recover(entry, now(), { newWindow });
       state.accounts[account.id] = entry;
     }
   }
@@ -59,17 +55,10 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   /** Allocations that can be spent now, in spending order, with what is left after open reservations. */
   function activeAllocations(account) {
     const entry = state.accounts[account.id];
-    return account.allocations
-      .filter((a) => expiryOf(a) > now() && (!a.startsAt || Date.parse(a.startsAt) <= now()))
-      .map((a) => {
-        const nextReset = a.period === 'monthly' ? monthlyWindow(now(), a.resetDay ?? 1).nextReset : Infinity;
-        const deadline = Math.min(nextReset, expiryOf(a));
-        const remaining = capAtZero(a.limit - (entry.buckets[a.id]?.spent || 0) - held(account.id, a.id));
-        return { ...a, remaining, deadline };
-      })
-      .filter((a) => a.remaining > 1e-9)
-      // Spend short-lived one-time promo grants before recurring free allowances (Exa also draws soonest-expiring first).
-      .sort((a, b) => Number(b.period === 'once') - Number(a.period === 'once') || a.deadline - b.deadline || b.remaining - a.remaining);
+    return spendingOrder(account.allocations, now(), {
+      spentOf: (id) => entry.buckets[id]?.spent || 0,
+      heldOf: (id) => held(account.id, id)
+    });
   }
   const available = (account) => activeAllocations(account).reduce((s, a) => s + a.remaining, 0);
 
@@ -77,8 +66,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     const options = [];
     for (const account of accounts) {
       if (account.provider !== provider || excluded.has(account.id)) continue;
-      const entry = state.accounts[account.id];
-      if (entry.disabled || (entry.cooldownUntil && entry.cooldownUntil > now())) continue;
+      if (!isUsable(state.accounts[account.id], now())) continue;
       const usable = activeAllocations(account);
       const total = usable.reduce((s, a) => s + a.remaining, 0);
       if (!usable.length || total + 1e-9 < amount) continue;
@@ -110,33 +98,6 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
       entry.lastSuccessAt = new Date(now()).toISOString();
     }
     if (requestId) entry.lastRequestId = requestId;
-  }
-
-  function applyFailure(account, { status, effect = null, retryAfterMs = 0, tag = null }) {
-    const entry = state.accounts[account.id];
-    entry.failures++;
-    entry.lastFailureAt = new Date(now()).toISOString();
-    entry.lastStatus = status;
-    entry.lastErrorTag = tag;
-    if (effect === EFFECT.AUTH || effect === EFFECT.BLOCKED) {
-      entry.disabled = effect; // Explicit unblocking required after fixing credentials / contacting the provider.
-    } else if (effect === EFFECT.QUOTA) {
-      entry.disabled = 'quota';
-      // Promo expiry may activate the account's free allowance before the next monthly reset.
-      const upcomingPromoExpiry = account.allocations
-        .filter((a) => a.period === 'once' && a.expiresAt && Date.parse(a.expiresAt) > now())
-        .map((a) => Date.parse(a.expiresAt));
-      const upcomingMonthlyReset = account.allocations.filter((a) => a.period === 'monthly')
-        .map((a) => monthlyWindow(now(), a.resetDay ?? 1).nextReset);
-      const nextTry = Math.min(...upcomingMonthlyReset, ...upcomingPromoExpiry);
-      entry.blockedUntil = Number.isFinite(nextTry) ? nextTry : 0;
-    } else if (effect === EFFECT.RATE_LIMIT) {
-      entry.cooldownUntil = now() + Math.max(1000, Math.min(120000, retryAfterMs || 30000));
-      entry.cooldownReason = effect;
-    } else if (effect in COOLDOWN_MS) {
-      entry.cooldownUntil = now() + COOLDOWN_MS[effect];
-      entry.cooldownReason = effect;
-    }
   }
 
   function recordAttempt(item) {
@@ -193,11 +154,11 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
         end(reason, {}, () => {
           charge(account, estimate, false, { possiblyBilled: true });
           // A timeout says something about the account's latency; a client leaving or a bad body does not.
-          if (reason === 'timeout') applyFailure(account, { status: reason });
+          if (reason === 'timeout') applyFailure(state.accounts[account.id], account, { status: reason }, now());
         });
       },
       fail({ status, effect = null, tag = null, retryAfterMs = 0, requestId = null }) {
-        end(status, defined({ tag, requestId }), () => applyFailure(account, { status, effect, tag, retryAfterMs }));
+        end(status, defined({ tag, requestId }), () => applyFailure(state.accounts[account.id], account, { status, effect, tag, retryAfterMs }, now()));
       },
       abandon() { end('abandoned', {}, null); }
     };
@@ -229,9 +190,8 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
           providerBalance: entry.reconciled ?? null,
           reconcileError: entry.reconcileError ?? null,
           allocations: account.allocations.map((a) => {
-            const expired = expiryOf(a) <= now();
             const used = entry.buckets[a.id]?.spent ?? 0;
-            const active = !expired && (!a.startsAt || Date.parse(a.startsAt) <= now());
+            const active = isActive(a, now());
             return { id: a.id, period: a.period, limit: a.limit, spent: used,
               remainingEstimate: active ? round6(capAtZero(a.limit - used)) : 0,
               expiresAt: a.expiresAt || null, startsAt: a.startsAt || null, active,

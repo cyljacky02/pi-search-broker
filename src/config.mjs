@@ -221,12 +221,3 @@ export function writeFirstConfig(path = defaultConfigPath()) {
 }
 
 export function defaultStatePath(configPath = defaultConfigPath()) { return join(dirname(configPath), 'state.json'); }
-export function monthlyWindow(nowMs, resetDay = 1) {
-  const d = new Date(nowMs);
-  const y = d.getUTCFullYear();
-  const m = d.getUTCMonth();
-  const thisReset = Date.UTC(y, m, resetDay);
-  const currentStart = nowMs >= thisReset ? thisReset : Date.UTC(y, m - 1, resetDay);
-  const nextReset = nowMs >= thisReset ? Date.UTC(y, m + 1, resetDay) : thisReset;
-  return { key: new Date(currentStart).toISOString().slice(0, 10), nextReset };
-}
