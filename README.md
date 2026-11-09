@@ -226,7 +226,8 @@ Layout:
 | Path | Purpose |
 |---|---|
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
-| `src/gateway.mjs` | HTTP server and the per-request account and retry loop |
+| `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion replies) and returns `{status, body}` |
+| `src/gateway.mjs` | HTTP server: auth, routing, body parsing and replies around the broker |
 | `src/manager.mjs` | Account state, reservations and accounting |
 | `src/reconcile.mjs` | Optional, report-only provider balance checks |
 | `src/client.mjs` | Authenticated loopback client for a running gateway (CLI and non-owner pi processes) |

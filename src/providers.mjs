@@ -238,19 +238,3 @@ const tavily = Object.freeze({
 });
 
 export const PROVIDERS = Object.freeze({ exa, tavily });
-
-/** Reject request shapes the broker cannot meter. Returns an error string or null. */
-export function validateRequest(body) {
-  // An SSE reply cannot be parsed or metered here, and would be retried (and billed) on every account.
-  return body.stream ? 'Streaming responses (stream: true) are not supported by the local search broker' : null;
-}
-
-/** Cost to record for a successful response: the provider-reported cost when present, else the estimate. */
-export function billFor(policy, data, estimate) {
-  const reported = policy.reportedCost(data);
-  return reported === null ? { amount: estimate, exact: false } : { amount: reported, exact: true };
-}
-
-export function parseJsonSafe(text) {
-  try { return JSON.parse(text); } catch { return null; }
-}
