@@ -2,13 +2,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSy
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { monthlyWindow } from './config.mjs';
-
-export { quote, actualCost } from './providers.mjs';
+import { EFFECT, PROVIDERS } from './providers.mjs';
+import { round6, isNonNegativeNumber } from './numbers.mjs';
 
 const capAtZero = (n) => Math.max(0, n);
-const round6 = (n) => Math.round(n * 1e6) / 1e6;
-const finite = (n) => typeof n === 'number' && Number.isFinite(n) && n >= 0;
-const FORBIDDEN_COOLDOWN_MS = 10 * 60 * 1000;
+const COOLDOWN_MS = Object.freeze({ [EFFECT.FORBIDDEN]: 10 * 60 * 1000, [EFFECT.UPSTREAM]: 10 * 1000 });
 const RECENT_LIMIT = 50;
 
 function atomicWriteJson(path, value) {
@@ -61,8 +59,6 @@ export class AccountManager {
         if (entry.buckets[bucket.id]?.window !== window) {
           entry.buckets[bucket.id] = { window, spent: 0, exactCalls: 0, estimatedCalls: 0 };
           if (entry.disabled === 'quota') { entry.disabled = null; entry.blockedUntil = 0; }
-          // A provider balance from the previous window no longer applies.
-          delete entry.reconciled;
         }
       }
       if (entry.disabled === 'quota' && entry.blockedUntil && this.now() >= entry.blockedUntil) {
@@ -89,23 +85,11 @@ export class AccountManager {
   }
   held(accountId, bucketId) {
     let n = 0;
-    for (const p of this.pending.values()) {
-      if (p.accountId !== accountId) continue;
-      n += bucketId === undefined ? p.amount : (p.allocations[bucketId] || 0);
-    }
+    for (const p of this.pending.values()) if (p.accountId === accountId) n += p.allocations[bucketId] || 0;
     return n;
   }
-  /** Provider-reported balance minus what was spent or reserved since; Infinity when unknown or stale. */
-  reconciledRemaining(account) {
-    const r = this.state.accounts[account.id].reconciled;
-    if (!r || !finite(r.remaining)) return Infinity;
-    const ttl = Math.max(2 * (this.config.reconcileIntervalMs || 0), 6 * 3600 * 1000);
-    if (this.now() - Date.parse(r.at) > ttl) return Infinity;
-    return capAtZero(r.remaining - (r.spentSince || 0) - this.held(account.id));
-  }
   available(account) {
-    const local = this.activeBuckets(account).reduce((s, b) => s + b.remaining, 0);
-    return Math.min(local, this.reconciledRemaining(account));
+    return this.activeBuckets(account).reduce((s, b) => s + b.remaining, 0);
   }
   choose(provider, amount, excluded = new Set()) {
     this.sync();
@@ -115,9 +99,8 @@ export class AccountManager {
       const state = this.state.accounts[account.id];
       if (state.disabled || (state.cooldownUntil && state.cooldownUntil > this.now())) continue;
       const buckets = this.activeBuckets(account);
-      if (!buckets.length) continue;
-      const available = this.available(account);
-      if (available + 1e-9 < amount) continue;
+      const available = buckets.reduce((s, b) => s + b.remaining, 0);
+      if (!buckets.length || available + 1e-9 < amount) continue;
       options.push({ account, promoFirst: buckets[0].period === 'once', deadline: buckets[0].deadline, available });
     }
     options.sort((a, b) => Number(b.promoFirst) - Number(a.promoFirst) || a.deadline - b.deadline || b.available - a.available || a.account.id.localeCompare(b.account.id));
@@ -135,14 +118,14 @@ export class AccountManager {
     }
     if (toReserve > 1e-8) throw new Error('Insufficient estimated budget');
     const token = randomBytes(12).toString('hex');
-    this.pending.set(token, { accountId: account.id, allocations, amount: requested });
+    this.pending.set(token, { accountId: account.id, allocations });
     return token;
   }
   release(token) { this.pending.delete(token); }
   /**
    * Record spend for a reservation.
-   * meta.requestId: provider request id for support tickets; meta.possiblyBilled: the attempt timed out
-   * after the request was sent, so the provider may or may not have billed it.
+   * meta.requestId: provider request id for support tickets; meta.possiblyBilled: the attempt timed out or the
+   * client left after the request was sent, so the provider may or may not have billed it.
    */
   commit(token, amount, exact = false, meta = {}) {
     const reservation = this.pending.get(token);
@@ -163,7 +146,6 @@ export class AccountManager {
       const fallback = account.allocations.find((b) => b.id in entry.buckets);
       entry.buckets[fallback.id].spent = round6(entry.buckets[fallback.id].spent + left);
     }
-    if (entry.reconciled) entry.reconciled.spentSince = round6((entry.reconciled.spentSince || 0) + amount);
     const first = account.allocations.find((b) => b.id in entry.buckets);
     if (meta.possiblyBilled) {
       entry.possiblyBilled++;
@@ -176,19 +158,16 @@ export class AccountManager {
     if (meta.requestId) entry.lastRequestId = meta.requestId;
     this.save();
   }
-  /**
-   * Apply the effect of a classified upstream failure (see classifyFailure in providers.mjs).
-   * effect: 'auth' | 'blocked' | 'quota' | 'cooldown' | 'forbidden' | null
-   */
+  /** Apply the effect of a classified upstream failure (an EFFECT value from providers.mjs, or null). */
   recordFailure(account, { status, effect = null, retryAfterMs = 0, tag = null } = {}) {
     const state = this.state.accounts[account.id];
     state.failures++;
     state.lastFailureAt = new Date(this.now()).toISOString();
     state.lastStatus = status;
     state.lastErrorTag = tag;
-    if (effect === 'auth' || effect === 'blocked') {
+    if (effect === EFFECT.AUTH || effect === EFFECT.BLOCKED) {
       state.disabled = effect; // Explicit unblocking required after fixing credentials / contacting the provider.
-    } else if (effect === 'quota') {
+    } else if (effect === EFFECT.QUOTA) {
       state.disabled = 'quota';
       // Promo expiry may activate the account's free allowance before the next monthly reset.
       const upcomingPromoExpiry = account.allocations
@@ -198,33 +177,21 @@ export class AccountManager {
         .map((b) => monthlyWindow(this.now(), b.resetDay ?? 1).nextReset);
       const nextTry = Math.min(...upcomingMonthlyReset, ...upcomingPromoExpiry);
       state.blockedUntil = Number.isFinite(nextTry) ? nextTry : 0;
-    } else if (effect === 'cooldown') {
+    } else if (effect === EFFECT.RATE_LIMIT) {
       state.cooldownUntil = this.now() + Math.max(1000, Math.min(120000, retryAfterMs || 30000));
-      state.cooldownReason = 'rate-limit';
-    } else if (effect === 'forbidden') {
-      state.cooldownUntil = this.now() + FORBIDDEN_COOLDOWN_MS;
-      state.cooldownReason = 'forbidden';
+      state.cooldownReason = effect;
+    } else if (effect in COOLDOWN_MS) {
+      state.cooldownUntil = this.now() + COOLDOWN_MS[effect];
+      state.cooldownReason = effect;
     }
     this.save();
   }
-  /** Backwards-compatible status-only failure API. */
-  fail(account, status, retryAfterMs = 0) {
-    const effect = [401, 403].includes(status) ? 'auth' : [402, 432, 433].includes(status) ? 'quota' : status === 429 ? 'cooldown' : null;
-    this.recordFailure(account, { status, effect, retryAfterMs });
-  }
-  /** Store a provider-authoritative balance (see reconcile.mjs). */
-  applyReconciliation(accountId, result) {
-    this.sync();
-    const account = this.accounts.find((a) => a.id === accountId);
-    if (!account) throw new Error('Unknown account id');
-    const entry = this.state.accounts[account.id];
-    entry.reconciled = { at: new Date(this.now()).toISOString(), remaining: round6(result.remaining), spentSince: 0, details: result.details ?? {} };
-    // Tavily plan usage maps directly onto the monthly allowance.
-    if (finite(result.monthlyUsed)) {
-      const monthly = account.allocations.find((b) => b.period === 'monthly');
-      if (monthly) entry.buckets[monthly.id].spent = round6(result.monthlyUsed);
-    }
-    if (entry.disabled === 'quota' && result.remaining > 0) { entry.disabled = null; entry.blockedUntil = 0; }
+  /** Store a provider-reported balance for display. Report-only: local accounting is not changed. */
+  recordProviderBalance(accountId, result) {
+    const entry = this.state.accounts[accountId];
+    if (!entry) throw new Error('Unknown account id');
+    entry.reconciled = { at: new Date(this.now()).toISOString(), remaining: round6(result.remaining), details: result.details ?? {} };
+    delete entry.reconcileError;
     this.save();
   }
   noteReconcileError(accountId, message) {
@@ -248,11 +215,10 @@ export class AccountManager {
     else if (op === 'set-spent') {
       const b = account.allocations.find((x) => x.id === data.allocationId);
       if (!b) throw new Error('Unknown allocation');
-      if (!finite(data.spent)) throw new Error('spent must be nonnegative number');
+      if (!isNonNegativeNumber(data.spent)) throw new Error('spent must be nonnegative number');
       entry.buckets[b.id].spent = round6(data.spent);
       entry.disabled = null;
       entry.blockedUntil = 0;
-      delete entry.reconciled; // a manual correction supersedes an older provider snapshot
     } else throw new Error('Unknown operation');
     this.save();
   }
@@ -260,23 +226,19 @@ export class AccountManager {
     this.sync();
     return {
       updatedAt: new Date(this.now()).toISOString(),
-      note: 'Local accounting. Exa uses costDollars.total and Tavily uses usage.credits when reported; otherwise estimates. Provider balances appear under "reconciled" when available.',
+      note: 'Local accounting. Exa uses costDollars.total and Tavily uses usage.credits when reported; otherwise estimates. "providerBalance" is the last report-only balance check, if any.',
       accounts: this.accounts.map((account) => {
         const entry = this.state.accounts[account.id];
         const cooling = entry.cooldownUntil > this.now();
-        const reconciledCap = this.reconciledRemaining(account);
         return {
-          id: account.id, provider: account.provider, unit: account.provider === 'exa' ? 'USD' : 'credits',
+          id: account.id, provider: account.provider, unit: PROVIDERS[account.provider].unit,
           status: entry.disabled || (cooling ? 'cooldown' : 'active'),
           cooldownReason: cooling ? entry.cooldownReason ?? null : null,
           retryAt: entry.disabled === 'quota' ? (entry.blockedUntil ? new Date(entry.blockedUntil).toISOString() : null) : (cooling ? new Date(entry.cooldownUntil).toISOString() : null),
           requests: entry.requests, failures: entry.failures, possiblyBilled: entry.possiblyBilled,
           lastStatus: entry.lastStatus ?? null, lastErrorTag: entry.lastErrorTag ?? null, lastRequestId: entry.lastRequestId ?? null,
           available: round6(this.available(account)),
-          reconciled: entry.reconciled ? {
-            at: entry.reconciled.at, remaining: entry.reconciled.remaining, spentSince: entry.reconciled.spentSince,
-            effectiveRemaining: Number.isFinite(reconciledCap) ? round6(reconciledCap) : null, details: entry.reconciled.details
-          } : null,
+          providerBalance: entry.reconciled ?? null,
           reconcileError: entry.reconcileError ?? null,
           allocations: account.allocations.map((b) => {
             const expired = expiryOf(b) <= this.now();

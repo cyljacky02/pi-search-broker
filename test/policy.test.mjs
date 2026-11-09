@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { run, config, exa, tavily, json, secret } from './helpers.mjs';
-import { quote, classifyFailure, sanitizedError } from '../src/providers.mjs';
+import { PROVIDERS, ACTION, EFFECT } from '../src/providers.mjs';
+
+const quote = (provider, path, body) => PROVIDERS[provider].quote(path, body);
 
 const keyOf = (opts) => opts.headers['x-api-key'] ?? opts.headers.Authorization;
 const status = (manager, i) => manager.snapshot().accounts[i];
@@ -35,25 +37,25 @@ test('Exa 403 TEAM_BLOCKED disables that account and rotates', async () => {
     });
 });
 
-test('Exa 403 FEATURE_DISABLED tries the other account, disables nobody, and returns the 403 if all refuse', async () => {
+test('Exa 403 FEATURE_DISABLED tries exactly one other account, disables nobody, then returns the 403', async () => {
   let calls = 0;
-  await run(config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb')),
+  await run(config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb'), exa('c', 'exa-key-cccc')),
     async () => { calls++; return json({ error: 'Snapshot is not on this plan', tag: 'FEATURE_DISABLED' }, 403); },
     async ({ post, manager }) => {
       const res = await post('/exa/search', { query: 'q' });
       assert.equal(res.status, 403);
       assert.equal((await res.json()).tag, 'FEATURE_DISABLED');
-      assert.equal(calls, 2);
-      assert.equal(status(manager, 0).status, 'active');
-      assert.equal(status(manager, 1).status, 'active');
+      assert.equal(calls, 2, 'one other account, not the whole pool');
+      for (let i = 0; i < 3; i++) assert.equal(status(manager, i).status, 'active');
     });
 });
 
 test('Exa 402 X402_PAYMENT_REQUIRED is treated as a credential problem, other 402 as quota', () => {
-  assert.equal(classifyFailure('exa', '/search', 402, { tag: 'X402_PAYMENT_REQUIRED' }).effect, 'auth');
-  assert.equal(classifyFailure('exa', '/search', 402, { tag: 'NO_MORE_CREDITS' }).effect, 'quota');
+  const classify = (...args) => PROVIDERS.exa.classify('/search', ...args);
+  assert.equal(classify(402, { tag: 'X402_PAYMENT_REQUIRED' }).effect, EFFECT.AUTH);
+  assert.equal(classify(402, { tag: 'NO_MORE_CREDITS' }).effect, EFFECT.QUOTA);
   const network = { get: (h) => (h === 'x-ratelimit-scope' ? 'network' : null) };
-  assert.equal(classifyFailure('exa', '/search', 429, {}, network).action, 'passthrough');
+  assert.equal(classify(429, {}, network).action, ACTION.PASSTHROUGH);
 });
 
 test('Exa 503 SERVICE_OVERLOADED retries with backoff without cooling the account down', async () => {
@@ -68,17 +70,30 @@ test('Exa 503 SERVICE_OVERLOADED retries with backoff without cooling the accoun
     });
 });
 
-test('Persistent 5xx gives up after maxTransientRetries with 503 (transient for pi fallback)', async () => {
+test('Persistent Exa 503 gives up after maxTransientRetries with 503 (transient for pi fallback)', async () => {
   let calls = 0;
-  await run(config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb')),
-    async () => { calls++; return json({ error: 'boom' }, 500); },
+  await run(config(exa('only', 'exa-key-only')),
+    async () => { calls++; return json({ error: 'overloaded', tag: 'SERVICE_OVERLOADED' }, 503); },
     async ({ post, manager, sleeps }) => {
-      const res = await post('/exa/search', { query: 'q' });
-      assert.equal(res.status, 503);
+      assert.equal((await post('/exa/search', { query: 'q' })).status, 503);
       assert.equal(calls, 3);
       assert.deepEqual(sleeps, [250, 500]);
       assert.equal(status(manager, 0).status, 'active');
-      assert.equal(status(manager, 1).status, 'active');
+    });
+});
+
+test('Other 5xx rotate with a short 10 s cooldown (unchanged behaviour); all failing returns 503', async () => {
+  let calls = 0;
+  await run(config(exa('a', 'exa-key-aaaa'), tavily('t', 'tvly-aaaaaaaa'), exa('b', 'exa-key-bbbb')),
+    async () => { calls++; return json({ error: 'boom' }, 500); },
+    async ({ post, manager, sleeps, time }) => {
+      assert.equal((await post('/exa/search', { query: 'q' })).status, 503);
+      assert.equal(calls, 2);
+      assert.deepEqual(sleeps, []);
+      assert.equal(status(manager, 0).status, 'cooldown');
+      assert.equal(status(manager, 0).cooldownReason, EFFECT.UPSTREAM);
+      time.ms += 10001;
+      assert.equal(status(manager, 0).status, 'active');
     });
 });
 
@@ -166,17 +181,18 @@ test('Tavily reported usage.credits of 0 is exact (not replaced by the estimate)
     });
 });
 
-test('Attempt timeout counts the estimate as possibly billed, does not cool down, and rotates', async () => {
+test('Attempt timeout is counted as possibly billed, never cools down, and is never retried on another account', async () => {
   const keys = [];
   await run(config(exa('a', 'exa-key-aaaa', '2026-11-20T00:00:00Z'), exa('b', 'exa-key-bbbb')),
     async (_u, opts) => {
       keys.push(keyOf(opts));
-      if (keys.length === 1) throw new DOMException('The operation timed out.', 'TimeoutError');
-      return json({ results: [], costDollars: { total: 0.007 } });
+      throw new DOMException('The operation timed out.', 'TimeoutError');
     },
     async ({ post, manager }) => {
-      assert.equal((await post('/exa/search', { query: 'q', numResults: 5 })).status, 200);
-      assert.deepEqual(keys, ['exa-key-aaaa', 'exa-key-bbbb']);
+      const res = await post('/exa/search', { query: 'q', numResults: 5 });
+      assert.equal(res.status, 504, 'pi classifies 504 as transient and falls back to the other provider');
+      assert.match((await res.json()).error, /not retried to avoid double billing/);
+      assert.deepEqual(keys, ['exa-key-aaaa'], 'a second account would risk billing the same request twice');
       const a = status(manager, 0);
       assert.equal(a.status, 'active');
       assert.equal(a.possiblyBilled, 1);
@@ -185,14 +201,15 @@ test('Attempt timeout counts the estimate as possibly billed, does not cool down
     });
 });
 
-test('Network errors retry with backoff and no cooldown', async () => {
+test('Network errors before a response rotate with a short cooldown (unchanged behaviour)', async () => {
   let calls = 0;
-  await run(config(tavily('t', 'tvly-aaaaaaaa')),
+  await run(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')),
     async () => { if (++calls === 1) throw new TypeError('fetch failed'); return json({ results: [] }); },
     async ({ post, manager, sleeps }) => {
       assert.equal((await post('/tavily/search', { query: 'q' })).status, 200);
-      assert.deepEqual(sleeps, [250]);
-      assert.equal(status(manager, 0).status, 'active');
+      assert.equal(calls, 2);
+      assert.deepEqual(sleeps, []);
+      assert.equal(status(manager, 0).cooldownReason, EFFECT.UPSTREAM);
     });
 });
 
@@ -206,7 +223,7 @@ test('Non-retryable provider errors are passed through sanitized, in the provide
       assert.match(body.detail.error, /Invalid topic/);
       assert.ok(!JSON.stringify(body).includes('tvly-aaaaaaaa'));
     });
-  const v = sanitizedError('tavily', 422, { detail: [{ loc: ['body', 'max_results'], msg: 'too big' }] }, []);
+  const v = PROVIDERS.tavily.sanitizeError(422, { detail: [{ loc: ['body', 'max_results'], msg: 'too big' }] }, []);
   assert.equal(v.detail.error, 'Validation failed: body.max_results: too big');
 });
 

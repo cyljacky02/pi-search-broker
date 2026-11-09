@@ -13,16 +13,30 @@ export const CONFIG_ENV = 'PI_SEARCH_BROKER_CONFIG';
 export const DEFAULT_DIR = join(homedir(), '.config', APP_NAME);
 export const DEFAULT_CONFIG = join(DEFAULT_DIR, 'config.json');
 
+/** pi-web-access's built-in Tavily key pool (TAVILY_API_KEY_1..20). */
+export const TAVILY_POOL_VARS = Object.freeze(Array.from({ length: 20 }, (_, i) => `TAVILY_API_KEY_${i + 1}`));
+
 export const DEFAULTS = Object.freeze({
   totalTimeoutMs: 50000,
   maxTransientRetries: 2,
-  reconcileIntervalMs: 30 * 60 * 1000
+  reconcileIntervalMs: 0 // balance checks are optional: off unless configured
 });
 
 const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const goodDate = (s) => typeof s === 'string' && Number.isFinite(Date.parse(s)) && /(?:Z|[+-]\d\d:\d\d)$/.test(s);
 const PLACEHOLDER = /REPLACE|CHANGE_ME|YOUR_KEY/i;
 const ENV_SOURCE = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/;
+
+/** Environment variable name of a "$NAME" / "${NAME}" source, or null. Same syntax as pi and pi-web-access. */
+export function parseEnvSource(source) {
+  const match = typeof source === 'string' ? source.trim().match(ENV_SOURCE) : null;
+  return match ? match[1] ?? match[2] : null;
+}
+
+/** Every secret the broker holds, for redaction. */
+export function secretsOf(config) {
+  return [config.gateway.token, ...config.accounts.flatMap((a) => [a.apiKey, a.adminKey].filter(Boolean))];
+}
 
 export function defaultConfigPath(env = process.env) {
   return env[CONFIG_ENV] || DEFAULT_CONFIG;
@@ -55,9 +69,8 @@ export function resolveSecret(value, label, { env = process.env, runCommand = de
     return resolved;
   }
   if (source.startsWith('$')) {
-    const match = source.match(ENV_SOURCE);
-    if (!match) throw new Error(`Malformed environment source for ${label}`);
-    const name = match[1] ?? match[2];
+    const name = parseEnvSource(source);
+    if (!name) throw new Error(`Malformed environment source for ${label}`);
     const resolved = env[name]?.trim();
     if (!resolved) throw new Error(`Environment variable ${name} for ${label} is empty or unset`);
     return resolved;

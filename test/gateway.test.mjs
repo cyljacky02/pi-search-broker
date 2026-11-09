@@ -1,38 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { createGateway } from '../src/gateway.mjs';
-import { quote, AccountManager } from '../src/manager.mjs';
+import { readFileSync } from 'node:fs';
+import { AccountManager } from '../src/manager.mjs';
+import { PROVIDERS } from '../src/providers.mjs';
 import { validateConfig } from '../src/config.mjs';
+import { run, config, exa, tavily, secret } from './helpers.mjs';
 
-const DATE = Date.parse('2026-11-09T06:00:00Z');
-const secret = 'local-only-secret-with-32-chars-12345';
-const exa = (id, key, promoExpiration = '2026-12-03T00:00:00Z') => ({
-  id, provider: 'exa', apiKey: key,
-  allocations: [{ id: 'promo', limit: 60, period: 'once', expiresAt: promoExpiration }, { id: 'free', limit: 10, period: 'monthly' }]
-});
-const tavily = (id, key) => ({ id, provider: 'tavily', apiKey: key, allocations: [{ id: 'free', limit: 1000, period: 'monthly' }] });
-const config = (...accounts) => validateConfig({
-  gateway: { host: '127.0.0.1', port: 19473, token: secret },
-  totalTimeoutMs: 50000, attemptTimeoutMs: 10000, accounts
-});
-async function run(config, fetchImpl, fn, time = { ms: DATE }) {
-  const temp = mkdtempSync(join(tmpdir(), 'pi-dual-key-'));
-  const statePath = join(temp, 'state.json');
-  const { server, manager } = createGateway(config, { statePath, fetchImpl, now: () => time.ms });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
-  const post = async (path, body, token = secret) => fetch(`${base}${path}`, {
-    method: 'POST', headers: { 'x-api-key': token, 'content-type': 'application/json' }, body: JSON.stringify(body)
-  });
-  try { await fn({ base, post, manager, statePath, time }); }
-  finally {
-    await new Promise((resolve) => server.close(resolve));
-    rmSync(temp, { recursive: true, force: true });
-  }
-}
+const quote = (provider, path, body) => PROVIDERS[provider].quote(path, body);
 
 // Public seam: provider-compatible localhost routes (same path and JSON as pi-web-access uses).
 test('Exa fails over from spent promo key to a second independent account in the SAME search', async () => {

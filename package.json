@@ -23,6 +23,6 @@
     "doctor": "node src/cli.mjs doctor",
     "reconcile": "node src/cli.mjs reconcile",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check src/config.mjs && node --check src/providers.mjs && node --check src/manager.mjs && node --check src/reconcile.mjs && node --check src/gateway.mjs && node --check src/host.mjs && node --check src/doctor.mjs && node --check src/format.mjs && node --check src/cli.mjs && node --check extension/index.js"
+    "check": "node scripts/check.mjs"
   }
 }

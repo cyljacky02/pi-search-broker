@@ -4,8 +4,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { APP_NAME, TOKEN_ENV, loadConfig } from './config.mjs';
-import { baseUrl } from './host.mjs';
+import { APP_NAME, TOKEN_ENV, TAVILY_POOL_VARS, loadConfig, parseEnvSource } from './config.mjs';
+import { baseUrl } from './client.mjs';
 
 /** Same order as pi-web-access getWebSearchConfigDir(). */
 export function piWebSearchConfigPath(env = process.env, home = homedir()) {
@@ -23,7 +23,10 @@ export function piWebSearchConfigPath(env = process.env, home = homedir()) {
   return agent;
 }
 
-const ENV_SOURCE = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/;
+/** Parsed web-search.json ({} when missing); throws on invalid JSON. */
+export function readPiWebSearchConfig(path) {
+  return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
+}
 
 /** Describe how pi-web-access would resolve a provider key, without revealing it. */
 export function describeKey(configValue, envName, env, token) {
@@ -33,9 +36,8 @@ export function describeKey(configValue, envName, env, token) {
   }
   if (value.startsWith('!')) return { source: 'command source in web-search.json', matches: null };
   if (value.startsWith('$')) {
-    const m = value.match(ENV_SOURCE);
-    if (!m) return { source: 'malformed $ source in web-search.json', matches: false };
-    const name = m[1] ?? m[2];
+    const name = parseEnvSource(value);
+    if (!name) return { source: 'malformed $ source in web-search.json', matches: false };
     const resolved = env[name]?.trim();
     return { source: `environment variable ${name}`, matches: resolved ? resolved === token : false, unset: !resolved };
   }
@@ -45,6 +47,31 @@ export function describeKey(configValue, envName, env, token) {
   }
   if (value) return { source: 'plain value in web-search.json', matches: value === token };
   return { source: 'none', matches: false, unset: true };
+}
+
+const KEY_FIELDS = Object.freeze([
+  { provider: 'exa', envKey: 'EXA_API_KEY', cfgKey: 'exaApiKey' },
+  { provider: 'tavily', envKey: 'TAVILY_API_KEY', cfgKey: 'tavilyApiKey' }
+]);
+
+/**
+ * Key-resolution and key-pool problems that keep pi-web-access from authenticating to the broker.
+ * Shared by `doctor` and the pi extension's startup warnings.
+ */
+export function piWiringIssues(pi, env, token) {
+  const issues = [];
+  for (const { provider, envKey, cfgKey } of KEY_FIELDS) {
+    const key = describeKey(pi[cfgKey], envKey, env, token);
+    const fix = `set "${cfgKey}": "$${TOKEN_ENV}" in web-search.json`;
+    if (key.matches === true) continue;
+    if (key.matches === null) issues.push({ level: 'info', message: `${provider}: key comes from a ${key.source}; make sure it prints the broker token` });
+    else if (key.unset && provider === 'exa') issues.push({ level: 'error', message: `${provider}: no key resolves (${key.source}); pi-web-access will silently use the keyless Exa MCP endpoint and bypass the broker. Fix: ${fix}` });
+    else if (key.unset) issues.push({ level: 'error', message: `${provider}: no key resolves (${key.source}); Tavily will be unavailable. Fix: ${fix}` });
+    else issues.push({ level: 'error', message: `${provider}: key from ${key.source} is NOT the broker token; the broker will answer 401 and pi will not fall back. Fix: ${fix}` });
+  }
+  const pool = TAVILY_POOL_VARS.filter((name) => env[name]);
+  if (pool.length) issues.push({ level: 'warn', message: `${pool.length} TAVILY_API_KEY_n variable(s) set; pi-web-access sends those real keys to the broker first (each gets 401). Unset them.` });
+  return issues;
 }
 
 export async function runDoctor({ configPath, env = process.env, home = homedir(), fetchImpl = fetch } = {}) {
@@ -61,7 +88,7 @@ export async function runDoctor({ configPath, env = process.env, home = homedir(
     return checks;
   }
   if (config.attemptTimeoutMs !== undefined && config.attemptTimeoutMs < 20000) {
-    add('warn', `attemptTimeoutMs is ${config.attemptTimeoutMs} ms; timeouts can double-bill. Remove it to use per-route defaults (30-40 s).`);
+    add('warn', `attemptTimeoutMs is ${config.attemptTimeoutMs} ms; slow searches will time out. Remove it to use the 30 s per-route default.`);
   }
 
   const base = baseUrl(config);
@@ -75,41 +102,32 @@ export async function runDoctor({ configPath, env = process.env, home = homedir(
   }
 
   const piPath = piWebSearchConfigPath(env, home);
-  let pi = {};
-  if (existsSync(piPath)) {
-    try { pi = JSON.parse(readFileSync(piPath, 'utf8')); add('ok', `pi-web-access config: ${piPath}`); }
-    catch { add('error', `pi-web-access config is not valid JSON: ${piPath}`); return checks; }
-  } else {
-    add('info', `No pi-web-access config at ${piPath}; pi uses defaults (fine when the pi extension wires the environment).`);
-  }
+  let pi;
+  try { pi = readPiWebSearchConfig(piPath); }
+  catch { add('error', `pi-web-access config is not valid JSON: ${piPath}`); return checks; }
+  add(existsSync(piPath) ? 'ok' : 'info', existsSync(piPath) ? `pi-web-access config: ${piPath}` : `No pi-web-access config at ${piPath}; pi uses defaults.`);
 
-  for (const [provider, envBase, cfgBase, envKey, cfgKey] of [
-    ['exa', 'EXA_BASE_URL', 'exaBaseUrl', 'EXA_API_KEY', 'exaApiKey'],
-    ['tavily', 'TAVILY_BASE_URL', 'tavilyBaseUrl', 'TAVILY_API_KEY', 'tavilyApiKey']
-  ]) {
+  for (const provider of ['exa', 'tavily']) {
+    const envBase = `${provider.toUpperCase()}_BASE_URL`;
+    const cfgBase = `${provider}BaseUrl`;
     const expected = `${base}/${provider}`;
     const effective = (env[envBase] ?? pi[cfgBase] ?? '').replace(/\/+$/, '');
     const where = env[envBase] !== undefined ? envBase : pi[cfgBase] ? `${cfgBase} in web-search.json` : 'default';
     if (effective === expected) add('ok', `${provider}: base URL points at the broker (${where})`);
     else add('error', `${provider}: base URL does not point at the broker (${where}); expected ${expected}`);
-
-    const key = describeKey(pi[cfgKey], envKey, env, config.gateway.token);
-    if (key.matches === true) add('ok', `${provider}: key resolves to the broker token (${key.source})`);
-    else if (key.matches === null) add('info', `${provider}: key comes from a ${key.source}; make sure it prints the broker token`);
-    else if (key.unset && provider === 'exa') add('error', `${provider}: no key resolves (${key.source}); pi-web-access will silently use the keyless Exa MCP endpoint and bypass the broker`);
-    else if (key.unset) add('error', `${provider}: no key resolves (${key.source}); Tavily will be unavailable`);
-    else add('error', `${provider}: key from ${key.source} is NOT the broker token; the broker will answer 401 and pi will not fall back`);
   }
-
-  const pool = Array.from({ length: 20 }, (_, i) => `TAVILY_API_KEY_${i + 1}`).filter((n) => env[n]);
-  if (pool.length) add('warn', `${pool.length} TAVILY_API_KEY_n variable(s) set; pi-web-access sends those real keys to the broker first (each gets 401). Unset them.`);
+  const issues = piWiringIssues(pi, env, config.gateway.token);
+  for (const { provider } of KEY_FIELDS) {
+    if (!issues.some((i) => i.message.startsWith(`${provider}:`))) add('ok', `${provider}: key resolves to the broker token`);
+  }
+  for (const issue of issues) add(issue.level, issue.message);
 
   const top = pi.searchProvider ?? pi.provider;
   if (top !== undefined && top !== 'auto') add('warn', `Top-level "${pi.searchProvider !== undefined ? 'searchProvider' : 'provider'}" is set; it overrides searchRouting and disables cross-provider fallback.`);
   const fallbackOn = pi.searchRouting?.fallbackOn;
   if (Array.isArray(fallbackOn)) {
     const missing = ['quota', 'transient'].filter((k) => !fallbackOn.includes(k));
-    if (missing.length) add('warn', `searchRouting.fallbackOn lacks ${missing.join(' and ')}; broker exhaustion (429/503) will not fall back to the other provider.`);
+    if (missing.length) add('warn', `searchRouting.fallbackOn lacks ${missing.join(' and ')}; broker exhaustion (429/503/504) will not fall back to the other provider.`);
   }
   const fetchProviders = pi.fetchRouting?.providers;
   if (!Array.isArray(fetchProviders) || !fetchProviders.includes('exa')) {
