@@ -1,0 +1,28 @@
+{
+  "name": "pi-dual-key-manager",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Exa + Tavily account-aware key rotation gateway (search broker) for pi-web-access, with a pi extension",
+  "keywords": ["pi-package", "pi-extension", "exa", "tavily", "pi-web-access"],
+  "engines": { "node": ">=20.3" },
+  "files": ["src/", "extension/", "README.md"],
+  "pi": {
+    "extensions": ["./extension/index.js"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
+  "scripts": {
+    "start": "node src/cli.mjs serve",
+    "init": "node src/cli.mjs init",
+    "status": "node src/cli.mjs status",
+    "doctor": "node src/cli.mjs doctor",
+    "reconcile": "node src/cli.mjs reconcile",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/config.mjs && node --check src/providers.mjs && node --check src/manager.mjs && node --check src/reconcile.mjs && node --check src/gateway.mjs && node --check src/host.mjs && node --check src/doctor.mjs && node --check src/format.mjs && node --check src/cli.mjs && node --check extension/index.js"
+  }
+}
