@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGateway } from '../src/gateway.mjs';
 import { createBroker } from '../src/broker.mjs';
-import { AccountManager } from '../src/manager.mjs';
+import { createAccountPool } from '../src/pool.mjs';
+import { fileStore, memoryStore } from '../src/pool/store.mjs';
 import { ROUTES } from '../src/providers.mjs';
 import { validateConfig, secretsOf } from '../src/config.mjs';
 
@@ -25,18 +26,18 @@ export const json = (data, status = 200, headers = {}) => Response.json(data, { 
 export const keyOf = (opts) => opts.headers['x-api-key'] ?? opts.headers.Authorization;
 
 /**
- * A brokered-request harness: no sockets, in-memory account state, a fake clock and recorded sleeps.
+ * A brokered-request harness: no sockets, an in-memory account pool, a fake clock and recorded sleeps.
  * call(localPath, body, {headers, signal}) -> { status, body }; status() -> the /status snapshot.
  */
 export function broker(cfg, fetchImpl, { time = { ms: DATE } } = {}) {
   const now = () => time.ms;
-  const manager = new AccountManager(cfg, { now });
+  const pool = createAccountPool(cfg.accounts, { store: memoryStore(), now });
   const sleeps = [];
-  const b = createBroker({ manager, limits: cfg, secrets: secretsOf(cfg), fetchImpl, now, sleep: async (ms) => { sleeps.push(ms); } });
+  const b = createBroker({ pool, limits: cfg, secrets: secretsOf(cfg), fetchImpl, now, sleep: async (ms) => { sleeps.push(ms); } });
   return {
     call: (path, body, options) => b.execute(ROUTES[path], body, options),
-    status: () => manager.snapshot(),
-    account: (i) => manager.snapshot().accounts[i],
+    status: () => pool.snapshot(),
+    account: (i) => pool.snapshot().accounts[i],
     sleeps,
     time
   };
@@ -46,7 +47,7 @@ export function broker(cfg, fetchImpl, { time = { ms: DATE } } = {}) {
 export async function serve(cfg, fetchImpl, fn, { time = { ms: DATE }, ...extra } = {}) {
   const temp = mkdtempSync(join(tmpdir(), 'pi-search-broker-'));
   const statePath = join(temp, 'state.json');
-  const gateway = createGateway(cfg, { statePath, fetchImpl, now: () => time.ms, sleep: async () => {}, ...extra });
+  const gateway = createGateway(cfg, { store: fileStore(statePath), fetchImpl, now: () => time.ms, sleep: async () => {}, ...extra });
   await new Promise((resolve) => gateway.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${gateway.server.address().port}`;
   const post = async (path, body, token = secret, headers = {}, signal = undefined) => fetch(`${base}${path}`, {

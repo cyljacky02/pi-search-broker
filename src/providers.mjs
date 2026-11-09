@@ -8,7 +8,7 @@ export const ACTION = Object.freeze({
   RETRY: 'retry',            // provider-wide transient problem: back off and retry, no account penalty
   PASSTHROUGH: 'passthrough' // the request itself was rejected: return it to the client
 });
-/** How a failure changes the account's state (consumed by AccountManager.recordFailure). */
+/** How a failure changes the account's state (applied by the account pool when a reservation fails). */
 export const EFFECT = Object.freeze({
   AUTH: 'auth',             // disabled until re-enabled
   BLOCKED: 'blocked',       // provider revoked access; disabled until re-enabled

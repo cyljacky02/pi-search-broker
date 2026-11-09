@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
-import { AccountManager } from './manager.mjs';
+import { createAccountPool } from './pool.mjs';
+import { memoryStore } from './pool/store.mjs';
 import { APP_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
 import { ROUTES } from './providers.mjs';
 import { createReconciler } from './reconcile.mjs';
@@ -49,13 +50,17 @@ async function readBody(req, maxBytes = 1024 * 1024) {
   }
 }
 
+/**
+ * @param store           account pool state store (default: in memory; the host and CLI pass a fileStore)
+ * @param reconcileFetch  fetch for provider balance endpoints (default: the real fetch)
+ */
 export function createGateway(config, {
-  statePath, fetchImpl = fetch, now = () => Date.now(), sleep, logger = null, reconcileFetch = fetchImpl
+  store = memoryStore(), fetchImpl = fetch, now = () => Date.now(), sleep, logger = null, reconcileFetch = fetch
 } = {}) {
-  const manager = new AccountManager(config, { statePath, now });
-  const reconciler = createReconciler(manager, config, { fetchImpl: reconcileFetch, now });
   const log = (line) => { try { logger?.(line); } catch { /* logging must never break a request */ } };
-  const broker = createBroker({ manager, limits: config, secrets: secretsOf(config), fetchImpl, now, sleep, logger: log });
+  const pool = createAccountPool(config.accounts, { store, now, logger: log });
+  const reconciler = createReconciler(pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
+  const broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, now, sleep });
 
   /** Admin operations shared by the HTTP API and the in-process pi host. */
   async function admin(op, body = {}) {
@@ -64,10 +69,13 @@ export function createGateway(config, {
       return { ok: true, results: await reconciler.reconcile(body.id) };
     }
     if (typeof body.id !== 'string') throw new Error('Account id required');
-    manager.change(body.id, op, body);
+    if (op === 'enable') pool.enable(body.id);
+    else if (op === 'disable') pool.disable(body.id);
+    else if (op === 'set-spent') pool.setSpent(body.id, body.allocationId, body.spent);
+    else throw new Error('Unknown operation');
     return { ok: true };
   }
-  const status = () => manager.snapshot();
+  const status = () => pool.snapshot();
 
   async function proxy(req, res, route) {
     const body = await readBody(req);

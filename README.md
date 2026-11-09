@@ -228,7 +228,8 @@ Layout:
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
 | `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion replies) and returns `{status, body}` |
 | `src/gateway.mjs` | HTTP server: auth, routing, body parsing and replies around the broker |
-| `src/manager.mjs` | Account state, reservations and accounting |
+| `src/pool.mjs` | Account pool: accounts, allocations, health and spend. Hands out reservations that end exactly once (`settle`, `settleUncertain`, `fail`, `abandon`) and keeps the attempt log |
+| `src/pool/store.mjs` | Where pool state lives: `fileStore` (`state.json`, optionally read-only) or `memoryStore` |
 | `src/reconcile.mjs` | Optional, report-only provider balance checks |
 | `src/client.mjs` | Authenticated loopback client for a running gateway (CLI and non-owner pi processes) |
 | `src/host.mjs` | Process singleton, port ownership, takeover and environment wiring, used by the extension |

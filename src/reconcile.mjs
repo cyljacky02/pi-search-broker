@@ -25,10 +25,11 @@ export async function fetchBalance(account, { fetchImpl = fetch, timeoutMs = 100
 }
 
 /**
- * On-demand (and, if reconcileIntervalMs > 0, periodic) balance checks bound to an AccountManager.
+ * On-demand (and, if intervalMs > 0, periodic) balance checks for the accounts in an account pool.
  * A minimum gap per account keeps repeated requests within Tavily's /usage rate limit.
+ * fetchImpl defaults to the real fetch: balance endpoints are different hosts from the search routes.
  */
-export function createReconciler(manager, config, { fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000 } = {}) {
+export function createReconciler(pool, { fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, intervalMs = 0 } = {}) {
   const lastAttempt = new Map();
   let timer = null;
 
@@ -38,16 +39,16 @@ export function createReconciler(manager, config, { fetchImpl = fetch, now = () 
     lastAttempt.set(account.id, now());
     try {
       const result = await fetchBalance(account, { fetchImpl });
-      manager.recordProviderBalance(account.id, result);
+      pool.recordBalanceCheck(account.id, result);
       return { id: account.id, remaining: result.remaining };
     } catch (err) {
-      manager.noteReconcileError(account.id, err.message);
+      pool.recordBalanceCheck(account.id, err);
       return { id: account.id, error: err.message };
     }
   }
 
   async function reconcile(accountId) {
-    const targets = accountId ? config.accounts.filter((a) => a.id === accountId) : config.accounts;
+    const targets = accountId ? pool.accounts.filter((a) => a.id === accountId) : pool.accounts;
     if (accountId && !targets.length) throw new Error('Unknown account id');
     const results = [];
     for (const account of targets) results.push(await checkAccount(account)); // sequential: gentle on rate limits
@@ -55,8 +56,8 @@ export function createReconciler(manager, config, { fetchImpl = fetch, now = () 
   }
 
   function start() {
-    if (timer || !config.reconcileIntervalMs) return;
-    timer = setInterval(() => { reconcile().catch(() => {}); }, config.reconcileIntervalMs);
+    if (timer || !intervalMs) return;
+    timer = setInterval(() => { reconcile().catch(() => {}); }, intervalMs);
     timer.unref?.();
   }
   function stop() {

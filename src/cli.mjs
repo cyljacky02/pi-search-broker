@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { defaultConfigPath, loadConfig, writeFirstConfig, defaultStatePath, webSearchFragment, secretsOf } from './config.mjs';
 import { createGateway } from './gateway.mjs';
-import { AccountManager } from './manager.mjs';
+import { createAccountPool } from './pool.mjs';
+import { fileStore } from './pool/store.mjs';
 import { baseUrl, gatewayRequest } from './client.mjs';
 import { statusReport } from './format.mjs';
 import { runDoctor, formatChecks } from './doctor.mjs';
@@ -57,7 +58,7 @@ try {
     const [id, allocationId, amount] = positional();
     if (cmd === 'serve') {
       const { server } = createGateway(config, {
-        statePath: defaultStatePath(path),
+        store: fileStore(defaultStatePath(path)),
         logger: (line) => console.log(`${new Date().toISOString()} ${line}`)
       });
       server.on('error', (err) => {
@@ -75,7 +76,7 @@ try {
       try { snapshot = await gatewayRequest(config, 'GET', '/status'); }
       catch {
         // Gateway not running: read the persisted state without writing to it.
-        snapshot = new AccountManager(config, { statePath: defaultStatePath(path), readOnly: true }).snapshot();
+        snapshot = createAccountPool(config.accounts, { store: fileStore(defaultStatePath(path), { readOnly: true }) }).snapshot();
         mode = 'offline, from state.json';
       }
       console.log(statusReport(snapshot, { mode, url: baseUrl(config) }));

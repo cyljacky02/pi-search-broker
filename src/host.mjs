@@ -7,6 +7,7 @@
 //  - one gateway owner per machine (the fixed loopback port); other processes act as clients;
 //  - a client takes over the port when the owner exits (ensure() is called before each search tool call).
 import { createGateway } from './gateway.mjs';
+import { fileStore } from './pool/store.mjs';
 import { APP_NAME, VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig } from './config.mjs';
 import { baseUrl, gatewayRequest } from './client.mjs';
 import { piWebSearchConfigPath, readPiWebSearchConfig, piWiringIssues } from './doctor.mjs';
@@ -107,7 +108,7 @@ export class BrokerHost {
   }
 
   listen(config) {
-    const gateway = createGateway(config, { statePath: defaultStatePath(this.configPath), logger: this.logger });
+    const gateway = createGateway(config, { store: fileStore(defaultStatePath(this.configPath)), logger: this.logger });
     return new Promise((resolve, reject) => {
       const onError = (err) => { gateway.server.close(); reject(err); };
       gateway.server.once('error', onError);
