@@ -1,6 +1,6 @@
 {
-  "name": "pi-dual-key-manager",
-  "version": "0.2.0",
+  "name": "pi-search-broker",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Local Exa + Tavily account-aware key rotation gateway (search broker) for pi-web-access, with a pi extension",

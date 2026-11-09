@@ -163,3 +163,30 @@ test('An out-of-credit account is retried at the earliest monthly reset or upcom
     assert.equal(at ? new Date(at).toISOString() : null, expected, why);
   }
 });
+
+test('A v1 state.json is upgraded on load: spend, health and balance survive under the v2 names', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-store-'));
+  const path = join(dir, 'state.json');
+  try {
+    const cfg = config(tavily('t', 'tvly-aaaaaaaa'));
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      accounts: { t: {
+        buckets: { free: { window: '2026-11-01', spent: 300, exactCalls: 3, estimatedCalls: 0 } },
+        disabled: 'quota', blockedUntil: Date.parse('2026-12-01T00:00:00Z'), cooldownUntil: 0, requests: 3, failures: 1,
+        reconciled: { at: '2026-11-08T00:00:00.000Z', remaining: 700, details: {} }
+      } }
+    }));
+    const pool = poolOf(cfg, { ms: DATE }, fileStore(path));
+    const a = account(pool);
+    assert.equal(a.allocations[0].spent, 300);
+    assert.equal(a.status, 'quota');
+    assert.equal(a.retryAt, '2026-12-01T00:00:00.000Z');
+    assert.equal(a.providerBalance.remaining, 700);
+    const saved = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(saved.version, 2);
+    assert.deepEqual(Object.keys(saved.accounts.t).filter((k) => ['buckets', 'blockedUntil', 'reconciled'].includes(k)), []);
+    assert.equal(saved.accounts.t.allocations.free.spent, 300);
+    assert.equal(saved.accounts.t.quotaRetryAt, Date.parse('2026-12-01T00:00:00Z'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

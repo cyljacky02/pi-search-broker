@@ -4,13 +4,18 @@ import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { execSync } from 'node:child_process';
 
-export const APP_NAME = 'pi-dual-key-manager';
-export const VERSION = '0.2.0';
+/** Product name, reported as the gateway's /health service id. */
+export const SERVICE_NAME = 'pi-search-broker';
+/** Service ids of earlier releases that a health probe still accepts, so mixed-version pi processes share one gateway. */
+export const LEGACY_SERVICE_NAMES = Object.freeze(['pi-dual-key-manager']);
+/** Config folder name, kept from before the product rename so existing configs and state.json are still found. */
+export const CONFIG_DIR_NAME = 'pi-dual-key-manager';
+export const VERSION = '0.3.0';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
 export const TOKEN_ENV = 'PI_SEARCH_BROKER_TOKEN';
 /** Optional override for the broker config path (used by the CLI default and the pi extension). */
 export const CONFIG_ENV = 'PI_SEARCH_BROKER_CONFIG';
-export const DEFAULT_DIR = join(homedir(), '.config', APP_NAME);
+export const DEFAULT_DIR = join(homedir(), '.config', CONFIG_DIR_NAME);
 export const DEFAULT_CONFIG = join(DEFAULT_DIR, 'config.json');
 
 /** pi-web-access's built-in Tavily key pool (TAVILY_API_KEY_1..20). */

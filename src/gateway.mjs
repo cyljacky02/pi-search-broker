@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { createAccountPool } from './pool.mjs';
 import { memoryStore } from './pool/store.mjs';
-import { APP_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
+import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
 import { ROUTES } from './providers.mjs';
 import { createReconciler } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
@@ -92,7 +92,7 @@ export function createGateway(config, {
       // Disallow query strings: no need to forward any untrusted host / URL fields.
       if (url.search) return reply(res, 400, { error: 'Query parameters are not supported' });
       if (url.pathname === '/health' && req.method === 'GET') {
-        return reply(res, 200, { ok: true, service: APP_NAME, version: VERSION, pid: process.pid });
+        return reply(res, 200, { ok: true, service: SERVICE_NAME, version: VERSION, pid: process.pid });
       }
       if (!isAuthorized(req, config.gateway.token)) return reply(res, 401, { error: unauthorizedHint(req) });
       if (url.pathname === '/status' && req.method === 'GET') return reply(res, 200, await control.status());

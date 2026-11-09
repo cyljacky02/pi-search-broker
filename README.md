@@ -64,7 +64,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
    ```
 
    This creates the following files and **never overwrites** existing ones:
-   - `~/.config/pi-dual-key-manager/config.json` (mode 0600)
+   - `~/.config/pi-dual-key-manager/config.json` (mode 0600) — the folder keeps the project's earlier name so existing configs and `state.json` keep working
    - `web-search.fragment.json` next to it, used only for standalone mode
 
    Set `PI_SEARCH_BROKER_CONFIG` to use another path.

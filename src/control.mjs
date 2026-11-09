@@ -6,7 +6,7 @@
 //               gateway ever writes account state
 // Every adapter: { mode, health(), status(), enable(id), disable(id), setSpent(id, allocationId, amount), reconcile(id?) }
 // health() -> { state: 'running', version } | { state: 'other' } (something else owns the port) | { state: 'down' }
-import { APP_NAME, VERSION } from './config.mjs';
+import { SERVICE_NAME, LEGACY_SERVICE_NAMES, VERSION } from './config.mjs';
 import { createAccountPool } from './pool.mjs';
 import { fileStore } from './pool/store.mjs';
 
@@ -23,7 +23,8 @@ export async function probeHealth(config, { fetchImpl = fetch } = {}) {
   try {
     const res = await fetchImpl(`${baseUrl(config)}/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
     const data = res.ok ? await res.json() : null;
-    return data?.service === APP_NAME ? { state: 'running', version: data.version ?? null } : { state: 'other' };
+    const ours = data?.service === SERVICE_NAME || LEGACY_SERVICE_NAMES.includes(data?.service);
+    return ours ? { state: 'running', version: data.version ?? null } : { state: 'other' };
   } catch {
     return { state: 'down' };
   }

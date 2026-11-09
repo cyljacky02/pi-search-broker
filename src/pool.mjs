@@ -31,14 +31,14 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   /** Lazy time-based transitions: new allocation windows, quota re-opening, expired cooldowns. Runs at every entry point. */
   function refresh() {
     for (const account of accounts) {
-      const entry = state.accounts[account.id] ?? { buckets: {}, disabled: null, cooldownUntil: 0, blockedUntil: 0, requests: 0, failures: 0 };
-      entry.buckets ??= {};
+      const entry = state.accounts[account.id] ?? { allocations: {}, disabled: null, cooldownUntil: 0, quotaRetryAt: 0, requests: 0, failures: 0 };
+      entry.allocations ??= {};
       entry.possiblyBilled ??= 0;
       let newWindow = false;
       for (const allocation of account.allocations) {
         const window = windowOf(allocation, now());
-        if (entry.buckets[allocation.id]?.window !== window) {
-          entry.buckets[allocation.id] = { window, spent: 0, exactCalls: 0, estimatedCalls: 0 };
+        if (entry.allocations[allocation.id]?.window !== window) {
+          entry.allocations[allocation.id] = { window, spent: 0, exactCalls: 0, estimatedCalls: 0 };
           newWindow = true;
         }
       }
@@ -56,7 +56,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   function activeAllocations(account) {
     const entry = state.accounts[account.id];
     return spendingOrder(account.allocations, now(), {
-      spentOf: (id) => entry.buckets[id]?.spent || 0,
+      spentOf: (id) => entry.allocations[id]?.spent || 0,
       heldOf: (id) => held(account.id, id)
     });
   }
@@ -80,20 +80,20 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     const entry = state.accounts[account.id];
     let left = amount;
     for (const a of activeAllocations(account)) {
-      const spent = entry.buckets[a.id];
+      const spent = entry.allocations[a.id];
       const used = Math.min(left, capAtZero(a.limit - spent.spent));
       spent.spent = round6(spent.spent + used);
       left -= used;
       if (left < 1e-8) break;
     }
-    const first = account.allocations.find((a) => a.id in entry.buckets);
+    const first = account.allocations.find((a) => a.id in entry.allocations);
     // A provider can bill more than our estimate. Attribute the overage; never pretend it vanished.
-    if (left > 1e-8) entry.buckets[first.id].spent = round6(entry.buckets[first.id].spent + left);
+    if (left > 1e-8) entry.allocations[first.id].spent = round6(entry.allocations[first.id].spent + left);
     if (possiblyBilled) {
       entry.possiblyBilled++;
     } else {
       // Exact vs estimated counts are request-level provenance, not provider account balances.
-      entry.buckets[first.id][exact ? 'exactCalls' : 'estimatedCalls']++;
+      entry.allocations[first.id][exact ? 'exactCalls' : 'estimatedCalls']++;
       entry.requests++;
       entry.lastSuccessAt = new Date(now()).toISOString();
     }
@@ -183,19 +183,19 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
           id: account.id, provider: account.provider, unit: PROVIDERS[account.provider].unit,
           status: entry.disabled || (cooling ? 'cooldown' : 'active'),
           cooldownReason: cooling ? entry.cooldownReason ?? null : null,
-          retryAt: entry.disabled === 'quota' ? (entry.blockedUntil ? new Date(entry.blockedUntil).toISOString() : null) : (cooling ? new Date(entry.cooldownUntil).toISOString() : null),
+          retryAt: entry.disabled === 'quota' ? (entry.quotaRetryAt ? new Date(entry.quotaRetryAt).toISOString() : null) : (cooling ? new Date(entry.cooldownUntil).toISOString() : null),
           requests: entry.requests, failures: entry.failures, possiblyBilled: entry.possiblyBilled,
           lastStatus: entry.lastStatus ?? null, lastErrorTag: entry.lastErrorTag ?? null, lastRequestId: entry.lastRequestId ?? null,
           available: round6(available(account)),
-          providerBalance: entry.reconciled ?? null,
+          providerBalance: entry.providerBalance ?? null,
           reconcileError: entry.reconcileError ?? null,
           allocations: account.allocations.map((a) => {
-            const used = entry.buckets[a.id]?.spent ?? 0;
+            const used = entry.allocations[a.id]?.spent ?? 0;
             const active = isActive(a, now());
             return { id: a.id, period: a.period, limit: a.limit, spent: used,
               remainingEstimate: active ? round6(capAtZero(a.limit - used)) : 0,
               expiresAt: a.expiresAt || null, startsAt: a.startsAt || null, active,
-              window: entry.buckets[a.id]?.window ?? null };
+              window: entry.allocations[a.id]?.window ?? null };
           })
         };
       }),
@@ -211,21 +211,21 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     accounts,
     reserve,
     snapshot,
-    enable: (id) => change(id, (_a, entry) => { entry.disabled = null; entry.blockedUntil = 0; entry.cooldownUntil = 0; entry.cooldownReason = null; }),
+    enable: (id) => change(id, (_a, entry) => { entry.disabled = null; entry.quotaRetryAt = 0; entry.cooldownUntil = 0; entry.cooldownReason = null; }),
     disable: (id) => change(id, (_a, entry) => { entry.disabled = 'manual'; }),
     /** Correct local spend for one allocation to match the provider dashboard. Also re-enables the account. */
     setSpent: (id, allocationId, amount) => change(id, (account, entry) => {
       if (!account.allocations.some((a) => a.id === allocationId)) throw new Error('Unknown allocation');
       if (!isNonNegativeNumber(amount)) throw new Error('spent must be nonnegative number');
-      entry.buckets[allocationId].spent = round6(amount);
+      entry.allocations[allocationId].spent = round6(amount);
       entry.disabled = null;
-      entry.blockedUntil = 0;
+      entry.quotaRetryAt = 0;
     }),
     /** Store a provider balance check: a { remaining, details } result, or an Error. Report-only. */
     recordBalanceCheck: (id, outcome) => change(id, (_a, entry) => {
       const at = new Date(now()).toISOString();
       if (outcome instanceof Error) { entry.reconcileError = { at, message: outcome.message }; return; }
-      entry.reconciled = { at, remaining: round6(outcome.remaining), details: outcome.details ?? {} };
+      entry.providerBalance = { at, remaining: round6(outcome.remaining), details: outcome.details ?? {} };
       delete entry.reconcileError;
     })
   };

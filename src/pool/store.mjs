@@ -6,9 +6,20 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSy
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
 
-function checkVersion(state) {
+const RENAMED_IN_V2 = Object.freeze({ buckets: 'allocations', blockedUntil: 'quotaRetryAt', reconciled: 'providerBalance' });
+
+/** Bring older state up to STATE_VERSION (v1 used the pre-glossary field names); reject anything else. */
+function upgrade(state) {
+  if (state?.version === 1 && state.accounts && typeof state.accounts === 'object') {
+    for (const entry of Object.values(state.accounts)) {
+      for (const [from, to] of Object.entries(RENAMED_IN_V2)) {
+        if (from in entry) { entry[to] = entry[from]; delete entry[from]; }
+      }
+    }
+    state.version = 2;
+  }
   if (state?.version !== STATE_VERSION || !state.accounts || typeof state.accounts !== 'object') {
     throw new Error('Unsupported/corrupt state version');
   }
@@ -30,13 +41,13 @@ function atomicWriteJson(path, value) {
 
 export function fileStore(path, { readOnly = false } = {}) {
   return {
-    load: () => (existsSync(path) ? checkVersion(JSON.parse(readFileSync(path, 'utf8'))) : null),
+    load: () => (existsSync(path) ? upgrade(JSON.parse(readFileSync(path, 'utf8'))) : null),
     save: (state) => { if (!readOnly) atomicWriteJson(path, state); }
   };
 }
 
 export function memoryStore(initial = null) {
-  let saved = initial ? structuredClone(checkVersion(initial)) : null;
+  let saved = initial ? upgrade(structuredClone(initial)) : null;
   return {
     load: () => (saved ? structuredClone(saved) : null),
     save: (state) => { saved = structuredClone(state); }

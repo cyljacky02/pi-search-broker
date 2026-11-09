@@ -23,7 +23,7 @@ export function applyFailure(entry, account, { status, effect = null, tag = null
     entry.disabled = effect;
   } else if (effect === EFFECT.QUOTA) {
     entry.disabled = 'quota';
-    entry.blockedUntil = nextCreditChange(account.allocations, now);
+    entry.quotaRetryAt = nextCreditChange(account.allocations, now);
   } else if (effect === EFFECT.RATE_LIMIT) {
     entry.cooldownUntil = now + Math.max(RATE_LIMIT_MS.min, Math.min(RATE_LIMIT_MS.max, retryAfterMs || RATE_LIMIT_MS.fallback));
     entry.cooldownReason = effect;
@@ -35,9 +35,9 @@ export function applyFailure(entry, account, { status, effect = null, tag = null
 
 /** Time-based recovery. `newWindow`: an allocation just started a new window, so an out-of-credit account has credit again. */
 export function recover(entry, now, { newWindow = false } = {}) {
-  if (entry.disabled === 'quota' && (newWindow || (entry.blockedUntil && now >= entry.blockedUntil))) {
+  if (entry.disabled === 'quota' && (newWindow || (entry.quotaRetryAt && now >= entry.quotaRetryAt))) {
     entry.disabled = null;
-    entry.blockedUntil = 0;
+    entry.quotaRetryAt = 0;
   }
   if (entry.cooldownUntil && entry.cooldownUntil <= now) { entry.cooldownUntil = 0; entry.cooldownReason = null; }
 }

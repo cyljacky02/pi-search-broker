@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { serve, config, exa, tavily, json, secret } from './helpers.mjs';
+import { probeHealth } from '../src/control.mjs';
 
 test('Searches are proxied on the provider-compatible routes and persisted state never contains keys', async () => {
   await serve(config(exa('a', 'exa-real-aaa')), async (url) => json({ results: [{ url }], costDollars: { total: 0.007 } }),
@@ -77,4 +78,16 @@ test('A client that disconnects aborts the upstream attempt, which is counted as
     for (let i = 0; i < 50 && (await status()).accounts[0].possiblyBilled === 0; i++) await new Promise((r) => setTimeout(r, 10));
     assert.equal((await status()).accounts[0].possiblyBilled, 1);
   });
+});
+
+test('/health reports the pi-search-broker service; probes also accept the pre-rename id', async () => {
+  const cfg = config(tavily('t', 'tvly-aaaaaaaa'));
+  await serve(cfg, async () => json({}), async ({ base }) => {
+    assert.equal((await (await fetch(`${base}/health`)).json()).service, 'pi-search-broker');
+  });
+  const answering = (body) => async () => json(body);
+  assert.equal((await probeHealth(cfg, { fetchImpl: answering({ service: 'pi-search-broker', version: '0.3.0' }) })).state, 'running');
+  assert.equal((await probeHealth(cfg, { fetchImpl: answering({ service: 'pi-dual-key-manager', version: '0.2.0' }) })).state, 'running');
+  assert.equal((await probeHealth(cfg, { fetchImpl: answering({ service: 'something-else' }) })).state, 'other');
+  assert.equal((await probeHealth(cfg, { fetchImpl: async () => { throw new TypeError('fetch failed'); } })).state, 'down');
 });
