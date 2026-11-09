@@ -12,16 +12,41 @@ import { offlineControl, connectControl } from '../src/control.mjs';
 import { memoryStore } from '../src/pool/store.mjs';
 
 const TOKEN = 'local-only-secret-with-32-chars-12345';
-async function freePort() {
+async function freePort(avoid = null) {
   const srv = createServer();
   await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
   const { port } = srv.address();
   await new Promise((resolve) => srv.close(resolve));
-  return port;
+  return port === avoid ? freePort(avoid) : port;
 }
 
-async function setup() {
-  const port = await freePort();
+async function assertPortAvailable(port, message) {
+  await assert.doesNotReject(new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => server.close(resolve));
+  }), message);
+}
+
+function deferHealthProbe() {
+  let resume;
+  let signal;
+  const started = new Promise((resolve) => { signal = resolve; });
+  const gate = new Promise((resolve) => { resume = resolve; });
+  let paused = false;
+  const fetchImpl = async (url, opts) => {
+    if (!paused && String(url).endsWith('/health')) {
+      paused = true;
+      signal();
+      await gate;
+    }
+    return fetch(url, opts);
+  };
+  return { started, resume, fetchImpl };
+}
+
+async function setup(avoidPort = null) {
+  const port = await freePort(avoidPort);
   const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-host-'));
   const configPath = join(dir, 'config.json');
   writeFileSync(configPath, JSON.stringify({
@@ -111,6 +136,321 @@ test('Reference counting keeps the gateway alive while any session in the proces
     assert.equal(h.mode, 'idle');
     assert.equal(h.gateway, null);
   } finally { cleanup(); }
+});
+
+test('Final release while a health probe is pending leaves no Gateway on the port', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, EXA_BASE_URL: 'https://example.test/exa', PI_SEARCH_BROKER_TOKEN: 'previous-token' };
+  const env = { ...originalEnv };
+  const probe = deferHealthProbe();
+  const h = new BrokerHost({ configPath, env, fetchImpl: probe.fetchImpl, store: memoryStore() });
+  let acquiring;
+  let releasing;
+  try {
+    acquiring = h.acquire();
+    await probe.started;
+    releasing = h.release();
+    await new Promise((resolve) => setImmediate(resolve));
+    probe.resume();
+    await Promise.all([acquiring, releasing]);
+
+    assert.deepEqual(env, originalEnv, 'the original pi environment is restored');
+    await assertPortAvailable(port, 'the Gateway must not retain the port after final release');
+  } finally {
+    probe.resume();
+    await Promise.allSettled([acquiring, releasing].filter(Boolean));
+    // Also clean up the orphaned Gateway when this regression test fails on the old implementation.
+    await h.release();
+    await h.acquire();
+    await h.release();
+    cleanup();
+  }
+});
+
+test('A session arriving during final cleanup keeps a Gateway and its pi environment', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, EXA_BASE_URL: 'https://example.test/exa', PI_SEARCH_BROKER_TOKEN: 'previous-token' };
+  const env = { ...originalEnv };
+  const h = new BrokerHost({ configPath, env, store: memoryStore() });
+  try {
+    assert.equal(await h.acquire(), 'owner');
+    const releasing = h.release();
+    const acquiring = h.acquire();
+    const [, mode] = await Promise.all([releasing, acquiring]);
+
+    assert.equal(mode, 'owner');
+    assert.deepEqual(env, {
+      ...originalEnv,
+      EXA_BASE_URL: `http://127.0.0.1:${port}/exa`,
+      TAVILY_BASE_URL: `http://127.0.0.1:${port}/tavily`,
+      PI_SEARCH_BROKER_TOKEN: TOKEN
+    }, 'the new session retains the broker environment');
+    const health = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal((await health.json()).service, 'pi-search-broker');
+
+    await h.release();
+    assert.deepEqual(env, originalEnv, 'the last session restores the original environment');
+    await assertPortAvailable(port, 'the last session releases the Gateway port');
+  } finally {
+    await h.release();
+    cleanup();
+  }
+});
+
+test('A session released while waiting for cleanup cannot leave an orphaned Gateway', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, TAVILY_BASE_URL: 'https://example.test/tavily' };
+  const env = { ...originalEnv };
+  const probe = deferHealthProbe();
+  const h = new BrokerHost({ configPath, env, fetchImpl: probe.fetchImpl, store: memoryStore() });
+  const operations = [];
+  try {
+    operations.push(h.acquire());
+    await probe.started;
+    operations.push(h.release());
+    operations.push(h.acquire());
+    operations.push(h.release());
+    probe.resume();
+    await Promise.all(operations);
+
+    await assertPortAvailable(port, 'both released sessions must leave the port available');
+    assert.deepEqual(env, originalEnv, 'both released sessions must restore the original environment');
+  } finally {
+    probe.resume();
+    await Promise.allSettled(operations);
+    await h.release();
+    await h.acquire();
+    await h.release();
+    cleanup();
+  }
+});
+
+test('A late ensure during final release cannot restart the Gateway', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, EXA_BASE_URL: 'https://example.test/exa' };
+  const env = { ...originalEnv };
+  const h = new BrokerHost({ configPath, env, store: memoryStore() });
+  try {
+    assert.equal(await h.acquire(), 'owner');
+    const releasing = h.release();
+    const ensuring = h.ensure();
+    await Promise.all([releasing, ensuring]);
+
+    await assertPortAvailable(port, 'a late ensure must not restart a Gateway after final release');
+    assert.deepEqual(env, originalEnv);
+  } finally {
+    await h.release();
+    await h.acquire();
+    await h.release();
+    cleanup();
+  }
+});
+
+test('An ensure during reload uses the replacement session Gateway configuration', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const nextPort = await freePort(port);
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, EXA_BASE_URL: 'https://example.test/exa' };
+  const env = { ...originalEnv };
+  let holdProbe = false;
+  let resumeProbe;
+  let signalProbe;
+  const probeStarted = new Promise((resolve) => { signalProbe = resolve; });
+  const probeGate = new Promise((resolve) => { resumeProbe = resolve; });
+  const fetchImpl = async (url, opts) => {
+    if (holdProbe && String(url).endsWith('/health')) {
+      holdProbe = false;
+      signalProbe();
+      await probeGate;
+    }
+    return fetch(url, opts);
+  };
+  const h = new BrokerHost({ configPath, env, fetchImpl, store: memoryStore() });
+  const operations = [];
+  try {
+    assert.equal(await h.acquire(), 'owner');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.gateway.port = nextPort;
+    writeFileSync(configPath, JSON.stringify(config));
+    holdProbe = true;
+    operations.push(h.release());
+    operations.push(h.acquire());
+    operations.push(h.ensure());
+    await probeStarted;
+    await operations[0];
+    resumeProbe();
+    const [, mode] = await Promise.all(operations);
+
+    assert.equal(mode, 'owner');
+    assert.equal(env.EXA_BASE_URL, `http://127.0.0.1:${nextPort}/exa`);
+    const health = await fetch(`http://127.0.0.1:${nextPort}/health`).then((res) => res.json(), () => null);
+    assert.equal(health?.service, 'pi-search-broker', 'the replacement session can reach its configured Gateway');
+    await assertPortAvailable(port, 'the old Gateway port is released');
+
+    await h.release();
+    assert.deepEqual(env, originalEnv);
+  } finally {
+    resumeProbe();
+    await Promise.allSettled(operations);
+    await h.release();
+    cleanup();
+  }
+});
+
+test('Sessions arriving during cleanup share the Gateway until their last release', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, TAVILY_BASE_URL: 'https://example.test/tavily' };
+  const env = { ...originalEnv };
+  const h = new BrokerHost({ configPath, env, store: memoryStore() });
+  try {
+    assert.equal(await h.acquire(), 'owner');
+    const releasing = h.release();
+    const first = h.acquire();
+    const second = h.acquire();
+    const [, firstMode, secondMode] = await Promise.all([releasing, first, second]);
+    assert.equal(firstMode, 'owner');
+    assert.equal(secondMode, 'owner');
+
+    await h.release();
+    assert.equal(env.TAVILY_BASE_URL, `http://127.0.0.1:${port}/tavily`);
+    assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).service, 'pi-search-broker');
+
+    await h.release();
+    assert.deepEqual(env, originalEnv);
+    await assertPortAvailable(port, 'the last session releases the shared Gateway port');
+  } finally {
+    await h.release();
+    await h.release();
+    cleanup();
+  }
+});
+
+test('A live session survives overlapping final cleanups', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, EXA_BASE_URL: 'https://example.test/exa' };
+  const env = { ...originalEnv };
+  const probe = deferHealthProbe();
+  const h = new BrokerHost({ configPath, env, fetchImpl: probe.fetchImpl, store: memoryStore() });
+  const operations = [];
+  try {
+    operations.push(h.acquire());
+    await probe.started;
+    operations.push(h.release());
+    operations.push(h.acquire());
+    operations.push(h.release());
+    operations.push(h.acquire());
+    probe.resume();
+    await Promise.all(operations);
+
+    assert.equal(env.EXA_BASE_URL, `http://127.0.0.1:${port}/exa`);
+    assert.equal(env.TAVILY_BASE_URL, `http://127.0.0.1:${port}/tavily`);
+    assert.equal(env.PI_SEARCH_BROKER_TOKEN, TOKEN);
+    assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).service, 'pi-search-broker');
+
+    await h.release();
+    assert.deepEqual(env, originalEnv);
+    await assertPortAvailable(port, 'the last session releases the Gateway port');
+  } finally {
+    probe.resume();
+    await Promise.allSettled(operations);
+    await h.release();
+    await h.acquire();
+    await h.release();
+    cleanup();
+  }
+});
+
+test('An older cleanup cannot discard a newer live session configuration', async () => {
+  const first = await setup();
+  const replacement = await setup(first.port);
+  const originalEnv = { PI_CODING_AGENT_DIR: first.agentDir, EXA_BASE_URL: 'https://example.test/exa' };
+  const env = { ...originalEnv };
+  const other = new BrokerHost({ configPath: replacement.configPath, env: {}, store: memoryStore() });
+  // Return the real owner's health identity immediately, before the earlier close callback can run.
+  // The test separately checks the owner's actual HTTP endpoint below.
+  const fetchImpl = (url, opts) => String(url) === `http://127.0.0.1:${replacement.port}/health`
+    ? Promise.resolve(Response.json({ service: 'pi-search-broker' }))
+    : fetch(url, opts);
+  const h = new BrokerHost({ configPath: first.configPath, env, fetchImpl, store: memoryStore() });
+  const operations = [];
+  try {
+    assert.equal(await other.acquire(), 'owner');
+    assert.equal(await h.acquire(), 'owner');
+    operations.push(h.release());
+    operations.push(h.acquire());
+    operations.push(h.release());
+    await operations[2];
+
+    const config = JSON.parse(readFileSync(first.configPath, 'utf8'));
+    config.gateway.port = replacement.port;
+    writeFileSync(first.configPath, JSON.stringify(config));
+    operations.push(h.acquire());
+    assert.equal(await operations[3], 'client');
+    writeFileSync(first.configPath, '{invalid until the next reload');
+    await Promise.all(operations);
+
+    assert.equal(env.EXA_BASE_URL, `http://127.0.0.1:${replacement.port}/exa`);
+    assert.equal(env.TAVILY_BASE_URL, `http://127.0.0.1:${replacement.port}/tavily`);
+    assert.equal(env.PI_SEARCH_BROKER_TOKEN, TOKEN);
+    assert.equal((await h.control()).mode, 'http');
+    assert.equal((await (await fetch(`http://127.0.0.1:${replacement.port}/health`)).json()).service, 'pi-search-broker');
+
+    await h.release();
+    assert.deepEqual(env, originalEnv);
+  } finally {
+    await Promise.allSettled(operations);
+    await h.release();
+    await h.release();
+    await other.release();
+    first.cleanup();
+    replacement.cleanup();
+  }
+});
+
+test('Final release during a client takeover probe leaves the Gateway port free', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const originalEnv = { PI_CODING_AGENT_DIR: agentDir, TAVILY_BASE_URL: 'https://example.test/tavily' };
+  const env = { ...originalEnv };
+  let holdProbe = false;
+  let resumeProbe;
+  let signalProbe;
+  const probeStarted = new Promise((resolve) => { signalProbe = resolve; });
+  const probeGate = new Promise((resolve) => { resumeProbe = resolve; });
+  const fetchImpl = async (url, opts) => {
+    if (holdProbe && String(url).endsWith('/health')) {
+      holdProbe = false;
+      signalProbe();
+      await probeGate;
+    }
+    return fetch(url, opts);
+  };
+  const time = { ms: Date.now() };
+  const owner = new BrokerHost({ configPath, env: {}, store: memoryStore() });
+  const client = new BrokerHost({ configPath, env, fetchImpl, store: memoryStore(), now: () => time.ms });
+  const operations = [];
+  try {
+    assert.equal(await owner.acquire(), 'owner');
+    assert.equal(await client.acquire(), 'client');
+    await owner.release();
+    time.ms += 5000;
+    holdProbe = true;
+    operations.push(client.ensure());
+    await probeStarted;
+    operations.push(client.release());
+    await new Promise((resolve) => setImmediate(resolve));
+    resumeProbe();
+    await Promise.all(operations);
+
+    await assertPortAvailable(port, 'a released client must not leave a takeover Gateway behind');
+    assert.deepEqual(env, originalEnv);
+  } finally {
+    resumeProbe();
+    await Promise.allSettled(operations);
+    await client.release();
+    await client.acquire();
+    await client.release();
+    await owner.release();
+    cleanup();
+  }
 });
 
 test('Missing config leaves the host unconfigured with an actionable message and no env changes', async () => {

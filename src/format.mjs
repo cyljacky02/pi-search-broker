@@ -24,12 +24,15 @@ const FOOTER_MODE = Object.freeze({ http: ' [shared]', offline: ' [offline]' });
 export function statusLine(snapshot, { mode } = {}) {
   const parts = Object.entries(providerTotals(snapshot))
     .map(([p, t]) => `${p} ${amount(p, t.available)} (${t.usable}/${t.total})`);
-  return `search: ${parts.join(' · ') || 'no accounts'}${FOOTER_MODE[mode] ?? ''}`;
+  return `search: ${parts.join(' · ') || 'no accounts'}${snapshot.persistence?.state === 'unavailable' ? ' [storage error; paused]' : ''}${FOOTER_MODE[mode] ?? ''}`;
 }
 
 export function statusReport(snapshot, { mode, url } = {}) {
   const lines = [];
   lines.push(`Search broker${mode ? ` (${mode}${url ? ` @ ${url}` : ''})` : ''} - local estimates as of ${snapshot.updatedAt}`);
+  if (snapshot.persistence?.state === 'unavailable') {
+    lines.push('WARNING: Account pool state could not be saved; new attempts are paused until storage recovers. After a restart or takeover, check provider balances and correct spend.');
+  }
   for (const a of snapshot.accounts) {
     const retry = a.retryAt ? ` until ${a.retryAt}` : '';
     const why = a.cooldownReason ? ` (${a.cooldownReason})` : a.lastErrorTag && a.status !== 'active' ? ` (${a.lastErrorTag})` : '';

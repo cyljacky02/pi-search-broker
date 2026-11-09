@@ -5,11 +5,12 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../src/cli.mjs';
-import { parseCommand, usage } from '../src/commands.mjs';
+import { parseCommand, runCommand, usage } from '../src/commands.mjs';
 import { createGateway } from '../src/gateway.mjs';
 import { offlineControl } from '../src/control.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { tavily, secret } from './helpers.mjs';
+import { memoryStore } from '../src/pool/store.mjs';
 
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-cli-'));
@@ -47,6 +48,22 @@ test('CLI account commands run against the control and report results', async ()
     assert.equal(await run('status'), 0);
     assert.match(lines.out.at(-1), /^Search broker \(live @ http:\/\/127\.0\.0\.1:19473\)/);
     assert.match(lines.out.at(-1), /t \[tavily\] active/);
+  } finally { cleanup(); }
+});
+
+test('Status warns when Account pool state cannot be saved', async () => {
+  const { configPath, cleanup } = setup();
+  try {
+    const cfg = loadConfig(configPath);
+    const backing = memoryStore();
+    let writable = true;
+    const store = { load: () => backing.load(), save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); } };
+    const gateway = createGateway(cfg, { store });
+    writable = false;
+    await assert.rejects(gateway.control.disable('t'));
+    const report = await runCommand(gateway.control, { name: 'status' }, { config: cfg });
+    assert.match(report, /state.*could not be saved/i);
+    assert.match(report, /paused/i);
   } finally { cleanup(); }
 });
 

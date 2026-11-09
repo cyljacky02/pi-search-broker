@@ -25,16 +25,19 @@ The design decisions below are backed by the research notes in [`docs/research/`
   | 429 | Cool down using `Retry-After` (default 30 s, max 120 s); try the next account. An Exa network-scoped 429 is returned as-is |
   | Tavily 434 (flex capacity) | Try another account without penalty |
   | Exa 503 `SERVICE_OVERLOADED` (not billed) | Back off (250 ms, 500 ms) and retry, **without** cooling the account down |
-  | Other 5xx / network errors | 10-second cooldown on that account; try the next one |
+  | Other 5xx | 10-second cooldown on that account; try the next one |
+  | Connection failure proven to precede delivery | 10-second cooldown on that account; try the next one |
+  | Ambiguous connection failure | Counted as *possibly billed* at the estimate; never retried on another account |
   | Attempt timeout | Counted as *possibly billed*; **not** retried on another account (that could bill twice). Returns 504 so pi falls back to the other provider |
   | Other 4xx (400, 404, 422…) | Returned to the client with the provider's own message (keys redacted) |
 
 - **No billing surprises:**
   - `stream: true` is rejected up front, because a stream can't be metered and would be retried on every account.
   - The per-attempt timeout is 30 s on every route.
-  - A timed-out attempt is counted as *possibly billed* and never retried on another account.
+  - A timed-out attempt or an ambiguous connection failure is counted as *possibly billed* and never retried on another account. pi-web-access may still fall back to a different provider on 503/504, which can also bill the search.
   - A 2xx with an unparseable body is never retried on another account.
-  - If pi aborts the call, the upstream request is aborted too.
+  - If pi aborts the call, the upstream request is aborted too, including while its reply is being read.
+  - If account state cannot be saved, the broker keeps the live accounting and attempt record, reports the failure, and pauses new attempts until it can save the current state. A save failure after an attempt returns 500 rather than triggering automatic cross-provider fallback; inspect the provider balance before retrying.
 - **Exact accounting where the provider allows it:**
   - Exa uses `costDollars.total`.
   - Tavily uses `usage.credits`; the broker adds `include_usage: true` upstream and removes `usage` from the reply unless you asked for it.
@@ -179,6 +182,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
 - **Exhaustion replies.** When every account is used up the broker answers **429** (pi: `quota`). When every attempt failed for temporary reasons it answers **503**, or **504** after a timeout (pi: `transient`). Keep both `quota` and `transient` in `searchRouting.fallbackOn` so pi falls back to the other provider.
 - **Exa `/contents`** only carries traffic if `fetchRouting.providers` includes `"exa"`. Otherwise only searches use the broker.
 - **Loopback only.** pi-web-access allows loopback HTTP base URLs. Never expose the gateway beyond `127.0.0.1`.
+- **Shared port, shared gateway token.** Processes joining the same Port owner must use the same gateway token. A different token cannot control the existing gateway and will receive 401; `/broker doctor` reports the mismatch without printing either token.
 
 ## Managing accounts (CLI)
 
@@ -192,7 +196,7 @@ node src/cli.mjs set-spent exa-account-1 promo 12.50
 node src/cli.mjs set-spent tavily-account-1 monthly 230
 ```
 
-`set-spent` corrects **the amount already spent from an allocation** to match the dashboard: USD for Exa, credits for Tavily. It does not set the remaining balance.
+`set-spent` corrects **the amount already spent from an allocation** to match the dashboard: USD for Exa, credits for Tavily. It does not set the remaining balance. It also clears the account's disabled state; any separate cooldown remains in effect.
 
 After changing keys, expiry dates or the account list in `config.json`, run `/reload` in pi, or restart the standalone gateway.
 
@@ -201,6 +205,7 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
 - Real keys never go into `pool-state.json`, `/status`, logs, error bodies or pi session data. **`config.json` itself may contain literal keys**, so keep it out of cloud sync and Git, or use `$ENV` / `!command` sources.
 - `gateway.token` is a secret, too. With the extension it lives only in pi's process environment (`PI_SEARCH_BROKER_TOKEN`); in standalone mode protect the shell profile that exports it.
 - Local numbers are estimates unless the provider reported the cost (`costDollars.total`, `usage.credits`). Balance checks are shown alongside them, never applied automatically.
+  - If saving state fails, a running broker pauses new attempts and retries the save before accepting another one. A restart or Port owner takeover can only load the last successful save and cannot reliably detect missing spend. After a storage failure or crash, check the provider dashboards or `/broker reconcile`, then use `set-spent` to correct local figures.
   - Exa's `/credits` can lag by up to 5 minutes.
   - Tavily may report `0` credits for a single call on threshold-billed endpoints.
   - Whether Tavily bills searches that fail or time out is undocumented. Timed-out attempts are counted as possibly billed.

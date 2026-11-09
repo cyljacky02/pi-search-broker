@@ -2,7 +2,7 @@
 // or every account is used up. No HTTP server knowledge lives here: callers hand in a parsed body and get back
 // { status, body } to send. Billing-safety rules (docs/research/exa.md, docs/research/tavily.md):
 //  - every reservation ends exactly once (billed, possibly billed, or released);
-//  - an attempt that may have been billed (timeout, client gone, unreadable 2xx) is never retried elsewhere;
+//  - an attempt that may have been billed (timeout, client gone, unreadable 2xx, ambiguous network) is never retried;
 //  - a refused request is never retried on another account.
 import { PROVIDERS, ACTION, EFFECT, EXHAUST } from './providers.mjs';
 import { POSSIBLY_BILLED } from './pool.mjs';
@@ -12,7 +12,41 @@ export const CLIENT_CLOSED = 499;
 
 const MAX_ERROR_BODY = 64 * 1024;
 const STREAM_REJECTED = 'Streaming responses (stream: true) are not supported by the local search broker';
-const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const PRE_DELIVERY_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+const defaultSleep = (ms, signal) => new Promise((resolve) => {
+  if (signal.aborted) return resolve();
+  const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+  const timer = setTimeout(done, ms);
+  signal.addEventListener('abort', done, { once: true });
+});
+
+async function sleepUnlessAborted(sleep, ms, signal) {
+  if (signal.aborted) return;
+  let onAbort;
+  const aborted = new Promise((resolve) => { onAbort = resolve; signal.addEventListener('abort', onAbort, { once: true }); });
+  try { await Promise.race([sleep(ms, signal), aborted]); }
+  finally { signal.removeEventListener('abort', onAbort); }
+}
+
+// Generic fetch errors, resets, and socket closes do not prove that the request was never delivered.
+function isPreDeliveryConnectionError(error, seen = new Set()) {
+  let found = false;
+  while (error && (typeof error === 'object' || typeof error === 'function')) {
+    if (seen.has(error)) return false;
+    seen.add(error);
+    // Node can aggregate connection attempts. Every member must independently prove pre-delivery failure.
+    if (Array.isArray(error.errors)) {
+      if (!error.errors.length || !error.errors.every((cause) => isPreDeliveryConnectionError(cause, seen))) return false;
+      found = true;
+    }
+    if (error.code !== undefined) {
+      if (!PRE_DELIVERY_CODES.has(error.code)) return false;
+      found = true;
+    }
+    error = error.cause;
+  }
+  return found;
+}
 
 async function readErrorJson(response) {
   let text = '';
@@ -43,28 +77,33 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
     async function attemptOn(reservation) {
       const prepared = policy.prepare(body, reservation.account, headers);
       const attemptMs = Math.max(1, Math.min(limits.attemptTimeoutMs ?? route.timeoutMs, deadline - now()));
+      const timeoutSignal = AbortSignal.timeout(attemptMs);
 
       let upstream;
       try {
         upstream = await fetchImpl(`${policy.origin}${route.path}`, {
           method: 'POST', headers: prepared.headers, body: prepared.body, redirect: 'error',
-          signal: AbortSignal.any([AbortSignal.timeout(attemptMs), clientGone])
+          signal: AbortSignal.any([timeoutSignal, clientGone])
         });
       } catch (err) {
         if (clientGone.aborted) {
           reservation.settlePossiblyBilled(POSSIBLY_BILLED.CLIENT_CLOSED);
           return { done: { status: CLIENT_CLOSED, body: null } };
         }
-        if (err?.name === 'TimeoutError') {
+        if (timeoutSignal.aborted || err?.name === 'TimeoutError') {
           // The request was sent and may still be billed upstream. Never retry it on another account (that could
           // bill twice). 504 lets pi fall back to the other provider.
           reservation.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT);
           return { done: { status: 504, body: policy.errorBody(`${policy.name} did not answer within ${attemptMs} ms via the local broker; not retried to avoid double billing`) } };
         }
-        // Connection-level failure before a response: nothing was billed. Short cooldown, try another account.
-        reservation.fail({ status: 'network', effect: EFFECT.UPSTREAM });
-        outcome[EXHAUST.TRANSIENT] = true;
-        return { rotate: reservation.account.id };
+        if (isPreDeliveryConnectionError(err)) {
+          reservation.fail({ status: 'network', effect: EFFECT.UPSTREAM });
+          outcome[EXHAUST.TRANSIENT] = true;
+          return { rotate: reservation.account.id };
+        }
+        // A missing response does not establish whether the provider received and billed the request.
+        reservation.settlePossiblyBilled(POSSIBLY_BILLED.AMBIGUOUS_NETWORK);
+        return { done: { status: 503, body: policy.errorBody(`${policy.name} connection failed with delivery unknown via the local broker; not retried to avoid double billing`) } };
       }
 
       if (!upstream.ok) {
@@ -75,6 +114,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
           status: code, effect: verdict.effect, tag: verdict.tag, retryAfterMs: verdict.retryAfterMs,
           requestId: policy.requestId(parsed, upstream.headers)
         });
+        if (clientGone.aborted) return { done: { status: CLIENT_CLOSED, body: null } };
         const upstreamError = { done: { status: code >= 400 && code < 500 ? code : 502, body: policy.sanitizeError(code, parsed, secrets) } };
         if (verdict.action === ACTION.PASSTHROUGH) return upstreamError;
         if (verdict.once) {
@@ -91,7 +131,15 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
       try {
         data = await upstream.json();
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid JSON');
-      } catch {
+      } catch (err) {
+        if (clientGone.aborted) {
+          reservation.settlePossiblyBilled(POSSIBLY_BILLED.CLIENT_CLOSED);
+          return { done: { status: CLIENT_CLOSED, body: null } };
+        }
+        if (timeoutSignal.aborted || err?.name === 'TimeoutError') {
+          reservation.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT);
+          return { done: { status: 504, body: policy.errorBody(`${policy.name} did not answer within ${attemptMs} ms via the local broker; not retried to avoid double billing`) } };
+        }
         // A 2xx was probably billed. Do not retry on another account (it would bill again); let pi fall back.
         reservation.settlePossiblyBilled(POSSIBLY_BILLED.INVALID_RESPONSE);
         return { done: { status: 502, body: policy.errorBody(`${policy.name} returned an invalid response body via the local broker`) } };
@@ -104,7 +152,9 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
       return { done: { status: 200, body: policy.finalize(data, prepared.clientWantsUsage) } };
     }
 
-    while (now() < deadline && !clientGone.aborted) {
+    const maxWaitMs = Math.max(0, deadline - now());
+    const deadlineSignal = AbortSignal.timeout(maxWaitMs);
+    while (now() < deadline && !clientGone.aborted && !deadlineSignal.aborted) {
       // The pool gives the credit back if attemptOn throws before the reservation ended (e.g. while preparing).
       const step = await pool.attempt(route, estimate, attempted, attemptOn);
       if (!step) break;
@@ -113,7 +163,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
       // ACTION.RETRY (Exa 503 SERVICE_OVERLOADED, not billed): back off and retry without penalising the account.
       if (transientRetries >= limits.maxTransientRetries) break;
       transientRetries++;
-      await sleep(Math.min(250 * 2 ** (transientRetries - 1), Math.max(0, deadline - now())));
+      await sleepUnlessAborted(sleep, Math.min(250 * 2 ** (transientRetries - 1), Math.max(0, deadline - now())), AbortSignal.any([clientGone, deadlineSignal]));
     }
 
     if (clientGone.aborted) return { status: CLIENT_CLOSED, body: null };

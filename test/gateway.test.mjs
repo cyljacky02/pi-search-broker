@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { serve, config, exa, tavily, json, secret } from './helpers.mjs';
 import { probeHealth } from '../src/control.mjs';
+import { memoryStore } from '../src/pool/store.mjs';
 
 test('Searches are proxied on the provider-compatible routes and persisted state never contains keys', async () => {
   await serve(config(exa('a', 'exa-real-aaa')), async (url) => json({ results: [{ url }], costDollars: { total: 0.007 } }),
@@ -50,6 +51,39 @@ test('Unknown routes, query strings and non-JSON bodies are rejected before any 
     assert.equal(bad.status, 400);
     assert.equal(calls, 0);
   });
+});
+
+test('A failed state save prevents further upstream Attempts until storage recovers', async () => {
+  const backing = memoryStore();
+  let writable = true;
+  let calls = 0;
+  const store = {
+    load: () => backing.load(),
+    save: (state) => { if (!writable) throw new Error('disk failure: tvly-secret-key'); backing.save(state); }
+  };
+  await serve(config(tavily('t', 'tvly-secret-key')), async () => { calls++; return json({ results: [] }); }, async ({ post, status }) => {
+    writable = false;
+    const change = await post('/admin/disable', { id: 't' });
+    assert.equal(change.status, 503);
+    assert.doesNotMatch(await change.text(), /tvly-secret-key/);
+    assert.equal((await status()).accounts[0].status, 'manual');
+    writable = true;
+    assert.equal((await post('/admin/enable', { id: 't' })).status, 200);
+    writable = false;
+    const first = await post('/tavily/search', { query: 'q' });
+    assert.equal(first.status, 500, 'avoid cross-provider fallback after an Attempt that may have been billed');
+    const message = await first.text();
+    assert.match(message, /may have been billed/);
+    assert.doesNotMatch(message, /tvly-secret-key/);
+    assert.equal((await status()).persistence.state, 'unavailable');
+    assert.equal((await status()).recent.at(-1).cost, 1);
+    assert.equal((await post('/tavily/search', { query: 'q' })).status, 503);
+    assert.equal(calls, 1, 'no new Attempt is sent while saving still fails');
+    writable = true;
+    assert.equal((await post('/tavily/search', { query: 'q' })).status, 200);
+    assert.equal(calls, 2);
+    assert.equal((await status()).persistence.state, 'ok');
+  }, { store });
 });
 
 test('Admin routes enable, disable and set-spent without restarting', async () => {

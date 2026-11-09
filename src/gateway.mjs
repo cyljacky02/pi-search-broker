@@ -88,15 +88,17 @@ export function createGateway(config, {
       if (url.pathname.startsWith('/admin/') && req.method === 'POST') {
         const body = await readBody(req);
         try { return reply(res, 200, await serveAdmin(control, url.pathname.slice('/admin/'.length), body)); }
-        catch (err) { return reply(res, 400, { error: err.message }); }
+        catch (err) { return reply(res, err.statusCode || 400, { error: err.message }); }
       }
       const route = ROUTES[url.pathname];
       if (!route || req.method !== 'POST') return reply(res, 404, { error: 'Not found' });
       await proxy(req, res, route);
     } catch (err) {
       const code = err.statusCode || 500;
-      // Never include upstream response bodies, key strings or raw exception traces.
-      reply(res, code, { error: code === 500 ? 'Gateway internal error; inspect local logs' : err.message });
+      // Never include upstream response bodies, key strings or raw exception traces. A storage failure can follow
+      // a billed provider response; returning 503 could cause pi to retry the request against another provider.
+      const message = err.persistenceFailure ? err.message : code === 500 ? 'Gateway internal error; inspect local logs' : err.message;
+      reply(res, code, { error: message });
       if (code === 500) log(`internal error: ${err?.name ?? 'Error'}`);
     }
   });

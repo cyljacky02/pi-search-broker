@@ -16,6 +16,9 @@ const HOST_KEY = Symbol.for('pi-search-broker.host');
 const PROBE_CACHE_MS = 3000;
 
 export class BrokerHost {
+  // Latest zero-reference cleanup, chained after any earlier cleanup.
+  #releasing = null;
+
   /**
    * Everything the host creates (the gateway, its upstream and balance calls, health probes) uses these.
    * @param store  account pool store for an owned gateway (default: pool-state.json next to the config)
@@ -55,8 +58,10 @@ export class BrokerHost {
   }
 
   async acquire() {
-    this.refs++;
-    if (this.refs === 1) {
+    const first = ++this.refs === 1;
+    if (this.#releasing) await this.#releasing;
+    if (this.refs === 0) return this.mode; // This session was released while cleanup was pending.
+    if (first) {
       if (!this.loadConfig()) return this.mode;
       this.wireEnvironment();
     }
@@ -69,14 +74,27 @@ export class BrokerHost {
     if (this.refs === 0) return;
     this.refs--;
     if (this.refs > 0) return;
-    await this.stopServer();
-    this.restoreEnvironment();
-    this.config = null;
-    this.mode = 'idle';
+    const previous = this.#releasing;
+    const releasing = (async () => {
+      if (previous) await previous;
+      if (this.ensuring) await this.ensuring;
+      await this.stopServer();
+      this.restoreEnvironment();
+      this.config = null;
+      this.mode = 'idle';
+    })();
+    this.#releasing = releasing;
+    try {
+      await releasing;
+    } finally {
+      if (this.#releasing === releasing) this.#releasing = null;
+    }
   }
 
-  /** Make sure some process serves the gateway; become the owner if nobody does. */
+  /** While sessions hold the host, make sure some process serves the gateway; take over if nobody does. */
   ensure() {
+    if (this.refs === 0) return Promise.resolve(this.mode); // A late tool call must not resurrect a released host.
+    if (this.#releasing) return this.#releasing.then(() => this.ensure());
     if (this.ensuring) return this.ensuring;
     this.ensuring = this.#ensure().finally(() => { this.ensuring = null; });
     return this.ensuring;
@@ -88,6 +106,7 @@ export class BrokerHost {
     if (this.mode === 'owner' && this.gateway?.server.listening) return this.mode;
     if (this.mode === 'client' && this.now() - this.lastProbeOk < PROBE_CACHE_MS) return this.mode;
     if (await this.probe()) { this.mode = 'client'; return this.mode; }
+    if (this.refs === 0) return this.mode;
     try {
       await this.listen(config);
       this.mode = 'owner';

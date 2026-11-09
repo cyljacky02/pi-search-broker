@@ -2,18 +2,19 @@
 // time through a Reservation that ends exactly once; everything else (allocation windows, promo-first ordering,
 // reserved credit, cooldowns, quota re-opening, persistence, the attempt log) stays behind this interface.
 // Never exposes key material in persisted state or user-facing status.
-import { PROVIDERS, EFFECT } from './providers.mjs';
+import { PROVIDERS } from './providers.mjs';
 import { round6, isNonNegativeNumber } from './numbers.mjs';
 import { quietLogger } from './log.mjs';
 import { STATE_VERSION } from './pool/store.mjs';
 import { windowOf, isActive, remainingOf, spendingOrder } from './pool/allocation.mjs';
-import { applyFailure, recover, isUsable } from './pool/health.mjs';
+import { applyFailure, recover, isUsable, healthStatus } from './pool/health.mjs';
 
 /** Why an attempt is possibly billed: it reached the provider, but whether it was billed is unknown. */
 export const POSSIBLY_BILLED = Object.freeze({
   TIMEOUT: 'timeout',                  // the provider did not answer in time
   CLIENT_CLOSED: 'client-closed',      // the client went away mid-attempt
-  INVALID_RESPONSE: 'invalid-response' // a 2xx whose body could not be read
+  INVALID_RESPONSE: 'invalid-response', // a 2xx whose body could not be read
+  AMBIGUOUS_NETWORK: 'ambiguous-network' // delivery could not be determined
 });
 const POSSIBLY_BILLED_REASONS = new Set(Object.values(POSSIBLY_BILLED));
 const RECENT_LIMIT = 50;
@@ -39,10 +40,25 @@ function spread(amount, ordered, capacityOf) {
  */
 export function createAccountPool(accounts, { store, now = () => Date.now(), logger = null }) {
   const state = store.load() ?? { version: STATE_VERSION, accounts: {} };
-  const reserved = new Set(); // credit set aside by open reservations: { accountId, amounts: { [allocationId]: n } }
+  const reserved = new Set(); // open reservations: { accountId, amount }
   const recent = [];
   const log = quietLogger(logger);
-  const save = () => store.save(state);
+  let persistenceUnavailable = false;
+  const save = ({ attemptFinished = false } = {}) => {
+    try {
+      store.save(state);
+      if (persistenceUnavailable) log('Account pool state storage recovered');
+      persistenceUnavailable = false;
+    } catch {
+      if (!persistenceUnavailable) log('Account pool state could not be saved; new attempts are paused');
+      persistenceUnavailable = true;
+      const message = attemptFinished
+        ? 'Account pool state could not be saved after the provider answered; the attempt may have been billed. New attempts are paused; check provider balances before retrying.'
+        : 'Account pool state could not be saved; new attempts are paused until storage recovers';
+      // 500 avoids automatic cross-provider fallback after a possibly billed Attempt. Before dispatch, 503 is safe.
+      throw Object.assign(new Error(message), { statusCode: attemptFinished ? 500 : 503, persistenceFailure: true });
+    }
+  };
   const byId = (id) => {
     const account = accounts.find((a) => a.id === id);
     if (!account) throw new Error('Unknown account id');
@@ -68,18 +84,17 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     }
   }
 
-  function reservedOn(accountId, allocationId) {
-    let n = 0;
-    for (const credit of reserved) if (credit.accountId === accountId) n += credit.amounts[allocationId] || 0;
-    return n;
-  }
-  /** Allocations that can be spent now, in spending order, with what is left after open reservations. */
+  /** Place all open Reservations on the allocations spendable now, then return the unreserved credit. */
   function activeAllocations(account) {
     const tallies = state.accounts[account.id].allocations;
-    return spendingOrder(account.allocations, now(), {
-      spentOf: (id) => tallies[id]?.spent || 0,
-      reservedOf: (id) => reservedOn(account.id, id)
-    });
+    const spentOf = (id) => tallies[id]?.spent || 0;
+    const at = now();
+    const ordered = spendingOrder(account.allocations, at, { spentOf, reservedOf: () => 0 });
+    const held = [...reserved].reduce((sum, credit) => sum + (credit.accountId === account.id ? credit.amount : 0), 0);
+    // Reservations follow the credit available at settlement, including across an expiry or a new window.
+    const { parts } = spread(held, ordered, (a) => a.remaining);
+    const reservedById = new Map(parts.map(([allocation, amount]) => [allocation.id, round6(amount)]));
+    return spendingOrder(account.allocations, at, { spentOf, reservedOf: (id) => reservedById.get(id) ?? 0 });
   }
 
   function choose(provider, amount, excluded) {
@@ -99,11 +114,16 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   function charge(account, amount, exact, { possiblyBilled = false, requestId = null } = {}) {
     const entry = state.accounts[account.id];
     const tallies = entry.allocations;
-    const { parts, left } = spread(amount, activeAllocations(account), (a) => remainingOf(a, tallies[a.id].spent));
+    const { parts, left } = spread(amount, activeAllocations(account), (a) => a.remaining);
     for (const [allocation, used] of parts) tallies[allocation.id].spent = round6(tallies[allocation.id].spent + used);
     const first = account.allocations.find((a) => a.id in tallies);
-    // A provider can bill more than our estimate. Attribute the overage; never pretend it vanished.
-    if (left > 1e-8) tallies[first.id].spent = round6(tallies[first.id].spent + left);
+    // A provider can bill more than our estimate. Attribute the overage to current credit, even when held or spent.
+    if (left > 1e-8) {
+      const at = now();
+      const ordered = spendingOrder(account.allocations, at, { spentOf: (id) => tallies[id]?.spent || 0, reservedOf: () => 0 });
+      const overage = ordered[0] ?? account.allocations.find((a) => isActive(a, at)) ?? first;
+      tallies[overage.id].spent = round6(tallies[overage.id].spent + left);
+    }
     if (possiblyBilled) {
       entry.possiblyBilled++;
     } else {
@@ -131,12 +151,14 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
    * If `use` returns or throws without ending it, the request was never sent: the credit returns with no penalty.
    */
   async function attempt(route, estimate, excludedIds, use) {
+    if (!isNonNegativeNumber(estimate)) throw new Error('estimate must be a nonnegative number');
+    // Never send another Attempt while live accounting is newer than the last successful save.
+    if (persistenceUnavailable) save();
     refresh();
     const choice = choose(route.provider, estimate, excludedIds);
     if (!choice) return null;
     const { account } = choice;
-    const { parts } = spread(estimate, choice.usable, (a) => a.remaining);
-    const credit = { accountId: account.id, amounts: Object.fromEntries(parts.map(([a, used]) => [a.id, round6(used)])) };
+    const credit = { accountId: account.id, amount: estimate };
     reserved.add(credit);
     const started = now();
     let open = true;
@@ -146,14 +168,15 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
       reserved.delete(credit);
       refresh();
       apply();
-      save();
       recordAttempt({ provider: route.provider, path: route.path, account: account.id, status, ms: now() - started, ...extra });
+      save({ attemptFinished: true });
     };
     const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null));
 
     const reservation = {
       account,
       settle({ status = 200, amount, exact, requestId = null }) {
+        if (!isNonNegativeNumber(amount)) throw new Error('amount must be a nonnegative number');
         end(status, defined({ requestId, cost: amount, exact }), () => charge(account, amount, exact, { requestId }));
       },
       settlePossiblyBilled(reason) {
@@ -209,15 +232,13 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     refresh();
     return {
       updatedAt: new Date(now()).toISOString(),
+      persistence: { state: persistenceUnavailable ? 'unavailable' : 'ok' },
       note: 'Local accounting. Exa uses costDollars.total and Tavily uses usage.credits when reported; otherwise estimates. "providerBalance" is the last report-only balance check, if any.',
       accounts: accounts.map((account) => {
         const entry = state.accounts[account.id];
-        const cooling = entry.cooldownUntil > now();
         return {
           id: account.id, provider: account.provider, unit: PROVIDERS[account.provider].unit,
-          status: entry.disabled || (cooling ? 'cooldown' : 'active'),
-          cooldownReason: cooling ? entry.cooldownReason ?? null : null,
-          retryAt: entry.disabled === EFFECT.QUOTA ? (entry.quotaRetryAt ? new Date(entry.quotaRetryAt).toISOString() : null) : (cooling ? new Date(entry.cooldownUntil).toISOString() : null),
+          ...healthStatus(entry, now()),
           requests: entry.requests, failures: entry.failures, possiblyBilled: entry.possiblyBilled,
           lastStatus: entry.lastStatus ?? null, lastErrorTag: entry.lastErrorTag ?? null, lastRequestId: entry.lastRequestId ?? null,
           available: round6(totalRemaining(activeAllocations(account))),

@@ -20,8 +20,10 @@ export function applyFailure(entry, account, { status, effect = null, tag = null
   entry.lastStatus = status;
   entry.lastErrorTag = tag;
   if (effect === EFFECT.AUTH || effect === EFFECT.BLOCKED) {
-    entry.disabled = effect;
-  } else if (effect === EFFECT.QUOTA) {
+    // A manually parked account stays parked until an explicit administrative action.
+    if (entry.disabled !== 'manual') entry.disabled = effect;
+  } else if (effect === EFFECT.QUOTA && (!entry.disabled || entry.disabled === EFFECT.QUOTA)) {
+    // A later quota response must not turn a permanent disable into one that recovers on a reset.
     entry.disabled = effect;
     entry.quotaRetryAt = nextCreditChange(account.allocations, now);
   } else if (effect === EFFECT.RATE_LIMIT) {
@@ -44,3 +46,11 @@ export function recover(entry, now, { newWindow = false } = {}) {
 
 /** Whether a reservation may be made on this account right now. */
 export const isUsable = (entry, now) => !entry.disabled && !(entry.cooldownUntil && entry.cooldownUntil > now);
+
+/** The visible eligibility state and the time at which that state can recover without an admin action. */
+export function healthStatus(entry, now) {
+  const cooling = entry.cooldownUntil > now;
+  const status = entry.disabled || (cooling ? 'cooldown' : 'active');
+  const retryAt = entry.disabled === EFFECT.QUOTA ? entry.quotaRetryAt : !entry.disabled && cooling ? entry.cooldownUntil : 0;
+  return { status, cooldownReason: !entry.disabled && cooling ? entry.cooldownReason ?? null : null, retryAt: retryAt ? new Date(retryAt).toISOString() : null };
+}

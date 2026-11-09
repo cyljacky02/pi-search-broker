@@ -18,6 +18,10 @@ _Avoid_: Key, team, user
 All accounts for one provider that the broker rotates through.
 _Avoid_: Key pool, manager
 
+**Account health**:
+Whether an account is eligible for new attempts, including accounts paused by a human or restricted by a provider.
+_Avoid_: Status
+
 **Allocation**:
 A slice of an account's credit with a limit and a period: either `monthly` (it resets on a set day of the month) or `once` (a promo grant that may expire).
 _Avoid_: Bucket, grant, quota
@@ -26,12 +30,16 @@ _Avoid_: Bucket, grant, quota
 Credit held on one account's allocations for one in-flight request. It ends exactly once: the request is billed, it fails, or the credit is given back.
 _Avoid_: Lease, hold, token
 
+**Brokered request**:
+A client search or content request routed through a provider's account pool; it may involve multiple attempts.
+_Avoid_: Provider call
+
 **Attempt**:
 One try of a client request against one account. A single request may make several attempts across an account pool.
 _Avoid_: Try, call
 
 **Possibly billed**:
-The state of an attempt that reached the provider but whose outcome is unknown (a timeout, the client went away, or an unreadable reply). It is charged at the estimate and never retried on another account.
+The state of an attempt that may have reached the provider but whose outcome is unknown (a timeout, the client went away, an unreadable reply, or an ambiguous connection failure). It is charged at the estimate and never retried on another account.
 _Avoid_: Uncertain, lost
 
 **Provider balance**:
@@ -43,6 +51,10 @@ _Avoid_: Reconciled balance, remote balance
 **Broker**:
 The whole product: the gateway, its account pools, and the tools to run and inspect it.
 _Avoid_: Key manager, dual-key manager, proxy
+
+**Broker control**:
+The operations for inspecting the broker and managing its accounts, distinct from submitting search requests.
+_Avoid_: Management API
 
 **Gateway**:
 The loopback HTTP endpoint that pi-web-access sends Exa and Tavily requests to in place of the providers.

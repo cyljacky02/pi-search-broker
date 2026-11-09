@@ -4,7 +4,8 @@
 // pi's own /reload re-runs shutdown + start, which re-reads the broker config.
 import { getHost as processHost } from '../src/host.mjs';
 import { statusLine } from '../src/format.mjs';
-import { runDoctor, formatChecks } from '../src/doctor.mjs';
+import { runDoctor, formatChecks, gatewayControlIssue } from '../src/doctor.mjs';
+import { baseUrl } from '../src/control.mjs';
 import { COMMAND_NAMES, TAKES_ACCOUNT, usage, parseCommand, runCommand } from '../src/commands.mjs';
 
 const STATUS_KEY = 'search-broker';
@@ -47,6 +48,19 @@ export function createExtension({ getHost = processHost } = {}) {
       if (ctx?.hasUI) {
         for (const note of host.takeNotes()) ctx.ui.notify(note, 'warning');
         if (host.mode === 'unconfigured' || host.mode === 'error') ctx.ui.notify(host.lastError, host.mode === 'error' ? 'error' : 'warning');
+      }
+      if (host.mode === 'client') {
+        try {
+          const control = await host.control();
+          const health = await control.health();
+          const base = baseUrl(host.config);
+          const issue = gatewayControlIssue(health, base, control.mode)
+            ?? (health.state === 'other' ? `Something else answers on ${base}; change gateway.port.`
+              : health.state === 'down' ? `Gateway at ${base} became unreachable during startup. Check the Gateway and retry.` : null);
+          if (issue) say(ctx, `Search broker: ${issue}`, 'warning');
+        } catch {
+          say(ctx, 'Search broker: unable to check authenticated control. Check the Gateway and retry.', 'warning');
+        }
       }
       await refreshFooter(ctx);
     });

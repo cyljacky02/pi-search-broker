@@ -6,6 +6,7 @@
 //               gateway ever writes account state
 // Every adapter: { mode, health(), status(), enable(id), disable(id), setSpent(id, allocationId, amount), reconcile(id?) }
 // health() -> { state: 'running', version } | { state: 'other' } (something else owns the port) | { state: 'down' }
+// HTTP health also reports control: 'ready' | 'unauthorized' | 'unavailable' when the Broker is identified.
 import { SERVICE_NAME, LEGACY_SERVICE_NAMES, VERSION } from './config.mjs';
 import { createAccountPool } from './pool.mjs';
 import { fileStore } from './pool/store.mjs';
@@ -75,18 +76,38 @@ export function httpControl(config, { fetchImpl = fetch, timeoutMs = 30000 } = {
       method,
       headers: { authorization: `Bearer ${config.gateway.token}`, ...(body ? { 'content-type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(timeoutMs)
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: 'error'
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(`Gateway request failed: HTTP ${res.status}${data?.error ? ` (${data.error})` : ''}`);
     return data;
+  }
+  async function health() {
+    const identity = await probeHealth(config, { fetchImpl });
+    if (identity.state !== 'running') return identity;
+    try {
+      // /health establishes port ownership only; /status requires the Gateway token. Never follow redirects with it.
+      const res = await fetchImpl(`${baseUrl(config)}/status`, {
+        headers: { authorization: `Bearer ${config.gateway.token}` },
+        signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS), redirect: 'error'
+      });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return { ...identity, control: res.status === 401 ? 'unauthorized' : 'unavailable' };
+      }
+      const status = await res.json();
+      return { ...identity, control: Array.isArray(status?.accounts) ? 'ready' : 'unavailable' };
+    } catch {
+      return { ...identity, control: 'unavailable' };
+    }
   }
   const changes = Object.fromEntries(Object.entries(WIRE).map(([method, wire]) => [
     method, async (...args) => (await request('POST', `/admin/${wire.op}`, wire.body(...args))).results
   ]));
   return {
     mode: 'http',
-    health: () => probeHealth(config, { fetchImpl }),
+    health,
     status: () => request('GET', '/status'),
     ...changes
   };
@@ -96,7 +117,7 @@ export function offlineControl(config, { statePath, fetchImpl = fetch }) {
   const refuse = async () => { throw new Error('The broker gateway is not running. Start pi with the extension installed, or run "npm start".'); };
   return {
     mode: 'offline',
-    // Not 'running' (or this would not be offline), but it can still be another program holding the port.
+    // Re-probe identity; if a Broker appears later, this adapter remains offline until the caller reconnects.
     health: () => probeHealth(config, { fetchImpl }),
     status: async () => createAccountPool(config.accounts, { store: fileStore(statePath, { readOnly: true }) }).snapshot(),
     enable: refuse, disable: refuse, setSpent: refuse, reconcile: refuse

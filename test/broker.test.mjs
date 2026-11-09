@@ -1,9 +1,13 @@
-// Brokered request: the attempt loop, exercised through execute() with a fake upstream, a fake clock and no sockets.
+// Brokered request: the attempt loop, exercised through execute() with a real pool and controlled providers.
 import test from 'node:test';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
 import assert from 'node:assert/strict';
-import { broker, config, exa, tavily, json, keyOf, secret } from './helpers.mjs';
-import { EFFECT } from '../src/providers.mjs';
-import { CLIENT_CLOSED } from '../src/broker.mjs';
+import { broker, config, exa, tavily, json, keyOf, secret, DATE } from './helpers.mjs';
+import { EFFECT, ROUTES } from '../src/providers.mjs';
+import { CLIENT_CLOSED, createBroker } from '../src/broker.mjs';
+import { createAccountPool } from '../src/pool.mjs';
+import { memoryStore } from '../src/pool/store.mjs';
 
 const ok = (cost) => json({ results: [], costDollars: { total: cost } });
 
@@ -148,6 +152,89 @@ test('Exa 403 FEATURE_DISABLED tries exactly one other account, disables nobody,
   for (let i = 0; i < 3; i++) assert.equal(b.account(i).status, 'active');
 });
 
+test('A client closing during a 403 error-body read ends the request without retrying or billing it', async () => {
+  const client = new AbortController();
+  let reading;
+  const bodyReadStarted = new Promise((resolve) => { reading = resolve; });
+  let calls = 0;
+  const b = broker(config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb')), async (_u, opts) => {
+    calls++;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"tag":'));
+        opts.signal.addEventListener('abort', () => controller.error(new DOMException('body aborted', 'AbortError')), { once: true });
+      }
+    });
+    const response = new Response(stream, { status: 403 });
+    const readText = response.text.bind(response);
+    response.text = () => { reading(); return readText(); };
+    return response;
+  });
+  const pending = b.call('/exa/search', { query: 'q' }, { signal: client.signal });
+  await bodyReadStarted;
+  client.abort();
+  const res = await pending;
+  assert.equal(res.status, CLIENT_CLOSED);
+  assert.equal(res.body, null);
+  assert.equal(calls, 1);
+  assert.equal(b.account(0).possiblyBilled, 0);
+  assert.equal(b.account(0).allocations[0].spent, 0);
+  assert.equal(b.account(0).status, 'active');
+  assert.equal(b.status().recent.at(-1).status, 403);
+});
+
+test('A client closing during a 429 error-body read still applies the provider rate limit without rotating', async () => {
+  const client = new AbortController();
+  let reading;
+  const bodyReadStarted = new Promise((resolve) => { reading = resolve; });
+  let calls = 0;
+  const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), async (_u, opts) => {
+    calls++;
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"detail":'));
+        opts.signal.addEventListener('abort', () => controller.error(new DOMException('body aborted', 'AbortError')), { once: true });
+      }
+    }), { status: 429, headers: { 'Retry-After': '45' } });
+    const readText = response.text.bind(response);
+    response.text = () => { reading(); return readText(); };
+    return response;
+  });
+  const pending = b.call('/tavily/search', { query: 'q' }, { signal: client.signal });
+  await bodyReadStarted;
+  client.abort();
+  assert.deepEqual(await pending, { status: CLIENT_CLOSED, body: null });
+  assert.equal(calls, 1);
+  assert.equal(b.account(0).status, 'cooldown');
+  assert.equal(b.account(0).retryAt, new Date(b.time.ms + 45000).toISOString());
+  assert.equal(b.account(0).possiblyBilled, 0);
+  assert.equal(b.account(0).allocations[0].spent, 0);
+  assert.equal(b.status().recent.at(-1).status, 429);
+});
+
+test('An Exa 403 whose error body times out remains a refusal and is never retried', async (t) => {
+  const keepAlive = setTimeout(() => {}, 2000);
+  t.after(() => clearTimeout(keepAlive));
+  let calls = 0;
+  const cfg = { ...config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb')), attemptTimeoutMs: 50 };
+  const b = broker(cfg, async (_u, opts) => {
+    calls++;
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"tag":'));
+        opts.signal.addEventListener('abort', () => controller.error(new DOMException('body aborted', 'AbortError')), { once: true });
+      }
+    }), { status: 403 });
+  });
+  const res = await b.call('/exa/search', { query: 'q' });
+  assert.equal(res.status, 403);
+  assert.equal(calls, 1);
+  assert.equal(b.account(0).possiblyBilled, 0);
+  assert.equal(b.account(0).allocations[0].spent, 0);
+  assert.equal(b.account(0).status, 'active');
+  assert.equal(b.status().recent.at(-1).status, 403);
+});
+
 test('Exa 503 SERVICE_OVERLOADED retries with backoff without cooling the account down', async () => {
   let calls = 0;
   const b = broker(config(exa('only', 'exa-key-only')),
@@ -156,6 +243,34 @@ test('Exa 503 SERVICE_OVERLOADED retries with backoff without cooling the accoun
   assert.equal(calls, 2);
   assert.deepEqual(b.sleeps, [250]);
   assert.equal(b.account(0).status, 'active');
+});
+
+test('A client closing during transient backoff returns promptly without a second attempt', async () => {
+  const client = new AbortController();
+  let sleeping;
+  const sleepStarted = new Promise((resolve) => { sleeping = resolve; });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const cfg = config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb'));
+  const pool = createAccountPool(cfg.accounts, { store: memoryStore(), now: () => DATE });
+  let calls = 0;
+  const b = createBroker({ pool, limits: cfg, now: () => DATE,
+    fetchImpl: async () => { calls++; return json({ error: 'overloaded', tag: 'SERVICE_OVERLOADED' }, 503); },
+    sleep: () => { sleeping(); return gate; }
+  });
+  const pending = b.execute(ROUTES['/exa/search'], { query: 'q' }, { signal: client.signal });
+  await sleepStarted;
+  client.abort();
+  let timer;
+  const result = await Promise.race([pending, new Promise((resolve) => { timer = setTimeout(() => resolve('still waiting'), 100); })]);
+  clearTimeout(timer);
+  release();
+  await pending;
+  assert.deepEqual(result, { status: CLIENT_CLOSED, body: null });
+  assert.equal(calls, 1);
+  assert.equal(pool.snapshot().accounts[0].possiblyBilled, 0);
+  assert.equal(pool.snapshot().accounts[0].allocations[0].spent, 0);
+  assert.equal(pool.snapshot().recent.at(-1).status, 503);
 });
 
 test('Persistent Exa 503 gives up after maxTransientRetries with 503 (transient for pi fallback)', async () => {
@@ -281,6 +396,40 @@ test('Exa integration and beta headers are forwarded only when well-formed; clie
 
 // ---------- possibly billed ----------
 
+test('A provider that consumes the request then closes without headers is possibly billed and never rotated', async (t) => {
+  const received = [];
+  const server = createServer((req) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => { received.push({ body: JSON.parse(body), authorization: req.headers.authorization }); req.socket.destroy(); });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const url = `http://127.0.0.1:${server.address().port}/search`;
+  const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')),
+    (_url, opts) => fetch(url, opts));
+
+  const res = await b.call('/tavily/search', { query: 'delivered', search_depth: 'advanced' });
+  assert.equal(received.length, 1, 'never send the same possibly billed request to a second account');
+  assert.equal(received[0].body.query, 'delivered');
+  assert.equal(received[0].body.search_depth, 'advanced');
+  assert.equal(received[0].authorization, 'Bearer tvly-aaaaaaaa');
+  assert.equal(res.status, 503);
+  assert.match(res.body.detail.error, /not retried to avoid double billing/);
+  assert.ok(!JSON.stringify(res.body).includes('tvly-aaaaaaaa'));
+  assert.equal(b.account(0).status, 'active');
+  assert.equal(b.account(0).possiblyBilled, 1);
+  assert.equal(b.account(0).allocations[0].spent, 2);
+  assert.equal(b.account(0).requests, 0);
+  assert.equal(b.account(1).allocations[0].spent, 0);
+  assert.equal(b.status().recent.at(-1).status, 'ambiguous-network');
+});
+
 test('Attempt timeout is possibly billed, never cools down, and is never retried on another account', async () => {
   const keys = [];
   const b = broker(config(exa('a', 'exa-key-aaaa', '2026-11-20T00:00:00Z'), exa('b', 'exa-key-bbbb')), async (_u, opts) => {
@@ -296,6 +445,24 @@ test('Attempt timeout is possibly billed, never cools down, and is never retried
   assert.equal(a.possiblyBilled, 1);
   assert.equal(a.allocations[0].spent, 0.007);
   assert.equal(a.requests, 0);
+});
+
+test('An attempt deadline reported by fetch as AbortError remains a 504 timeout', async (t) => {
+  const keepAlive = setTimeout(() => {}, 2000);
+  t.after(() => clearTimeout(keepAlive));
+  let calls = 0;
+  const cfg = { ...config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), attemptTimeoutMs: 50 };
+  const b = broker(cfg, (_u, opts) => new Promise((_resolve, reject) => {
+    calls++;
+    opts.signal.addEventListener('abort', () => reject(new DOMException('request aborted', 'AbortError')), { once: true });
+  }));
+  const res = await b.call('/tavily/search', { query: 'q' });
+  assert.equal(res.status, 504);
+  assert.match(res.body.detail.error, /not retried to avoid double billing/);
+  assert.equal(calls, 1);
+  assert.equal(b.account(0).possiblyBilled, 1);
+  assert.equal(b.account(0).allocations[0].spent, 1);
+  assert.equal(b.status().recent.at(-1).status, 'timeout');
 });
 
 test('A client that goes away mid-attempt aborts upstream; the attempt is possibly billed and not retried', async () => {
@@ -314,6 +481,62 @@ test('A client that goes away mid-attempt aborts upstream; the attempt is possib
   assert.equal(b.status().recent.at(-1).status, 'client-closed');
 });
 
+test('A client closing while reading a 2xx body is client-closed and possibly billed', async () => {
+  const client = new AbortController();
+  let reading;
+  const bodyReadStarted = new Promise((resolve) => { reading = resolve; });
+  let calls = 0;
+  const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), async (_u, opts) => {
+    calls++;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"results":'));
+        opts.signal.addEventListener('abort', () => controller.error(new DOMException('body aborted', 'AbortError')), { once: true });
+      }
+    });
+    const response = new Response(stream, { status: 200 });
+    const readJson = response.json.bind(response);
+    response.json = () => { reading(); return readJson(); };
+    return response;
+  });
+  const pending = b.call('/tavily/search', { query: 'q' }, { signal: client.signal });
+  await bodyReadStarted;
+  client.abort();
+  const res = await pending;
+  assert.equal(res.status, CLIENT_CLOSED);
+  assert.equal(res.body, null);
+  assert.equal(calls, 1);
+  assert.equal(b.account(0).possiblyBilled, 1);
+  assert.equal(b.account(0).allocations[0].spent, 1);
+  assert.equal(b.account(1).allocations[0].spent, 0);
+  assert.equal(b.status().recent.at(-1).status, 'client-closed');
+});
+
+test('A timeout while reading a 2xx body is a timeout and possibly billed even if the stream throws AbortError', async (t) => {
+  const keepAlive = setTimeout(() => {}, 2000); // AbortSignal.timeout uses an unref'ed timer.
+  t.after(() => clearTimeout(keepAlive));
+  let calls = 0;
+  const cfg = { ...config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), attemptTimeoutMs: 50 };
+  const b = broker(cfg, async (_u, opts) => {
+    calls++;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"results":'));
+        opts.signal.addEventListener('abort', () => controller.error(new DOMException('body aborted', 'AbortError')), { once: true });
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+  const res = await b.call('/tavily/search', { query: 'q' });
+  assert.equal(res.status, 504);
+  assert.match(res.body.detail.error, /not retried to avoid double billing/);
+  assert.equal(calls, 1);
+  assert.equal(b.account(0).possiblyBilled, 1);
+  assert.equal(b.account(0).allocations[0].spent, 1);
+  assert.equal(b.account(1).allocations[0].spent, 0);
+  assert.equal(b.status().recent.at(-1).status, 'timeout');
+});
+
 test('An unreadable 2xx body is possibly billed and not retried on another account', async () => {
   let calls = 0;
   const b = broker(config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb')), async () => { calls++; return new Response('<html>', { status: 200 }); });
@@ -323,14 +546,57 @@ test('An unreadable 2xx body is possibly billed and not retried on another accou
   assert.equal(b.account(0).possiblyBilled + b.account(1).possiblyBilled, 1);
 });
 
-test('Network errors before a response rotate with a short cooldown', async () => {
-  let calls = 0;
-  const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')),
-    async () => { if (++calls === 1) throw new TypeError('fetch failed'); return json({ results: [] }); });
-  assert.equal((await b.call('/tavily/search', { query: 'q' })).status, 200);
-  assert.equal(calls, 2);
-  assert.deepEqual(b.sleeps, []);
-  assert.equal(b.account(0).cooldownReason, EFFECT.UPSTREAM);
+test('Generic failures, resets, socket closes and conflicting cause codes are never proof of non-delivery', async () => {
+  const coded = (code, cause) => Object.assign(new Error(`failure with tvly-aaaaaaaa and ${secret}`, { cause }), { code });
+  const cyclic = coded('ECONNREFUSED');
+  cyclic.cause = cyclic;
+  const failures = [
+    new TypeError(`fetch failed with tvly-aaaaaaaa and ${secret}`),
+    new TypeError('fetch failed', { cause: coded('ECONNRESET') }),
+    new TypeError('fetch failed', { cause: coded('UND_ERR_SOCKET') }),
+    new TypeError('fetch failed', { cause: coded('EPIPE') }),
+    new TypeError('fetch failed', { cause: coded('ECONNRESET', coded('ECONNREFUSED')) }),
+    new TypeError('fetch failed', { cause: new AggregateError([coded('ECONNRESET')], 'mixed failures', { cause: coded('ECONNREFUSED') }) }),
+    new TypeError('fetch failed', { cause: cyclic })
+  ];
+  for (const error of failures) {
+    let calls = 0;
+    const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')),
+      async () => { calls++; throw error; });
+    const res = await b.call('/tavily/search', { query: 'q' });
+    assert.equal(res.status, 503);
+    assert.match(res.body.detail.error, /not retried to avoid double billing/);
+    assert.ok(!JSON.stringify(res.body).includes('tvly-aaaaaaaa'));
+    assert.ok(!JSON.stringify(res.body).includes(secret));
+    assert.equal(calls, 1);
+    assert.equal(b.account(0).possiblyBilled, 1);
+    assert.equal(b.account(0).allocations[0].spent, 1);
+    assert.equal(b.account(1).allocations[0].spent, 0);
+    assert.equal(b.account(0).status, 'active');
+    assert.equal(b.status().recent.at(-1).status, 'ambiguous-network');
+  }
+});
+
+test('Proven pre-delivery connection failures rotate without charging the failed account', async () => {
+  for (const code of ['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']) {
+    let calls = 0;
+    const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), async () => {
+      if (++calls === 1) {
+        const cause = Object.assign(new Error('connect failed'), { code });
+        throw new TypeError('fetch failed', { cause: new Error('wrapped', { cause }) });
+      }
+      return json({ results: [] });
+    });
+    const res = await b.call('/tavily/search', { query: 'q' });
+    assert.equal(res.status, 200, code);
+    assert.equal(calls, 2, code);
+    assert.deepEqual(b.sleeps, [], code);
+    assert.equal(b.account(0).cooldownReason, EFFECT.UPSTREAM, code);
+    assert.equal(b.account(0).possiblyBilled, 0, code);
+    assert.equal(b.account(0).allocations[0].spent, 0, code);
+    assert.equal(b.account(1).allocations[0].spent, 1, code);
+    assert.equal(b.status().recent[0].status, 'network', code);
+  }
 });
 
 test('If preparing the upstream request throws, nothing is sent and the reserved credit comes back', async () => {

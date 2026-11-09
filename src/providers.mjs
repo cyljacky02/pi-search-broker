@@ -102,7 +102,8 @@ const exa = Object.freeze({
       const types = Math.max(1, Number(Boolean(body.text)) + Number(Boolean(body.highlights)) + Number(Boolean(body.summary)));
       return round6(Math.max(1, list.length) * (1 + subpages) * types * 0.001);
     }
-    const base = EXA_SEARCH_BASE[typeof body.type === 'string' ? body.type : 'auto'] ?? EXA_UNKNOWN_TYPE;
+    const type = typeof body.type === 'string' ? body.type : 'auto';
+    const base = Object.hasOwn(EXA_SEARCH_BASE, type) ? EXA_SEARCH_BASE[type] : EXA_UNKNOWN_TYPE;
     const results = Number.isFinite(body.numResults) ? Math.max(1, Math.ceil(body.numResults)) : 10;
     const c = body.contents && typeof body.contents === 'object' ? body.contents : {};
     const pageTypes = Math.max(1, Number(Boolean(c.text)) + Number(Boolean(c.highlights)));

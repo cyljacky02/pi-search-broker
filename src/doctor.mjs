@@ -74,6 +74,21 @@ export function piWiringIssues(pi, env, token) {
   return issues;
 }
 
+/** Explain an identified Broker whose authenticated control cannot be used, without exposing credentials. */
+export function gatewayControlIssue(health, base, mode) {
+  if (health.state !== 'running') return null;
+  if (mode === 'offline') {
+    return `Gateway at ${base} identifies as the Broker, but this control is offline. Reconnect and retry.`;
+  }
+  if (health.control === 'unauthorized') {
+    return `Gateway at ${base} identifies as the Broker but rejected this process's Gateway token. Make gateway.token match the port owner's trusted config, then reload or restart the client.`;
+  }
+  if (health.control === 'unavailable') {
+    return `Gateway at ${base} identifies as the Broker, but authenticated control is unavailable. Check the Gateway and retry.`;
+  }
+  return null;
+}
+
 /**
  * Check the broker config, the running gateway and pi-web-access's wiring, as seen from `env`.
  * @param config       the loaded broker config, or undefined when loading failed (then pass configError)
@@ -95,7 +110,9 @@ export async function runDoctor({ config, configError, control, env = process.en
 
   const base = baseUrl(config);
   const health = await control.health();
-  if (health.state === 'running') add('ok', `Gateway is running at ${base} (version ${health.version ?? '?'})`);
+  const controlIssue = gatewayControlIssue(health, base, control.mode);
+  if (controlIssue) add('error', controlIssue);
+  else if (health.state === 'running') add('ok', `Gateway is running at ${base} (version ${health.version ?? '?'})`);
   else if (health.state === 'other') add('error', `Something else answers on ${base}; change gateway.port`);
   else add('warn', `Gateway is not running at ${base}. Start pi with the extension installed, or run "npm start".`);
 

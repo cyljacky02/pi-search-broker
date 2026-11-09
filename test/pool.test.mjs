@@ -47,6 +47,81 @@ test('If the attempt throws or returns before the reservation ends, the credit c
   assert.deepEqual(pool.snapshot().recent, [], 'nothing was sent, so there is no attempt to log');
 });
 
+test('A higher actual cost preserves credit held by overlapping Reservations', async () => {
+  const a = { ...tavily('a', 'tvly-aaaaaaaa'), allocations: [
+    { id: 'promo', period: 'once', limit: 2, expires: 'never' },
+    { id: 'monthly', period: 'monthly', limit: 1 }
+  ] };
+  const pool = poolOf(config(a));
+  await pool.attempt(TAVILY, 1, NONE, async (first) => {
+    await pool.attempt(TAVILY, 1, NONE, async (second) => {
+      first.settle({ amount: 2, exact: true });
+      assert.equal(account(pool).available, 0, 'the remaining credit is already reserved');
+      assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('no credit remains')), null);
+      second.settle({ amount: 1, exact: true });
+    });
+  });
+  assert.deepEqual(account(pool).allocations.map((a) => a.spent), [2, 1]);
+});
+
+test('An open Reservation continues to hold credit when its promo Allocation expires', async () => {
+  const time = { ms: Date.parse('2026-11-09T23:59:59Z') };
+  const a = { ...tavily('a', 'tvly-aaaaaaaa'), allocations: [
+    { id: 'promo', period: 'once', limit: 1, expiresAt: '2026-11-10T00:00:00Z' },
+    { id: 'monthly', period: 'monthly', limit: 1, startsAt: '2026-11-10T00:00:00Z' }
+  ] };
+  const pool = poolOf(config(a), time);
+  await pool.attempt(TAVILY, 1, NONE, async (reservation) => {
+    time.ms = Date.parse('2026-11-10T00:00:01Z');
+    assert.equal(account(pool).available, 0, 'the in-flight Attempt still holds the newly active credit');
+    assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('credit is held')), null);
+    reservation.settle({ amount: 1, exact: true });
+  });
+  assert.equal(account(pool).allocations[1].spent, 1);
+});
+
+test('Overage after promo expiry is recorded on an active Allocation even when its credit is reserved', async () => {
+  const time = { ms: Date.parse('2026-11-09T23:59:59Z') };
+  const a = { ...tavily('a', 'tvly-aaaaaaaa'), allocations: [
+    { id: 'promo', period: 'once', limit: 1, expiresAt: '2026-11-10T00:00:00Z' },
+    { id: 'monthly', period: 'monthly', limit: 1 }
+  ] };
+  const pool = poolOf(config(a), time);
+  await pool.attempt(TAVILY, 1, NONE, async (first) => {
+    await pool.attempt(TAVILY, 1, NONE, async (second) => {
+      time.ms = Date.parse('2026-11-10T00:00:01Z');
+      first.settle({ amount: 1, exact: true });
+      assert.deepEqual(account(pool).allocations.map((allocation) => allocation.spent), [0, 1]);
+      assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('no credit remains')), null);
+      second.settle({ amount: 1, exact: true });
+    });
+  });
+  assert.deepEqual(account(pool).allocations.map((allocation) => allocation.spent), [0, 2]);
+});
+
+test('Invalid Reservation estimates are rejected before an Attempt starts', async () => {
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')));
+  let started = false;
+  for (const estimate of [NaN, Infinity, -1]) {
+    await assert.rejects(pool.attempt(TAVILY, estimate, NONE, () => { started = true; }), /estimate/i);
+  }
+  assert.equal(started, false);
+  assert.equal(account(pool).available, 1000);
+  assert.deepEqual(pool.snapshot().recent, []);
+});
+
+test('Invalid billed amounts cannot corrupt Account spend or end a Reservation', async () => {
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')));
+  await pool.attempt(TAVILY, 1, NONE, (reservation) => {
+    for (const amount of [NaN, Infinity, -1]) {
+      assert.throws(() => reservation.settle({ amount, exact: true }), /amount/i);
+    }
+    reservation.settle({ amount: 1, exact: true });
+  });
+  assert.equal(account(pool).allocations[0].spent, 1);
+  assert.equal(account(pool).available, 999);
+});
+
 test('No reservation when no account of that provider can cover the estimate; excluded accounts are skipped', async () => {
   const small = { ...tavily('small', 'tvly-small'), allocations: [{ id: 'free', limit: 1, period: 'monthly' }] };
   const pool = poolOf(config(small, exa('e', 'exa-key-aaaa')));
@@ -80,6 +155,61 @@ test('Failure effects: rate limit honours Retry-After within 1-120 s; auth disab
   assert.equal(account(pool, 1).status, 'auth');
   pool.enable('b');
   assert.equal(account(pool, 1).status, 'active');
+});
+
+test('An auth-disabled Account reports no automatic retry time after an overlapping rate limit', async () => {
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')));
+  await pool.attempt(TAVILY, 1, NONE, async (auth) => {
+    await pool.attempt(TAVILY, 1, NONE, (rate) => {
+      auth.fail({ status: 401, effect: EFFECT.AUTH });
+      rate.fail({ status: 429, effect: EFFECT.RATE_LIMIT, retryAfterMs: 30000 });
+    });
+  });
+  assert.equal(account(pool).status, 'auth');
+  assert.equal(account(pool).cooldownReason, null);
+  assert.equal(account(pool).retryAt, null, 'the cooldown expiry does not undo the auth disable');
+});
+
+test('A later quota failure cannot undo an auth disable from an overlapping Attempt', async () => {
+  const time = { ms: DATE };
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), time);
+  await pool.attempt(TAVILY, 1, NONE, async (auth) => {
+    await pool.attempt(TAVILY, 1, NONE, (quota) => {
+      auth.fail({ status: 401, effect: EFFECT.AUTH });
+      quota.fail({ status: 433, effect: EFFECT.QUOTA });
+    });
+  });
+  time.ms = Date.parse('2026-12-01T00:00:00Z');
+  assert.equal(account(pool).status, 'auth', 'a reset cannot re-enable an auth-disabled Account');
+  pool.enable('a');
+  assert.equal(account(pool).status, 'active');
+});
+
+test('A later quota failure cannot undo a blocked Account', async () => {
+  const time = { ms: DATE };
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), time);
+  await pool.attempt(TAVILY, 1, NONE, async (blocked) => {
+    await pool.attempt(TAVILY, 1, NONE, (quota) => {
+      blocked.fail({ status: 403, effect: EFFECT.BLOCKED });
+      quota.fail({ status: 433, effect: EFFECT.QUOTA });
+    });
+  });
+  time.ms = Date.parse('2026-12-01T00:00:00Z');
+  assert.equal(account(pool).status, 'blocked');
+});
+
+test('A manual disable survives a later quota failure until set-spent re-enables the Account', async () => {
+  const time = { ms: DATE };
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), time);
+  await pool.attempt(TAVILY, 1, NONE, (reservation) => {
+    pool.disable('a');
+    reservation.fail({ status: 433, effect: EFFECT.QUOTA });
+  });
+  time.ms = Date.parse('2026-12-01T00:00:00Z');
+  assert.equal(account(pool).status, 'manual');
+  assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('disabled')), null);
+  pool.setSpent('a', 'free', 0);
+  assert.equal(account(pool).status, 'active');
 });
 
 test('Spend is charged to the allocation window current when the reservation ends (month rollover)', async () => {
@@ -140,6 +270,68 @@ test('Balance checks are stored report-only; skips store nothing; unknown ids th
   assert.equal(t.available, 1000, 'local accounting is untouched');
   assert.equal(u.providerBalance, null);
   await assert.rejects(pool.checkBalances('nope', async () => ({ remaining: 1 })), /Unknown account id/);
+});
+
+test('Failed persistence preserves billed spend and pauses Attempts until the state can be saved', async () => {
+  const backing = memoryStore();
+  let writable = true;
+  const store = {
+    load: () => backing.load(),
+    save: (state) => { if (!writable) throw new Error('disk failure with tvly-secret-key'); backing.save(state); }
+  };
+  const cfg = config(tavily('a', 'tvly-secret-key'));
+  const pool = poolOf(cfg, { ms: DATE }, store);
+  writable = false;
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, (r) => r.settle({ amount: 2, exact: true })), (err) => {
+    assert.equal(err.statusCode, 500);
+    assert.match(err.message, /may have been billed/);
+    assert.doesNotMatch(err.message, /tvly-secret-key/);
+    return true;
+  });
+  let snapshot = pool.snapshot();
+  assert.equal(snapshot.accounts[0].allocations[0].spent, 2);
+  assert.equal(snapshot.recent.at(-1).cost, 2);
+  assert.equal(snapshot.persistence.state, 'unavailable');
+  let started = false;
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, () => { started = true; }), (err) => err.statusCode === 503);
+  assert.equal(started, false);
+
+  writable = true;
+  await pool.attempt(TAVILY, 1, NONE, (r) => r.settle({ amount: 1, exact: true }));
+  snapshot = pool.snapshot();
+  assert.equal(snapshot.persistence.state, 'ok');
+  assert.equal(poolOf(cfg, { ms: DATE }, backing).snapshot().accounts[0].allocations[0].spent, 3);
+});
+
+test('A failed save after a possibly billed Attempt keeps its estimate and reason', async () => {
+  const backing = memoryStore();
+  let writable = true;
+  const store = { load: () => backing.load(), save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); } };
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store);
+  writable = false;
+  await assert.rejects(pool.attempt(TAVILY, 2, NONE, (r) => r.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT)), (err) => err.statusCode === 500);
+  assert.equal(account(pool).allocations[0].spent, 2);
+  assert.equal(account(pool).possiblyBilled, 1);
+  assert.equal(pool.snapshot().recent.at(-1).status, 'timeout');
+  writable = true;
+  await pool.attempt(TAVILY, 1, NONE, (r) => r.fail({ status: 400 }));
+  assert.equal(poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, backing).snapshot().accounts[0].allocations[0].spent, 2);
+});
+
+test('A failed admin save keeps its live change and pauses Attempts until the change is durable', async () => {
+  const backing = memoryStore();
+  let writable = true;
+  const store = { load: () => backing.load(), save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); } };
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store);
+  writable = false;
+  assert.throws(() => pool.disable('a'), (err) => err.statusCode === 503);
+  assert.equal(account(pool).status, 'manual');
+  assert.equal(pool.snapshot().persistence.state, 'unavailable');
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, () => assert.fail('paused')), (err) => err.statusCode === 503);
+  writable = true;
+  assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('disabled')), null);
+  assert.equal(pool.snapshot().persistence.state, 'ok');
+  assert.equal(poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, backing).snapshot().accounts[0].status, 'manual');
 });
 
 test('fileStore persists state without keys; a read-only fileStore never writes', () => withTempDir(async (dir) => {
