@@ -166,7 +166,9 @@ export function validateConfig(input, secretOptions = {}) {
   if (input.pi !== undefined && !isObj(input.pi)) throw new Error('pi settings must be an object');
   const pi = { wireEnvironment: true, ...(input.pi ?? {}) };
   if (typeof pi.wireEnvironment !== 'boolean') throw new Error('pi.wireEnvironment must be true/false');
-  return { ...input, accounts, attemptTimeoutMs, totalTimeoutMs, maxTransientRetries, reconcileIntervalMs, pi };
+  // One spelling of the loopback host, so listen, wiring, the fragment and doctor all build the same base URL.
+  const host = gateway.host === 'localhost' ? '127.0.0.1' : gateway.host;
+  return { ...input, gateway: { ...gateway, host }, accounts, attemptTimeoutMs, totalTimeoutMs, maxTransientRetries, reconcileIntervalMs, pi };
 }
 
 export function loadConfig(path = defaultConfigPath(), secretOptions = {}) {

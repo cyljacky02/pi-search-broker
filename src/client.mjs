@@ -1,7 +1,7 @@
 // Authenticated loopback client for a running gateway (used by the CLI and by non-owner pi processes).
 
 export function baseUrl(config) {
-  const host = config.gateway.host === 'localhost' ? '127.0.0.1' : config.gateway.host;
+  const { host } = config.gateway; // validateConfig already turned "localhost" into 127.0.0.1
   return `http://${host.includes(':') ? `[${host}]` : host}:${config.gateway.port}`;
 }
 
