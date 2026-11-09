@@ -6,7 +6,8 @@ import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
 import { ROUTES } from './providers.mjs';
 import { createReconciler } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
-import { inProcessControl } from './control.mjs';
+import { inProcessControl, serveAdmin } from './control.mjs';
+import { quietLogger } from './log.mjs';
 
 function suppliedToken(req) {
   const headerKey = req.headers['x-api-key'];
@@ -58,24 +59,12 @@ async function readBody(req, maxBytes = 1024 * 1024) {
 export function createGateway(config, {
   store = memoryStore(), fetchImpl = fetch, now = () => Date.now(), sleep, logger = null, reconcileFetch = fetch
 } = {}) {
-  const log = (line) => { try { logger?.(line); } catch { /* logging must never break a request */ } };
-  const pool = createAccountPool(config.accounts, { store, now, logger: log });
+  const log = quietLogger(logger);
+  const pool = createAccountPool(config.accounts, { store, now, logger });
   const reconciler = createReconciler(pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
   const broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, now, sleep });
 
   const control = inProcessControl({ pool, reconciler });
-
-  /** HTTP wire format for the http control adapter: POST /admin/<op> with a JSON body. */
-  async function admin(op, body) {
-    if (body.id !== undefined && typeof body.id !== 'string') throw new Error('id must be a string');
-    if (op === 'reconcile') return { ok: true, results: await control.reconcile(body.id) };
-    if (!body.id) throw new Error('Account id required');
-    if (op === 'enable') await control.enable(body.id);
-    else if (op === 'disable') await control.disable(body.id);
-    else if (op === 'set-spent') await control.setSpent(body.id, body.allocationId, body.spent);
-    else throw new Error('Unknown operation');
-    return { ok: true };
-  }
 
   async function proxy(req, res, route) {
     const body = await readBody(req);
@@ -98,7 +87,7 @@ export function createGateway(config, {
       if (url.pathname === '/status' && req.method === 'GET') return reply(res, 200, await control.status());
       if (url.pathname.startsWith('/admin/') && req.method === 'POST') {
         const body = await readBody(req);
-        try { return reply(res, 200, await admin(url.pathname.slice('/admin/'.length), body)); }
+        try { return reply(res, 200, await serveAdmin(control, url.pathname.slice('/admin/'.length), body)); }
         catch (err) { return reply(res, 400, { error: err.message }); }
       }
       const route = ROUTES[url.pathname];

@@ -5,6 +5,7 @@
 //  - an attempt that may have been billed (timeout, client gone, unreadable 2xx) is never retried elsewhere;
 //  - a refused request is never retried on another account.
 import { PROVIDERS, ACTION, EFFECT, EXHAUST } from './providers.mjs';
+import { POSSIBLY_BILLED } from './pool.mjs';
 
 /** Status returned when the caller aborted: nobody is listening, so there is nothing to send. */
 export const CLIENT_CLOSED = 499;
@@ -20,7 +21,7 @@ async function readErrorJson(response) {
 }
 
 /**
- * @param pool      account pool (see pool.mjs): reserve(route, estimate, excludedIds) -> Reservation | null
+ * @param pool      account pool (see pool.mjs): attempt(route, estimate, excludedIds, use) runs `use` on a Reservation
  * @param limits    { totalTimeoutMs, attemptTimeoutMs?, maxTransientRetries }
  * @param secrets   strings to redact from anything returned to the client
  */
@@ -30,7 +31,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
     const policy = PROVIDERS[route.provider];
     // An SSE reply cannot be parsed or metered here, and would be retried (and billed) on every account.
     if (body.stream) return { status: 400, body: policy.errorBody(STREAM_REJECTED, { tag: 'BROKER_UNSUPPORTED' }) };
-    const estimate = policy.quote(route.path, body);
+    const estimate = policy.quote(body, route.path);
     const deadline = now() + limits.totalTimeoutMs;
     const clientGone = signal ?? new AbortController().signal;
     const attempted = new Set();
@@ -39,7 +40,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
     let transientRetries = 0;
 
     // One attempt on one reserved account. Ends the reservation, then returns a final { status, body } or a loop step.
-    async function attempt(reservation) {
+    async function attemptOn(reservation) {
       const prepared = policy.prepare(body, reservation.account, headers);
       const attemptMs = Math.max(1, Math.min(limits.attemptTimeoutMs ?? route.timeoutMs, deadline - now()));
 
@@ -51,19 +52,19 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
         });
       } catch (err) {
         if (clientGone.aborted) {
-          reservation.settleUncertain('client-closed');
+          reservation.settlePossiblyBilled(POSSIBLY_BILLED.CLIENT_CLOSED);
           return { done: { status: CLIENT_CLOSED, body: null } };
         }
         if (err?.name === 'TimeoutError') {
           // The request was sent and may still be billed upstream. Never retry it on another account (that could
           // bill twice). 504 lets pi fall back to the other provider.
-          reservation.settleUncertain('timeout');
+          reservation.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT);
           return { done: { status: 504, body: policy.errorBody(`${policy.name} did not answer within ${attemptMs} ms via the local broker; not retried to avoid double billing`) } };
         }
         // Connection-level failure before a response: nothing was billed. Short cooldown, try another account.
         reservation.fail({ status: 'network', effect: EFFECT.UPSTREAM });
         outcome[EXHAUST.TRANSIENT] = true;
-        return { rotate: true };
+        return { rotate: reservation.account.id };
       }
 
       if (!upstream.ok) {
@@ -83,7 +84,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
         }
         if (verdict.exhaust === EXHAUST.REQUEST) outcome.request = { status: code, body: policy.sanitizeError(code, parsed, secrets) };
         else outcome[verdict.exhaust] = true;
-        return verdict.action === ACTION.ROTATE ? { rotate: true } : { retry: true };
+        return verdict.action === ACTION.ROTATE ? { rotate: reservation.account.id } : { retry: true };
       }
 
       let data;
@@ -92,7 +93,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid JSON');
       } catch {
         // A 2xx was probably billed. Do not retry on another account (it would bill again); let pi fall back.
-        reservation.settleUncertain('invalid-response');
+        reservation.settlePossiblyBilled(POSSIBLY_BILLED.INVALID_RESPONSE);
         return { done: { status: 502, body: policy.errorBody(`${policy.name} returned an invalid response body via the local broker`) } };
       }
       const reported = policy.reportedCost(data);
@@ -104,17 +105,11 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
     }
 
     while (now() < deadline && !clientGone.aborted) {
-      const reservation = pool.reserve(route, estimate, attempted);
-      if (!reservation) break;
-      let step;
-      try {
-        step = await attempt(reservation);
-      } finally {
-        // Anything that throws before the reservation ended (e.g. while preparing the request) gives the credit back.
-        if (reservation.open) reservation.abandon();
-      }
+      // The pool gives the credit back if attemptOn throws before the reservation ended (e.g. while preparing).
+      const step = await pool.attempt(route, estimate, attempted, attemptOn);
+      if (!step) break;
       if (step.done) return step.done;
-      if (step.rotate) { attempted.add(reservation.account.id); continue; }
+      if (step.rotate) { attempted.add(step.rotate); continue; }
       // ACTION.RETRY (Exa 503 SERVICE_OVERLOADED, not billed): back off and retry without penalising the account.
       if (transientRetries >= limits.maxTransientRetries) break;
       transientRetries++;

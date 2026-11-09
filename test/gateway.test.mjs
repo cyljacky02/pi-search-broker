@@ -62,6 +62,10 @@ test('Admin routes enable, disable and set-spent without restarting', async () =
     assert.equal((await post('/admin/disable', { id: 't-1' }, 'bad-token')).status, 401);
     assert.equal((await post('/admin/enable', { id: 't-1' })).status, 200);
     assert.equal((await post('/admin/explode', { id: 't-1' })).status, 400);
+    const empty = await post('/admin/enable', { id: '' });
+    assert.equal(empty.status, 400);
+    assert.equal((await empty.json()).error, 'Unknown account id');
+    assert.equal((await post('/admin/enable', {})).status, 400);
   });
 });
 

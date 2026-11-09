@@ -8,7 +8,7 @@ import { BrokerHost } from '../src/host.mjs';
 import { createExtension } from '../extension/index.js';
 import { runDoctor, describeKey, piWebSearchConfigPath } from '../src/doctor.mjs';
 import { loadConfig } from '../src/config.mjs';
-import { offlineControl } from '../src/control.mjs';
+import { offlineControl, connectControl } from '../src/control.mjs';
 import { memoryStore } from '../src/pool/store.mjs';
 
 const TOKEN = 'local-only-secret-with-32-chars-12345';
@@ -58,11 +58,11 @@ test('First host owns the port, a second process is a client, and takes over whe
     assert.match(notes, /TAVILY_API_KEY_n/);
     assert.ok(!notes.includes('exa-real') && !notes.includes(TOKEN));
     // The client controls the owner's gateway over HTTP.
-    assert.equal(b.control().mode, 'http');
-    assert.equal((await b.control().status()).accounts[0].id, 'tavily-1');
-    await b.control().disable('tavily-1');
-    assert.equal((await a.control().status()).accounts[0].status, 'manual');
-    await b.control().enable('tavily-1');
+    assert.equal((await b.control()).mode, 'http');
+    assert.equal((await (await b.control()).status()).accounts[0].id, 'tavily-1');
+    await (await b.control()).disable('tavily-1');
+    assert.equal((await (await a.control()).status()).accounts[0].status, 'manual');
+    await (await b.control()).enable('tavily-1');
     // Owner leaves: env restored, port freed; once the client's probe cache expires, it takes over.
     await a.release();
     assert.equal(envA.EXA_BASE_URL, undefined);
@@ -70,8 +70,8 @@ test('First host owns the port, a second process is a client, and takes over whe
     assert.equal(await b.ensure(), 'client', 'a recent successful probe is trusted for a few seconds');
     time.ms += 5000;
     assert.equal(await b.ensure(), 'owner');
-    assert.equal(b.control().mode, 'in-process');
-    assert.equal((await b.control().status()).accounts[0].status, 'active');
+    assert.equal((await b.control()).mode, 'in-process');
+    assert.equal((await (await b.control()).status()).accounts[0].status, 'active');
   } finally {
     await a.release(); await b.release();
     cleanup();
@@ -94,7 +94,7 @@ test('An owner host sends searches upstream through its injected fetch', async (
     });
     assert.equal(res.status, 200);
     assert.deepEqual(upstream, ['https://api.tavily.com/search']);
-    assert.equal((await h.control().status()).accounts[0].allocations[0].spent, 1);
+    assert.equal((await (await h.control()).status()).accounts[0].allocations[0].spent, 1);
   } finally { await h.release(); cleanup(); }
 });
 
@@ -119,7 +119,7 @@ test('Missing config leaves the host unconfigured with an actionable message and
   assert.equal(await h.acquire(), 'unconfigured');
   assert.match(h.lastError, /npm run init/);
   assert.deepEqual(env, {});
-  assert.throws(() => h.control(), /npm run init/);
+  await assert.rejects(h.control(), /npm run init/);
   await h.release();
 });
 
@@ -203,6 +203,12 @@ test('doctor: explains the EXA_API_KEY override trap and the keyless Exa MCP byp
     assert.match(text, /lacks transient/);
     assert.ok(!text.includes('tvly-real-key-in-shell') && !text.includes(TOKEN));
     assert.deepEqual(await runDoctor({ configError: 'Missing config' }), [{ level: 'error', message: 'Broker config: Missing config' }]);
+    // Another program on the gateway port is an error, not "not running".
+    const otherProgram = async () => Response.json({ service: 'some-other-app' });
+    const control = await connectControl({ config, statePath: join(dir, 'pool-state.json'), fetchImpl: otherProgram });
+    assert.equal(control.mode, 'offline');
+    const blocked = JSON.stringify(await runDoctor({ config, control, env, home }));
+    assert.match(blocked, /"level":"error","message":"Something else answers on http:\/\/127\.0\.0\.1:\d+; change gateway\.port"/);
   } finally { cleanup(); }
 });
 

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PROVIDERS, ACTION, EFFECT } from '../src/providers.mjs';
 
-const quote = (provider, path, body) => PROVIDERS[provider].quote(path, body);
+const quote = (provider, path, body) => PROVIDERS[provider].quote(body, path);
 
 test('Exa 402 X402_PAYMENT_REQUIRED is a credential problem, other 402 is quota; network 429 passes through', () => {
   const classify = (...args) => PROVIDERS.exa.classify(...args);

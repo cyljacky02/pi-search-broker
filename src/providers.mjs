@@ -94,8 +94,8 @@ const exa = Object.freeze({
   },
   finalize: (data) => data,
 
-  /** Reservation estimate in USD; errs on the high side. */
-  quote(path, body) {
+  /** Reservation estimate in USD for a request to `path`; errs on the high side. */
+  quote(body, path) {
     if (path === '/contents') {
       const list = Array.isArray(body.urls) ? body.urls : Array.isArray(body.ids) ? body.ids : [];
       const subpages = Number.isInteger(body.subpages) && body.subpages > 0 ? body.subpages : 0;
@@ -185,8 +185,8 @@ const tavily = Object.freeze({
     return data;
   },
 
-  /** Reservation estimate in credits. */
-  quote(_path, body) {
+  /** Reservation estimate in credits (only /search is routed). */
+  quote(body) {
     if (body.search_depth === 'advanced') return 2;
     if (body.auto_parameters === true && body.search_depth === undefined) return 2; // may auto-select advanced
     return 1; // basic, fast, ultra-fast

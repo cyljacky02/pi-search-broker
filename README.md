@@ -50,7 +50,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
 - **Safety:**
   - Listens on loopback only, and every request needs the local token.
   - Upstream origins are fixed.
-  - Keys never appear in `state.json`, `/status`, logs, error bodies, pi notifications or the footer.
+  - Keys never appear in the state file (`pool-state.json`), `/status`, logs, error bodies, pi notifications or the footer.
   - A Tavily body `api_key` is stripped so the local token never leaves the machine.
   - Account keys can come from `$ENV` / `!command` sources, so they never have to touch disk.
 - **Debuggability:** per-account last request id (Exa `requestId`, Tavily `request_id`), the last error tag, and the most recent 50 attempts in `/status`.
@@ -64,7 +64,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
    ```
 
    This creates the following files and **never overwrites** existing ones:
-   - `~/.config/pi-dual-key-manager/config.json` (mode 0600) — the folder keeps the project's earlier name so existing configs and `state.json` keep working
+   - `~/.config/pi-dual-key-manager/config.json` (mode 0600) — the folder keeps the project's earlier name so existing configs and account state keep working
    - `web-search.fragment.json` next to it, used only for standalone mode
 
    Set `PI_SEARCH_BROKER_CONFIG` to use another path.
@@ -183,7 +183,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
 ## Managing accounts (CLI)
 
 ```bash
-npm run status                                  # live from the gateway, or read-only from state.json if it is down
+npm run status                                  # live from the gateway, or read-only from pool-state.json if it is down
 npm run doctor
 node src/cli.mjs reconcile [ACCOUNT_ID]
 node src/cli.mjs disable exa-account-1
@@ -198,7 +198,7 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
 
 ## Security and accuracy limitations
 
-- Real keys never go into `state.json`, `/status`, logs, error bodies or pi session data. **`config.json` itself may contain literal keys**, so keep it out of cloud sync and Git, or use `$ENV` / `!command` sources.
+- Real keys never go into `pool-state.json`, `/status`, logs, error bodies or pi session data. **`config.json` itself may contain literal keys**, so keep it out of cloud sync and Git, or use `$ENV` / `!command` sources.
 - `gateway.token` is a secret, too. With the extension it lives only in pi's process environment (`PI_SEARCH_BROKER_TOKEN`); in standalone mode protect the shell profile that exports it.
 - Local numbers are estimates unless the provider reported the cost (`costDollars.total`, `usage.credits`). Balance checks are shown alongside them, never applied automatically.
   - Exa's `/credits` can lag by up to 5 minutes.
@@ -210,7 +210,8 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
   - Rate limits are per team (Exa) or per key (Tavily, likely).
   - Do not use rotation to evade either provider's terms of service.
 - Months and `resetDay` are UTC.
-- One gateway owns `state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config.
+- One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config.
+- Upgrading from 0.2.x: the first 0.3 gateway starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
 
 ## Development
@@ -229,11 +230,14 @@ Layout:
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
 | `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion replies) and returns `{status, body}` |
 | `src/gateway.mjs` | HTTP server: auth, routing, body parsing and replies around the broker |
-| `src/pool.mjs` | Account pool: accounts, allocations, health and spend. Hands out reservations that end exactly once (`settle`, `settleUncertain`, `fail`, `abandon`) and keeps the attempt log |
+| `src/pool.mjs` | Account pool: accounts, allocations, health and spend. `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends); `checkBalances()` stores provider balances; keeps the attempt log |
 | `src/pool/health.mjs` | Account health: what each failure effect does to an account (disable, quota, cooldowns) and how it recovers |
 | `src/pool/allocation.mjs` | Allocation calendar: windows, reset days, spending order, and when an out-of-credit account is worth retrying |
-| `src/pool/store.mjs` | Where pool state lives: `fileStore` (`state.json`, optionally read-only) or `memoryStore` |
-| `src/reconcile.mjs` | Optional, report-only provider balance checks |
+| `src/pool/store.mjs` | Where pool state lives: `fileStore` (`pool-state.json`, optionally read-only; started once from a 0.2.x `state.json`, which is never written) or `memoryStore` |
+| `src/reconcile.mjs` | Optional, report-only provider balance checks (rate gap per account, run through `pool.checkBalances`) |
+| `src/format.mjs` | Human-readable status: the footer line and the status report |
+| `src/log.mjs` | `quietLogger`: an optional logger that never throws |
+| `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with in-process, HTTP and offline (read-only) adapters; `connectControl` picks one |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
 | `src/host.mjs` | Process singleton, port ownership, takeover and environment wiring, used by the extension |

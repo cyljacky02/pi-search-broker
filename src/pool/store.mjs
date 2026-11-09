@@ -1,12 +1,17 @@
 // Where account pool state lives between processes. Two adapters behind one seam: { load() -> state | null, save(state) }.
-//  - fileStore: state.json next to the config (atomic write, mode 0600), optionally read-only for offline status;
+//  - fileStore: pool-state.json next to the config (atomic write, mode 0600), optionally read-only for offline status;
 //  - memoryStore: tests, and any caller that wants nothing on disk.
 // State never contains key material: the pool stores account ids, spend and health only.
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync, unlinkSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 export const STATE_VERSION = 2;
+/**
+ * Where 0.2.x kept v1 state. A new state file starts from it once; it is never written, so 0.2.x pi processes still
+ * running during an upgrade keep working with their own file instead of failing on a version they cannot read.
+ */
+const V1_STATE_FILE = 'state.json';
 
 const RENAMED_IN_V2 = Object.freeze({ buckets: 'allocations', blockedUntil: 'quotaRetryAt', reconciled: 'providerBalance' });
 
@@ -39,9 +44,15 @@ function atomicWriteJson(path, value) {
   }
 }
 
+const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
+
 export function fileStore(path, { readOnly = false } = {}) {
+  const v1Path = join(dirname(path), V1_STATE_FILE);
   return {
-    load: () => (existsSync(path) ? upgrade(JSON.parse(readFileSync(path, 'utf8'))) : null),
+    load() {
+      if (existsSync(path)) return upgrade(readJson(path));
+      return v1Path !== path && existsSync(v1Path) ? upgrade(readJson(v1Path)) : null;
+    },
     save: (state) => { if (!readOnly) atomicWriteJson(path, state); }
   };
 }

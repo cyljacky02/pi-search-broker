@@ -1,5 +1,5 @@
-// Allocation calendar: when an allocation is spendable, which window its spend belongs to, and when it next changes.
-// Pure functions of (allocation, now). Months and resetDay are UTC.
+// Allocation calendar: when an allocation is spendable, which window its spend belongs to, what is left in it, and
+// when it next changes. Pure functions of (allocation, now). Months and resetDay are UTC.
 
 /** The monthly window containing nowMs: its key (start date) and the next reset. */
 export function monthlyWindow(nowMs, resetDay = 1) {
@@ -21,15 +21,18 @@ export const windowOf = (allocation, now) => (allocation.period === 'monthly' ? 
 /** Started and not yet expired. */
 export const isActive = (allocation, now) => expiryOf(allocation) > now && (!allocation.startsAt || Date.parse(allocation.startsAt) <= now);
 
+/** What is left in an allocation once `used` (spent, plus anything reserved) is taken out. Never negative. */
+export const remainingOf = (allocation, used) => Math.max(0, allocation.limit - used);
+
 /**
- * Allocations that can be spent now, in spending order, each with `remaining` (after `spentOf` and `heldOf`)
+ * Allocations that can be spent now, in spending order, each with `remaining` (after `spentOf` and `reservedOf`)
  * and `deadline` (when it next resets or expires). One-time promo grants come before recurring allowances,
  * then the soonest deadline (Exa also draws soonest-expiring credit first), then the most remaining.
  */
-export function spendingOrder(allocations, now, { spentOf, heldOf }) {
+export function spendingOrder(allocations, now, { spentOf, reservedOf }) {
   return allocations
     .filter((a) => isActive(a, now))
-    .map((a) => ({ ...a, remaining: Math.max(0, a.limit - spentOf(a.id) - heldOf(a.id)), deadline: Math.min(nextResetOf(a, now), expiryOf(a)) }))
+    .map((a) => ({ ...a, remaining: remainingOf(a, spentOf(a.id) + reservedOf(a.id)), deadline: Math.min(nextResetOf(a, now), expiryOf(a)) }))
     .filter((a) => a.remaining > 1e-9)
     .sort((a, b) => Number(b.period === 'once') - Number(a.period === 'once') || a.deadline - b.deadline || b.remaining - a.remaining);
 }

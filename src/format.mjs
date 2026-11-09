@@ -17,11 +17,14 @@ export function providerTotals(snapshot) {
   return totals;
 }
 
+// Footer suffix by broker control mode: another process owns the gateway, or nobody runs it.
+const FOOTER_MODE = Object.freeze({ http: ' [shared]', offline: ' [offline]' });
+
 /** One-line footer text, e.g. "search: exa $41.20 (2/3) · tavily 1,840cr (2/2)". */
 export function statusLine(snapshot, { mode } = {}) {
   const parts = Object.entries(providerTotals(snapshot))
     .map(([p, t]) => `${p} ${amount(p, t.available)} (${t.usable}/${t.total})`);
-  return `search: ${parts.join(' · ') || 'no accounts'}${mode === 'client' ? ' [shared]' : ''}`;
+  return `search: ${parts.join(' · ') || 'no accounts'}${FOOTER_MODE[mode] ?? ''}`;
 }
 
 export function statusReport(snapshot, { mode, url } = {}) {

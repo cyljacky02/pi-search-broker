@@ -10,7 +10,10 @@ import { COMMAND_NAMES, TAKES_ACCOUNT, usage, parseCommand, runCommand } from '.
 const STATUS_KEY = 'search-broker';
 // pi-web-access tools that can hit Exa/Tavily.
 const SEARCH_TOOLS = new Set(['web_search', 'fetch_content', 'source_check']);
-const USAGE = usage('/broker');
+const PREFIX = '/broker';
+const USAGE = usage(PREFIX);
+// How /broker status names where the numbers came from, by control mode.
+const STATUS_LABEL = Object.freeze({ 'in-process': 'owner', http: 'client', offline: 'offline, from the state file' });
 
 /** Build the extension. `getHost` returns the process's broker host (tests pass their own). */
 export function createExtension({ getHost = processHost } = {}) {
@@ -23,9 +26,10 @@ export function createExtension({ getHost = processHost } = {}) {
       const host = getHost();
       let text;
       try {
-        const snapshot = await host.control().status();
+        const control = await host.control();
+        const snapshot = await control.status();
         accountIds = snapshot.accounts.map((a) => a.id);
-        text = statusLine(snapshot, { mode: host.mode });
+        text = statusLine(snapshot, { mode: control.mode });
       } catch {
         text = host.mode === 'unconfigured' ? 'search: broker not configured' : 'search: broker offline';
       }
@@ -64,7 +68,7 @@ export function createExtension({ getHost = processHost } = {}) {
     });
 
     pi.registerCommand('broker', {
-      description: 'Search broker (Exa/Tavily key pool): status, enable/disable, set-spent, doctor, reconcile',
+      description: 'Search broker (Exa/Tavily account pools): status, enable/disable, set-spent, reconcile, doctor',
       getArgumentCompletions: (prefix) => {
         const [action, account, ...rest] = prefix.trimStart().split(/\s+/);
         if (rest.length > 0) return null;
@@ -78,18 +82,19 @@ export function createExtension({ getHost = processHost } = {}) {
       },
       handler: async (args, ctx) => {
         const words = args.trim().split(/\s+/).filter(Boolean);
-        const command = parseCommand(words.length ? words : ['status']);
+        const command = parseCommand(words.length ? words : ['status'], { prefix: PREFIX });
         if (!command) return say(ctx, USAGE, 'warning');
-        if (command.error) return say(ctx, command.error.replace(/^Usage: /, 'Usage: /broker '), 'warning');
+        if (command.error) return say(ctx, command.error, 'warning');
         const host = getHost();
         try {
           if (command.name === 'doctor') {
             await host.ensure().catch(() => {});
-            const checks = await runDoctor({ config: host.config, configError: host.lastError, control: await host.anyControl(), env: host.env });
-            say(ctx, formatChecks(checks));
+            const control = host.config ? await host.control() : null;
+            say(ctx, formatChecks(await runDoctor({ config: host.config, configError: host.lastError, control, env: host.env })));
           } else {
             await host.ensure();
-            say(ctx, await runCommand(host.control(), command, { config: host.config }));
+            const control = await host.control();
+            say(ctx, await runCommand(control, command, { config: host.config, label: STATUS_LABEL[control.mode] }));
           }
         } catch (err) {
           say(ctx, `Broker: ${err.message}`, 'error');

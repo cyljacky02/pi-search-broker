@@ -332,3 +332,14 @@ test('Network errors before a response rotate with a short cooldown', async () =
   assert.deepEqual(b.sleeps, []);
   assert.equal(b.account(0).cooldownReason, EFFECT.UPSTREAM);
 });
+
+test('If preparing the upstream request throws, nothing is sent and the reserved credit comes back', async () => {
+  let calls = 0;
+  const b = broker(config(exa('a', 'exa-key-aaaa')), async () => { calls++; return ok(0.007); });
+  const headers = { get 'x-exa-integration'() { throw new Error('unreadable header'); } };
+  await assert.rejects(b.call('/exa/search', { query: 'q' }, { headers }), /unreadable header/);
+  assert.equal(calls, 0);
+  const a = b.account(0);
+  assert.equal(a.available, 70, 'all 60 promo + 10 free is available again');
+  assert.deepEqual([a.failures, a.possiblyBilled, a.status], [0, 0, 'active']);
+});

@@ -8,7 +8,7 @@ import { execSync } from 'node:child_process';
 export const SERVICE_NAME = 'pi-search-broker';
 /** Service ids of earlier releases that a health probe still accepts, so mixed-version pi processes share one gateway. */
 export const LEGACY_SERVICE_NAMES = Object.freeze(['pi-dual-key-manager']);
-/** Config folder name, kept from before the product rename so existing configs and state.json are still found. */
+/** Config folder name, kept from before the product rename so existing configs and account state are still found. */
 export const CONFIG_DIR_NAME = 'pi-dual-key-manager';
 export const VERSION = '0.3.0';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
@@ -225,4 +225,5 @@ export function writeFirstConfig(path = defaultConfigPath()) {
   return { configPath: path, fragmentPath: out };
 }
 
-export function defaultStatePath(configPath = defaultConfigPath()) { return join(dirname(configPath), 'state.json'); }
+/** Account pool state next to the config. 0.2.x kept v1 state in state.json; see pool/store.mjs for the upgrade. */
+export function defaultStatePath(configPath = defaultConfigPath()) { return join(dirname(configPath), 'pool-state.json'); }

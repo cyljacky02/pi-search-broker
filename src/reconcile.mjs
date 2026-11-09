@@ -33,27 +33,16 @@ export function createReconciler(pool, { fetchImpl = fetch, now = () => Date.now
   const lastAttempt = new Map();
   let timer = null;
 
-  async function checkAccount(account) {
-    if (!canReconcile(account)) return { id: account.id, skipped: 'not-supported' };
-    if (now() - (lastAttempt.get(account.id) ?? -Infinity) < minGapMs) return { id: account.id, skipped: 'too-soon' };
+  /** One account's check, for pool.checkBalances: a balance, a skip reason, or a thrown key-free Error. */
+  async function check(account) {
+    if (!canReconcile(account)) return { skipped: 'not-supported' };
+    if (now() - (lastAttempt.get(account.id) ?? -Infinity) < minGapMs) return { skipped: 'too-soon' };
     lastAttempt.set(account.id, now());
-    try {
-      const result = await fetchBalance(account, { fetchImpl });
-      pool.recordBalanceCheck(account.id, result);
-      return { id: account.id, remaining: result.remaining };
-    } catch (err) {
-      pool.recordBalanceCheck(account.id, err);
-      return { id: account.id, error: err.message };
-    }
+    return fetchBalance(account, { fetchImpl });
   }
 
-  async function reconcile(accountId) {
-    const targets = accountId ? pool.accounts.filter((a) => a.id === accountId) : pool.accounts;
-    if (accountId && !targets.length) throw new Error('Unknown account id');
-    const results = [];
-    for (const account of targets) results.push(await checkAccount(account)); // sequential: gentle on rate limits
-    return results;
-  }
+  /** Results per account: { id, remaining } | { id, skipped } | { id, error }. Unknown ids throw. */
+  const reconcile = (accountId) => pool.checkBalances(accountId, check);
 
   function start() {
     if (timer || !intervalMs) return;

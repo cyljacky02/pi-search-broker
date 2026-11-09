@@ -9,6 +9,8 @@ import { usage, parseCommand, runCommand } from './commands.mjs';
 import { redact } from './providers.mjs';
 
 const PREFIX = 'node src/cli.mjs';
+// How `status` names where the numbers came from, by control mode.
+const STATUS_LABEL = Object.freeze({ 'in-process': 'live', http: 'live', offline: 'offline, from the state file' });
 const CLI_ONLY = [
   { name: 'init', args: '', help: 'create a private config (never overwrites)' },
   { name: 'serve', args: '', help: 'run the gateway in the foreground (standalone mode)' },
@@ -50,9 +52,9 @@ export async function main(argv, { out = console.log, err = console.error, env =
       out('Then install the pi extension (recommended) or run "npm start" and merge the fragment (see README).');
       return 0;
     }
-    const command = parseCommand(words);
-    if (!command && !['serve', 'fragment'].includes(cmd)) { err(HELP); return 1; }
-    if (command?.error) { err(command.error.replace(/^Usage: /, `Usage: ${PREFIX} `)); return 1; }
+    const command = parseCommand(words, { prefix: PREFIX });
+    if (!command && !['serve', 'fragment'].includes(cmd)) { out(HELP); return 0; }
+    if (command?.error) { err(command.error); return 1; }
 
     if (cmd === 'doctor') {
       let config;
@@ -84,7 +86,7 @@ export async function main(argv, { out = console.log, err = console.error, env =
       return 0;
     }
     const control = await connect({ config, statePath: defaultStatePath(configPath), fetchImpl });
-    out(await runCommand(control, command, { config }));
+    out(await runCommand(control, command, { config, label: STATUS_LABEL[control.mode] }));
     return 0;
   } catch (e) {
     // Config values (including API keys) are never printed here.

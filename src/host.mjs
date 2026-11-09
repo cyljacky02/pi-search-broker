@@ -9,7 +9,7 @@
 import { createGateway } from './gateway.mjs';
 import { fileStore } from './pool/store.mjs';
 import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig } from './config.mjs';
-import { baseUrl, probeHealth, httpControl, connectControl } from './control.mjs';
+import { baseUrl, probeHealth, connectControl } from './control.mjs';
 import { piWebSearchConfigPath, readPiWebSearchConfig, piWiringIssues } from './doctor.mjs';
 
 const HOST_KEY = Symbol.for('pi-search-broker.host');
@@ -18,7 +18,7 @@ const PROBE_CACHE_MS = 3000;
 export class BrokerHost {
   /**
    * Everything the host creates (the gateway, its upstream and balance calls, health probes) uses these.
-   * @param store  account pool store for an owned gateway (default: state.json next to the config)
+   * @param store  account pool store for an owned gateway (default: pool-state.json next to the config)
    */
   constructor({ configPath = defaultConfigPath(), env = process.env, fetchImpl = fetch, now = () => Date.now(), store = null, logger = null } = {}) {
     this.version = VERSION;
@@ -171,17 +171,13 @@ export class BrokerHost {
     return notes;
   }
 
-  /** Broker control for this process: in-process when it owns the gateway, HTTP when it is a client. */
-  control() {
-    if (this.mode === 'owner' && this.gateway) return this.gateway.control;
-    if (this.mode === 'client') return httpControl(this.config, { fetchImpl: this.fetchImpl });
-    throw new Error(this.lastError || 'Broker is not running');
-  }
-
-  /** A control for checks that must also work when the gateway is down (doctor); null without a config. */
-  async anyControl() {
-    if (!this.config) return null;
-    return connectControl({ config: this.config, statePath: this.statePath, gateway: this.gateway?.control, fetchImpl: this.fetchImpl });
+  /**
+   * Broker control for this process: in-process when it owns the gateway, HTTP when another process does, offline
+   * (read-only) when nobody does. Throws when there is no usable config.
+   */
+  async control() {
+    if (!this.config) throw new Error(this.lastError || 'Broker is not configured');
+    return connectControl({ config: this.config, statePath: this.statePath, inProcess: this.gateway?.control, fetchImpl: this.fetchImpl });
   }
 }
 

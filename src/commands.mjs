@@ -23,14 +23,14 @@ export function usage(prefix, extra = []) {
 }
 
 /**
- * Parse the words after the command prefix. Returns { name, id?, allocationId?, amount? }, or { error } with a
- * one-line usage hint, or null when the first word is not an account command.
+ * Parse the words after `prefix` (e.g. '/broker'). Returns { name, id?, allocationId?, amount? }, or { error } with
+ * a one-line usage hint, or null when the first word is not an account command.
  */
-export function parseCommand(words) {
+export function parseCommand(words, { prefix }) {
   const [name, ...args] = words;
   const spec = COMMANDS.find((c) => c.name === name);
   if (!spec) return null;
-  const hint = () => ({ error: `Usage: ${spec.name} ${spec.args}`.trim() });
+  const hint = () => ({ error: `Usage: ${prefix} ${spec.name} ${spec.args}`.trim() });
   if (name === 'enable' || name === 'disable') return args[0] ? { name, id: args[0] } : hint();
   if (name === 'set-spent') {
     const [id, allocationId, raw] = args;
@@ -42,11 +42,14 @@ export function parseCommand(words) {
   return { name };
 }
 
-/** Run a parsed account command (not doctor) against a control and return the text to show. */
-export async function runCommand(control, command, { config } = {}) {
+/**
+ * Run a parsed account command (not doctor) against a control and return the text to show.
+ * @param label  how the caller describes where the status came from (default: the control's mode)
+ */
+export async function runCommand(control, command, { config, label = control.mode } = {}) {
   switch (command.name) {
     case 'status':
-      return statusReport(await control.status(), { mode: control.mode, url: config ? baseUrl(config) : undefined });
+      return statusReport(await control.status(), { mode: label, url: config ? baseUrl(config) : undefined });
     case 'enable':
       await control.enable(command.id);
       return `Enabled ${command.id}`;
