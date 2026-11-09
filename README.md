@@ -129,11 +129,12 @@ The design decisions below are backed by the research notes in [`docs/research/`
    - **adds `/broker`:**
 
      ```text
-     /broker [status]                         accounts and remaining credits
-     /broker enable|disable <account>
-     /broker set-spent <account> <alloc> <n>  correct local spend to the dashboard value
-     /broker doctor                           check that pi-web-access really goes through the broker
-     /broker reconcile [account]              show provider-reported balances (report-only)
+     /broker status                                     accounts and remaining credits (the default)
+     /broker enable <account>                           re-enable an account
+     /broker disable <account>                          park an account
+     /broker set-spent <account> <allocation> <amount>  correct local spend to the provider dashboard value
+     /broker reconcile [account]                        show provider-reported balances (report-only)
+     /broker doctor                                     check that pi-web-access really goes through the broker
      ```
 
 4. Tell pi-web-access to authenticate with the broker token. Add these two keys to `~/.pi/agent/web-search.json` (create the file if needed):
@@ -233,11 +234,12 @@ Layout:
 | `src/pool/allocation.mjs` | Allocation calendar: windows, reset days, spending order, and when an out-of-credit account is worth retrying |
 | `src/pool/store.mjs` | Where pool state lives: `fileStore` (`state.json`, optionally read-only) or `memoryStore` |
 | `src/reconcile.mjs` | Optional, report-only provider balance checks |
-| `src/client.mjs` | Authenticated loopback client for a running gateway (CLI and non-owner pi processes) |
+| `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with in-process, HTTP and offline (read-only) adapters; `connectControl` picks one |
+| `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
 | `src/host.mjs` | Process singleton, port ownership, takeover and environment wiring, used by the extension |
 | `src/doctor.mjs` | Checks that pi-web-access really uses the broker |
 | `extension/index.js` | The pi extension |
-| `src/cli.mjs` | Standalone CLI |
+| `src/cli.mjs` | Standalone CLI (`main(argv)` is exported for tests) |
 | `scripts/check.mjs` | Syntax-checks every module (`npm run check`) |
 
 Re-run the pi-web-access audit ([docs/research/pi-web-access.md](docs/research/pi-web-access.md)) whenever pi-web-access is upgraded: a new Exa/Tavily endpoint there would return 404 here, which pi classifies as `unknown` (no fallback).

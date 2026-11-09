@@ -56,7 +56,7 @@ test('Admin routes enable, disable and set-spent without restarting', async () =
     assert.equal((await post('/admin/disable', { id: 't-1' })).status, 200);
     assert.equal((await post('/tavily/search', { query: 'test' })).status, 429);
     assert.equal((await post('/admin/set-spent', { id: 't-1', allocationId: 'free', spent: 820 })).status, 200);
-    assert.equal(status().accounts[0].allocations[0].remainingEstimate, 180);
+    assert.equal((await status()).accounts[0].allocations[0].remainingEstimate, 180);
     assert.equal((await post('/tavily/search', { query: 'test' })).status, 200);
     assert.equal((await post('/admin/disable', { id: 't-1' }, 'bad-token')).status, 401);
     assert.equal((await post('/admin/enable', { id: 't-1' })).status, 200);
@@ -74,7 +74,7 @@ test('A client that disconnects aborts the upstream attempt, which is counted as
   }), async ({ post, status }) => {
     await assert.rejects(post('/tavily/search', { query: 'q' }, secret, {}, client.signal));
     await aborted;
-    for (let i = 0; i < 50 && status().accounts[0].possiblyBilled === 0; i++) await new Promise((r) => setTimeout(r, 10));
-    assert.equal(status().accounts[0].possiblyBilled, 1);
+    for (let i = 0; i < 50 && (await status()).accounts[0].possiblyBilled === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal((await status()).accounts[0].possiblyBilled, 1);
   });
 });

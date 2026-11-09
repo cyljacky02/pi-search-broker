@@ -53,7 +53,7 @@ export async function serve(cfg, fetchImpl, fn, { time = { ms: DATE }, ...extra 
   const post = async (path, body, token = secret, headers = {}, signal = undefined) => fetch(`${base}${path}`, {
     method: 'POST', headers: { 'x-api-key': token, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal
   });
-  try { await fn({ base, post, status: gateway.status, statePath, time }); }
+  try { await fn({ base, post, status: gateway.control.status, control: gateway.control, statePath, time }); }
   finally {
     await new Promise((resolve) => gateway.server.close(resolve));
     rmSync(temp, { recursive: true, force: true });

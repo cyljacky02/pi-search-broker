@@ -1,102 +1,98 @@
 #!/usr/bin/env node
+import { pathToFileURL } from 'node:url';
 import { defaultConfigPath, loadConfig, writeFirstConfig, defaultStatePath, webSearchFragment, secretsOf } from './config.mjs';
 import { createGateway } from './gateway.mjs';
-import { createAccountPool } from './pool.mjs';
 import { fileStore } from './pool/store.mjs';
-import { baseUrl, gatewayRequest } from './client.mjs';
-import { statusReport } from './format.mjs';
+import { connectControl } from './control.mjs';
 import { runDoctor, formatChecks } from './doctor.mjs';
+import { usage, parseCommand, runCommand } from './commands.mjs';
 import { redact } from './providers.mjs';
 
-const args = process.argv.slice(2);
-const cmd = args[0] || 'help';
-function configArg() {
-  const i = args.indexOf('--config');
-  return i < 0 ? defaultConfigPath() : args[i + 1];
-}
-const positional = () => {
-  const out = [];
-  for (let i = 1; i < args.length; i++) {
-    if (args[i] === '--config') { i++; continue; }
-    out.push(args[i]);
-  }
-  return out;
-};
-function usage() {
-  console.log(`Pi Search Broker (Node 20.3+, no dependencies)
-  node src/cli.mjs init [--config /path/to/config.json]
-  node src/cli.mjs serve [--config ...]
-  node src/cli.mjs status [--config ...]
-  node src/cli.mjs doctor [--config ...]           check that pi-web-access really uses the broker
-  node src/cli.mjs reconcile [ACCOUNT_ID] [--config ...]  show provider-reported balances (report-only)
-  node src/cli.mjs enable ACCOUNT_ID [--config ...]
-  node src/cli.mjs disable ACCOUNT_ID [--config ...]
-  node src/cli.mjs set-spent ACCOUNT_ID ALLOCATION_ID AMOUNT [--config ...]
-  node src/cli.mjs fragment [--config ...]         print the web-search.json settings for standalone use
+const PREFIX = 'node src/cli.mjs';
+const CLI_ONLY = [
+  { name: 'init', args: '', help: 'create a private config (never overwrites)' },
+  { name: 'serve', args: '', help: 'run the gateway in the foreground (standalone mode)' },
+  { name: 'fragment', args: '', help: 'print the web-search.json settings for standalone use' }
+];
+const HELP = `Pi Search Broker (Node 20.3+, no dependencies)
+${usage(PREFIX, CLI_ONLY)}
 
-The config path defaults to $PI_SEARCH_BROKER_CONFIG or ~/.config/pi-dual-key-manager/config.json.
-enable/disable/set-spent/reconcile talk to the running gateway over authenticated loopback HTTP.
-Never paste real provider API keys into shell commands or logs.`);
+Every command accepts --config /path/to/config.json. The default is $PI_SEARCH_BROKER_CONFIG or
+~/.config/pi-dual-key-manager/config.json. enable/disable/set-spent/reconcile need a running gateway.
+Never paste real provider API keys into shell commands or logs.`;
+
+/** Split argv into the --config path and the positional words. */
+function parseArgs(argv, env) {
+  const words = [];
+  let configPath = null;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--config') configPath = argv[++i];
+    else words.push(argv[i]);
+  }
+  return { words, configPath: configPath ?? defaultConfigPath(env) };
 }
-let secrets = [];
-try {
-  if (cmd === 'help' || cmd === '--help' || cmd === '-h') usage();
-  else if (cmd === 'init') {
-    const result = writeFirstConfig(configArg());
-    console.log('Created private config:', result.configPath);
-    console.log('Created Pi web-search fragment:', result.fragmentPath);
-    console.log('Edit the config: replace placeholders, adjust expiry/limits, duplicate account records as needed.');
-    console.log('Then install the pi extension (recommended) or run "npm start" and merge the fragment (see README).');
-  } else if (cmd === 'doctor') {
-    const checks = await runDoctor({ configPath: configArg() });
-    console.log(formatChecks(checks));
-    if (checks.some((c) => c.level === 'error')) process.exitCode = 1;
-  } else {
-    const path = configArg();
-    const config = loadConfig(path);
+
+/**
+ * Run one CLI invocation. Returns the exit code (serve keeps the process alive and returns 0).
+ * @param connect  (options) => broker control; tests pass one that returns an in-process control
+ */
+export async function main(argv, { out = console.log, err = console.error, env = process.env, fetchImpl = fetch, connect = connectControl } = {}) {
+  const { words, configPath } = parseArgs(argv, env);
+  const [cmd = 'help'] = words;
+  let secrets = [];
+  try {
+    if (cmd === 'help' || cmd === '--help' || cmd === '-h') { out(HELP); return 0; }
+    if (cmd === 'init') {
+      const result = writeFirstConfig(configPath);
+      out(`Created private config: ${result.configPath}`);
+      out(`Created Pi web-search fragment: ${result.fragmentPath}`);
+      out('Edit the config: replace placeholders, adjust expiry/limits, duplicate account records as needed.');
+      out('Then install the pi extension (recommended) or run "npm start" and merge the fragment (see README).');
+      return 0;
+    }
+    const command = parseCommand(words);
+    if (!command && !['serve', 'fragment'].includes(cmd)) { err(HELP); return 1; }
+    if (command?.error) { err(command.error.replace(/^Usage: /, `Usage: ${PREFIX} `)); return 1; }
+
+    if (cmd === 'doctor') {
+      let config;
+      let configError;
+      try { config = loadConfig(configPath, { env }); } catch (e) { configError = e.message; }
+      const control = config ? await connect({ config, statePath: defaultStatePath(configPath), fetchImpl }) : null;
+      const checks = await runDoctor({ config, configError, control, env });
+      out(formatChecks(checks));
+      return checks.some((c) => c.level === 'error') ? 1 : 0;
+    }
+
+    const config = loadConfig(configPath, { env });
     secrets = secretsOf(config);
-    const [id, allocationId, amount] = positional();
+    if (cmd === 'fragment') { out(JSON.stringify(webSearchFragment(config.gateway), null, 2)); return 0; }
     if (cmd === 'serve') {
       const { server } = createGateway(config, {
-        store: fileStore(defaultStatePath(path)),
-        logger: (line) => console.log(`${new Date().toISOString()} ${line}`)
+        store: fileStore(defaultStatePath(configPath)),
+        logger: (line) => out(`${new Date().toISOString()} ${line}`)
       });
-      server.on('error', (err) => {
-        console.error(err.code === 'EADDRINUSE' ? `Port ${config.gateway.port} is already in use (is the broker already running in pi?)` : `Server error: ${err.message}`);
+      server.on('error', (e) => {
+        err(e.code === 'EADDRINUSE' ? `Port ${config.gateway.port} is already in use (is the broker already running in pi?)` : `Server error: ${e.message}`);
         process.exitCode = 1;
       });
       server.listen(config.gateway.port, config.gateway.host, () => {
-        console.log(`Gateway listening on ${config.gateway.host}:${config.gateway.port} (loopback only)`);
-        console.log('Exa accounts:', config.accounts.filter((a) => a.provider === 'exa').length);
-        console.log('Tavily accounts:', config.accounts.filter((a) => a.provider === 'tavily').length);
+        out(`Gateway listening on ${config.gateway.host}:${config.gateway.port} (loopback only)`);
+        out(`Exa accounts: ${config.accounts.filter((a) => a.provider === 'exa').length}`);
+        out(`Tavily accounts: ${config.accounts.filter((a) => a.provider === 'tavily').length}`);
       });
-    } else if (cmd === 'status') {
-      let snapshot;
-      let mode = 'live';
-      try { snapshot = await gatewayRequest(config, 'GET', '/status'); }
-      catch {
-        // Gateway not running: read the persisted state without writing to it.
-        snapshot = createAccountPool(config.accounts, { store: fileStore(defaultStatePath(path), { readOnly: true }) }).snapshot();
-        mode = 'offline, from state.json';
-      }
-      console.log(statusReport(snapshot, { mode, url: baseUrl(config) }));
-    } else if (cmd === 'reconcile') {
-      const { results } = await gatewayRequest(config, 'POST', '/admin/reconcile', id ? { id } : {});
-      for (const r of results) console.log(`${r.id}: ${r.error ?? r.skipped ?? `provider reports ~${r.remaining} remaining`}`);
-    } else if (cmd === 'enable' || cmd === 'disable') {
-      if (!id) throw new Error('Account id required');
-      await gatewayRequest(config, 'POST', `/admin/${cmd}`, { id });
-      console.log(`OK: ${cmd} ${id}`);
-    } else if (cmd === 'set-spent') {
-      if (!id || !allocationId || amount === undefined) throw new Error('Usage: set-spent ACCOUNT_ID ALLOCATION_ID AMOUNT');
-      await gatewayRequest(config, 'POST', '/admin/set-spent', { id, allocationId, spent: Number(amount) });
-      console.log(`OK: set-spent ${id}`);
-    } else if (cmd === 'fragment') {
-      console.log(JSON.stringify(webSearchFragment(config.gateway), null, 2));
-    } else usage();
+      return 0;
+    }
+    const control = await connect({ config, statePath: defaultStatePath(configPath), fetchImpl });
+    out(await runCommand(control, command, { config }));
+    return 0;
+  } catch (e) {
+    // Config values (including API keys) are never printed here.
+    err(`Error: ${redact(e.message, secrets)}`);
+    return 1;
   }
-} catch (err) {
-  // Config values (including API keys) are never printed here.
-  console.error('Error:', redact(err.message, secrets));
-  process.exitCode = 1;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.exitCode = await main(process.argv.slice(2));
 }

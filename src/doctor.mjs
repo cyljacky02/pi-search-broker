@@ -4,8 +4,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { APP_NAME, TOKEN_ENV, TAVILY_POOL_VARS, loadConfig, parseEnvSource } from './config.mjs';
-import { baseUrl } from './client.mjs';
+import { TOKEN_ENV, TAVILY_POOL_VARS, parseEnvSource } from './config.mjs';
+import { baseUrl } from './control.mjs';
 
 /** Same order as pi-web-access getWebSearchConfigDir(). */
 export function piWebSearchConfigPath(env = process.env, home = homedir()) {
@@ -74,32 +74,30 @@ export function piWiringIssues(pi, env, token) {
   return issues;
 }
 
-export async function runDoctor({ configPath, env = process.env, home = homedir(), fetchImpl = fetch } = {}) {
+/**
+ * Check the broker config, the running gateway and pi-web-access's wiring, as seen from `env`.
+ * @param config       the loaded broker config, or undefined when loading failed (then pass configError)
+ * @param control      a broker control (control.mjs) used for the gateway health check
+ */
+export async function runDoctor({ config, configError, control, env = process.env, home = homedir() }) {
   const checks = [];
   const add = (level, message) => checks.push({ level, message });
 
-  let config;
-  try {
-    config = loadConfig(configPath, { env });
-    const byProvider = (p) => config.accounts.filter((a) => a.provider === p).length;
-    add('ok', `Broker config valid: ${byProvider('exa')} Exa and ${byProvider('tavily')} Tavily account(s)`);
-  } catch (err) {
-    add('error', `Broker config: ${err.message}`);
+  if (!config) {
+    add('error', `Broker config: ${configError ?? 'not loaded'}`);
     return checks;
   }
+  const byProvider = (p) => config.accounts.filter((a) => a.provider === p).length;
+  add('ok', `Broker config valid: ${byProvider('exa')} Exa and ${byProvider('tavily')} Tavily account(s)`);
   if (config.attemptTimeoutMs !== undefined && config.attemptTimeoutMs < 20000) {
     add('warn', `attemptTimeoutMs is ${config.attemptTimeoutMs} ms; slow searches will time out. Remove it to use the 30 s per-route default.`);
   }
 
   const base = baseUrl(config);
-  try {
-    const res = await fetchImpl(`${base}/health`, { signal: AbortSignal.timeout(1500) });
-    const data = res.ok ? await res.json() : null;
-    if (data?.service === APP_NAME) add('ok', `Gateway is running at ${base} (version ${data.version ?? '?'})`);
-    else add('error', `Something else answers on ${base}; change gateway.port`);
-  } catch {
-    add('warn', `Gateway is not running at ${base}. Start pi with the extension installed, or run "npm start".`);
-  }
+  const health = await control.health();
+  if (health.state === 'running') add('ok', `Gateway is running at ${base} (version ${health.version ?? '?'})`);
+  else if (health.state === 'other') add('error', `Something else answers on ${base}; change gateway.port`);
+  else add('warn', `Gateway is not running at ${base}. Start pi with the extension installed, or run "npm start".`);
 
   const piPath = piWebSearchConfigPath(env, home);
   let pi;

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfig, webSearchFragment, resolveSecret } from '../src/config.mjs';
-import { baseUrl } from '../src/client.mjs';
+import { baseUrl } from '../src/control.mjs';
 import { config, exa, tavily, secret } from './helpers.mjs';
 
 const withHost = (host) => validateConfig({ gateway: { host, port: 19473, token: secret }, accounts: [tavily('t', 'tvly-aaaaaaaa')] });

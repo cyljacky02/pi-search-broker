@@ -8,19 +8,26 @@
 //  - a client takes over the port when the owner exits (ensure() is called before each search tool call).
 import { createGateway } from './gateway.mjs';
 import { fileStore } from './pool/store.mjs';
-import { APP_NAME, VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig } from './config.mjs';
-import { baseUrl, gatewayRequest } from './client.mjs';
+import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig } from './config.mjs';
+import { baseUrl, probeHealth, httpControl, connectControl } from './control.mjs';
 import { piWebSearchConfigPath, readPiWebSearchConfig, piWiringIssues } from './doctor.mjs';
 
 const HOST_KEY = Symbol.for('pi-search-broker.host');
 const PROBE_CACHE_MS = 3000;
 
 export class BrokerHost {
-  constructor({ configPath = defaultConfigPath(), env = process.env, fetchImpl = fetch, logger = null } = {}) {
+  /**
+   * Everything the host creates (the gateway, its upstream and balance calls, health probes) uses these.
+   * @param store  account pool store for an owned gateway (default: state.json next to the config)
+   */
+  constructor({ configPath = defaultConfigPath(), env = process.env, fetchImpl = fetch, now = () => Date.now(), store = null, logger = null } = {}) {
     this.version = VERSION;
     this.configPath = configPath;
+    this.statePath = defaultStatePath(configPath);
     this.env = env;
     this.fetchImpl = fetchImpl;
+    this.now = now;
+    this.store = store;
     this.logger = logger;
     this.refs = 0;
     this.mode = 'idle'; // idle | unconfigured | owner | client | error
@@ -79,7 +86,7 @@ export class BrokerHost {
     const config = this.loadConfig();
     if (!config) return this.mode;
     if (this.mode === 'owner' && this.gateway?.server.listening) return this.mode;
-    if (this.mode === 'client' && Date.now() - this.lastProbeOk < PROBE_CACHE_MS) return this.mode;
+    if (this.mode === 'client' && this.now() - this.lastProbeOk < PROBE_CACHE_MS) return this.mode;
     if (await this.probe()) { this.mode = 'client'; return this.mode; }
     try {
       await this.listen(config);
@@ -96,19 +103,15 @@ export class BrokerHost {
   }
 
   async probe() {
-    try {
-      const res = await this.fetchImpl(`${baseUrl(this.config)}/health`, { signal: AbortSignal.timeout(1500) });
-      const data = res.ok ? await res.json() : null;
-      const ok = data?.service === APP_NAME;
-      if (ok) this.lastProbeOk = Date.now();
-      return ok;
-    } catch {
-      return false;
-    }
+    const ok = (await probeHealth(this.config, { fetchImpl: this.fetchImpl })).state === 'running';
+    if (ok) this.lastProbeOk = this.now();
+    return ok;
   }
 
   listen(config) {
-    const gateway = createGateway(config, { store: fileStore(defaultStatePath(this.configPath)), logger: this.logger });
+    const gateway = createGateway(config, {
+      store: this.store ?? fileStore(this.statePath), fetchImpl: this.fetchImpl, reconcileFetch: this.fetchImpl, now: this.now, logger: this.logger
+    });
     return new Promise((resolve, reject) => {
       const onError = (err) => { gateway.server.close(); reject(err); };
       gateway.server.once('error', onError);
@@ -168,16 +171,17 @@ export class BrokerHost {
     return notes;
   }
 
-  async status() {
-    if (this.mode === 'owner' && this.gateway) return this.gateway.status();
-    if (this.mode === 'client') return gatewayRequest(this.config, 'GET', '/status', undefined, { fetchImpl: this.fetchImpl });
+  /** Broker control for this process: in-process when it owns the gateway, HTTP when it is a client. */
+  control() {
+    if (this.mode === 'owner' && this.gateway) return this.gateway.control;
+    if (this.mode === 'client') return httpControl(this.config, { fetchImpl: this.fetchImpl });
     throw new Error(this.lastError || 'Broker is not running');
   }
 
-  async admin(op, body) {
-    if (this.mode === 'owner' && this.gateway) return this.gateway.admin(op, body);
-    if (this.mode === 'client') return gatewayRequest(this.config, 'POST', `/admin/${op}`, body, { fetchImpl: this.fetchImpl });
-    throw new Error(this.lastError || 'Broker is not running');
+  /** A control for checks that must also work when the gateway is down (doctor); null without a config. */
+  async anyControl() {
+    if (!this.config) return null;
+    return connectControl({ config: this.config, statePath: this.statePath, gateway: this.gateway?.control, fetchImpl: this.fetchImpl });
   }
 }
 

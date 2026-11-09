@@ -6,6 +6,7 @@ import { APP_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
 import { ROUTES } from './providers.mjs';
 import { createReconciler } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
+import { inProcessControl } from './control.mjs';
 
 function suppliedToken(req) {
   const headerKey = req.headers['x-api-key'];
@@ -62,20 +63,19 @@ export function createGateway(config, {
   const reconciler = createReconciler(pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
   const broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, now, sleep });
 
-  /** Admin operations shared by the HTTP API and the in-process pi host. */
-  async function admin(op, body = {}) {
-    if (op === 'reconcile') {
-      if (body.id !== undefined && typeof body.id !== 'string') throw new Error('id must be a string');
-      return { ok: true, results: await reconciler.reconcile(body.id) };
-    }
-    if (typeof body.id !== 'string') throw new Error('Account id required');
-    if (op === 'enable') pool.enable(body.id);
-    else if (op === 'disable') pool.disable(body.id);
-    else if (op === 'set-spent') pool.setSpent(body.id, body.allocationId, body.spent);
+  const control = inProcessControl({ pool, reconciler });
+
+  /** HTTP wire format for the http control adapter: POST /admin/<op> with a JSON body. */
+  async function admin(op, body) {
+    if (body.id !== undefined && typeof body.id !== 'string') throw new Error('id must be a string');
+    if (op === 'reconcile') return { ok: true, results: await control.reconcile(body.id) };
+    if (!body.id) throw new Error('Account id required');
+    if (op === 'enable') await control.enable(body.id);
+    else if (op === 'disable') await control.disable(body.id);
+    else if (op === 'set-spent') await control.setSpent(body.id, body.allocationId, body.spent);
     else throw new Error('Unknown operation');
     return { ok: true };
   }
-  const status = () => pool.snapshot();
 
   async function proxy(req, res, route) {
     const body = await readBody(req);
@@ -95,7 +95,7 @@ export function createGateway(config, {
         return reply(res, 200, { ok: true, service: APP_NAME, version: VERSION, pid: process.pid });
       }
       if (!isAuthorized(req, config.gateway.token)) return reply(res, 401, { error: unauthorizedHint(req) });
-      if (url.pathname === '/status' && req.method === 'GET') return reply(res, 200, status());
+      if (url.pathname === '/status' && req.method === 'GET') return reply(res, 200, await control.status());
       if (url.pathname.startsWith('/admin/') && req.method === 'POST') {
         const body = await readBody(req);
         try { return reply(res, 200, await admin(url.pathname.slice('/admin/'.length), body)); }
@@ -116,5 +116,5 @@ export function createGateway(config, {
   server.headersTimeout = 65000;
   server.on('listening', () => reconciler.start());
   server.on('close', () => reconciler.stop());
-  return { server, status, admin };
+  return { server, control };
 }
