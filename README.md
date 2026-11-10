@@ -127,7 +127,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
    On every pi session the extension:
    - **starts the gateway inside pi**, or joins one already running in another pi process. Only one process per machine owns the port; the others are clients and take over automatically when the owner exits. In-process subagents share the same gateway through reference counting.
    - **points pi-web-access at the broker for this pi process.** It sets `EXA_BASE_URL` and `TAVILY_BASE_URL` (which pi-web-access reads on every request and which win over `web-search.json`) and `PI_SEARCH_BROKER_TOKEN`. It never overrides or removes your provider keys. Everything is restored when the last session ends. Commands the agent runs in bash inherit these variables, but the token only works against the loopback gateway. Set `"pi": { "wireEnvironment": false }` to opt out.
-   - **warns at session start** if pi-web-access would not authenticate to the broker: wrong or missing key source, or `TAVILY_API_KEY_n` set. It shows the exact fix.
+   - **warns at session start** (in the UI) if pi-web-access would not authenticate to the broker: wrong or missing key source, or `TAVILY_API_KEY_n` set. It shows the exact fix. It also warns when this process joined a gateway it cannot control (a different gateway token), or could not take the port at all.
    - **shows remaining credits in the footer**, for example `search: exa $41.20 (2/3) · tavily 1,840cr (2/2)`.
    - **adds `/broker`:**
 
@@ -217,7 +217,8 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
   - Do not use rotation to evade either provider's terms of service.
 - Months and `resetDay` are UTC.
 - One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config. On graceful shutdown the owner cancels balance checks and waits for in-flight searches to settle before releasing the port; an injected fetch that ignores cancellation and timeouts can delay shutdown indefinitely.
-- Upgrading from 0.2.x: the first 0.3 gateway starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
+- Upgrading from 0.2.x: the first gateway of 0.3 or later starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
+- Upgrading from 0.3.x: `/reload` replaces the extension's idle 0.3 host. If an in-process subagent still holds it during the reload, restart pi so the new extension does not keep using the old host.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
 
 ## Development
@@ -247,8 +248,8 @@ Layout:
 | `src/clock.mjs` | Time for everything that waits on it (`now`, `sleep`, `timeout`): `realClock`; tests pass a fake clock that fires timeouts on demand |
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with HTTP and offline (read-only) adapters here and an in-process adapter built by the Gateway; `connectControl` picks one |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
-| `src/host.mjs` | Process singleton, port ownership, takeover and environment wiring, used by the extension |
-| `src/doctor.mjs` | Checks that pi-web-access really uses the broker |
+| `src/host.mjs` | Process singleton used by the extension: decides with one look at the port whether this process is the Port owner, a client or offline, and hands out one view (`role`, `control`, `issue`, `url`); takeover, environment wiring, and doctor as this process sees it |
+| `src/doctor.mjs` | Checks that pi-web-access really uses the broker; words broker-control problems for doctor and the host |
 | `extension/index.js` | The pi extension |
 | `src/cli.mjs` | Standalone CLI (`main(argv)` is exported for tests); `serve` drains on Ctrl+C / SIGTERM |
 | `scripts/check.mjs` | Syntax-checks every module (`npm run check`) |

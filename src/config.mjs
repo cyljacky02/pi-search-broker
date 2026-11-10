@@ -10,7 +10,7 @@ export const SERVICE_NAME = 'pi-search-broker';
 export const LEGACY_SERVICE_NAMES = Object.freeze(['pi-dual-key-manager']);
 /** Config folder name, kept from before the product rename so existing configs and account state are still found. */
 export const CONFIG_DIR_NAME = 'pi-dual-key-manager';
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
 export const TOKEN_ENV = 'PI_SEARCH_BROKER_TOKEN';
 /** Optional override for the broker config path (used by the CLI default and the pi extension). */

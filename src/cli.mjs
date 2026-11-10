@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { defaultConfigPath, loadConfig, writeFirstConfig, defaultStatePath, webSearchFragment, secretsOf } from './config.mjs';
 import { createGateway } from './gateway.mjs';
 import { fileStore } from './pool/store.mjs';
-import { connectControl } from './control.mjs';
+import { baseUrl, connectControl } from './control.mjs';
 import { runDoctor, formatChecks } from './doctor.mjs';
 import { usage, parseCommand, runCommand } from './commands.mjs';
 import { redact } from './providers.mjs';
@@ -99,7 +99,7 @@ export async function main(argv, {
       return 0;
     }
     const control = await connect({ config, statePath: defaultStatePath(configPath), fetchImpl });
-    out(await runCommand(control, command, { config, label: STATUS_LABEL[control.mode] }));
+    out(await runCommand(control, command, { url: baseUrl(config), label: STATUS_LABEL[control.mode] }));
     return 0;
   } catch (e) {
     // Config values (including API keys) are never printed here.

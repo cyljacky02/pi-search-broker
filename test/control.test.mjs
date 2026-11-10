@@ -154,8 +154,9 @@ test('a port redirecting health to a Broker is not trusted with the Gateway toke
     const configPath = join(dir, 'client-config.json');
     writeFileSync(configPath, JSON.stringify(clientConfig));
     host = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: dir } });
-    assert.equal(await host.acquire(), 'error');
-    assert.match(host.lastError, /port .*another program/i);
+    const view = await host.acquire();
+    assert.equal(view.role, 'offline');
+    assert.match(view.issue.message, /port .*another program/i);
     assert.equal((await probeHealth(clientConfig)).state, 'other', 'the unrelated port remains occupied');
     assert.ok(received.every(({ authorization, apiKey }) => !authorization && !apiKey));
     assert.equal(targetRequests, 0, 'the Port owner must not follow the redirect');
@@ -316,7 +317,7 @@ test('extension warns when the joined Gateway disappears before control is usabl
     createExtension({ getHost: () => host })(pi);
     try {
       await handlers.session_start({}, ctx);
-      assert.equal(host.mode, 'client');
+      assert.equal(host.view.role, 'client');
       assert.ok(notices.some(({ level, message }) => level === 'warning' && /Gateway.*(unavailable|unreachable|not running)/i.test(message)), JSON.stringify(notices));
       assert.ok(!JSON.stringify(notices).includes(ownerToken));
     } finally {
@@ -347,10 +348,40 @@ test('extension startup accepts a joined client with the matching Gateway token'
     createExtension({ getHost: () => host })(pi);
     try {
       await handlers.session_start({}, ctx);
-      assert.equal(host.mode, 'client');
+      assert.equal(host.view.role, 'client');
       assert.deepEqual(notices, []);
       assert.match(statuses.at(-1), /tavily/);
       assert.ok(!JSON.stringify(statuses).includes(ownerToken));
+    } finally {
+      await handlers.session_shutdown({}, ctx);
+    }
+  });
+});
+
+test('A joining client decides its role with one look at the port and reuses the control it chose', async () => {
+  const ownerConfig = config(tavily('account-1', 'tvly-owner-provider-key'));
+  await serve(ownerConfig, fetch, async ({ base, statePath }) => {
+    const dir = dirname(statePath);
+    ownerConfig.gateway.port = Number(new URL(base).port);
+    const configPath = join(dir, 'client-config.json');
+    writeFileSync(configPath, JSON.stringify(ownerConfig));
+    writeFileSync(join(dir, 'web-search.json'), JSON.stringify({
+      exaApiKey: '$PI_SEARCH_BROKER_TOKEN', tavilyApiKey: '$PI_SEARCH_BROKER_TOKEN'
+    }));
+    const requests = [];
+    const fetchImpl = (url, options) => { requests.push(new URL(url).pathname); return fetch(url, options); };
+    const host = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: dir }, fetchImpl });
+    const handlers = {};
+    const statuses = [];
+    const pi = { on: (name, fn) => { handlers[name] = fn; }, registerCommand: () => {} };
+    const ctx = { hasUI: true, ui: { setStatus: (_key, status) => statuses.push(status), notify: () => {} } };
+    createExtension({ getHost: () => host })(pi);
+    try {
+      await handlers.session_start({}, ctx);
+      assert.equal(host.view.role, 'client');
+      assert.equal(host.view.control.mode, 'http');
+      assert.deepEqual(requests, ['/health', '/status', '/status'], 'one identity probe, one readiness check, one footer status');
+      assert.match(statuses.at(-1), /tavily .*\[shared\]/);
     } finally {
       await handlers.session_shutdown({}, ctx);
     }
@@ -379,9 +410,9 @@ test('extension warns a joined client about a different Gateway token without at
     createExtension({ getHost: () => host })(pi);
     try {
       await handlers.session_start({}, ctx);
-      assert.equal(host.mode, 'client');
+      assert.equal(host.view.role, 'client');
       now += 5000; // An expired identity cache must still not trigger takeover.
-      assert.equal(await host.ensure(), 'client');
+      assert.equal((await host.ensure()).role, 'client');
       assert.equal((await ownerControl.status()).accounts[0].id, 'account-1');
 
       const output = JSON.stringify(notices);

@@ -2,10 +2,10 @@
 // Lifecycle follows docs/extensions.md "Long-lived resources and shutdown": nothing starts in the factory;
 // the gateway is acquired on session_start and released on session_shutdown (ref-counted per process).
 // pi's own /reload re-runs shutdown + start, which re-reads the broker config.
+// The host decides this process's role; the extension only shows what it decided (see host.mjs for the view).
 import { getHost as processHost } from '../src/host.mjs';
 import { statusLine } from '../src/format.mjs';
-import { runDoctor, formatChecks, gatewayControlIssue } from '../src/doctor.mjs';
-import { baseUrl } from '../src/control.mjs';
+import { formatChecks } from '../src/doctor.mjs';
 import { COMMAND_NAMES, TAKES_ACCOUNT, usage, parseCommand, runCommand } from '../src/commands.mjs';
 
 const STATUS_KEY = 'search-broker';
@@ -13,8 +13,8 @@ const STATUS_KEY = 'search-broker';
 const SEARCH_TOOLS = new Set(['web_search', 'fetch_content', 'source_check']);
 const PREFIX = '/broker';
 const USAGE = usage(PREFIX);
-// How /broker status names where the numbers came from, by control mode.
-const STATUS_LABEL = Object.freeze({ 'in-process': 'owner', http: 'client', offline: 'offline, from the state file' });
+// How /broker status names where the numbers came from, by this process's role.
+const STATUS_LABEL = Object.freeze({ owner: 'owner', client: 'client', offline: 'offline, from the state file' });
 
 /** Build the extension. `getHost` returns the process's broker host (tests pass their own). */
 export function createExtension({ getHost = processHost } = {}) {
@@ -22,17 +22,15 @@ export function createExtension({ getHost = processHost } = {}) {
     let sessionHoldsHost = false;
     let accountIds = [];
 
-    async function refreshFooter(ctx) {
+    async function refreshFooter(ctx, view) {
       if (!sessionHoldsHost || !ctx?.hasUI) return;
-      const host = getHost();
       let text;
       try {
-        const control = await host.control();
-        const snapshot = await control.status();
+        const snapshot = await view.control.status();
         accountIds = snapshot.accounts.map((a) => a.id);
-        text = statusLine(snapshot, { mode: control.mode });
+        text = statusLine(snapshot, { mode: view.control.mode });
       } catch {
-        text = host.mode === 'unconfigured' ? 'search: broker not configured' : 'search: broker offline';
+        text = view?.role === 'unconfigured' ? 'search: broker not configured' : 'search: broker offline';
       }
       ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme?.fg ? ctx.ui.theme.fg('dim', text) : text);
     }
@@ -44,25 +42,15 @@ export function createExtension({ getHost = processHost } = {}) {
 
     pi.on('session_start', async (_event, ctx) => {
       const host = getHost();
-      if (!sessionHoldsHost) { sessionHoldsHost = true; await host.acquire(); }
+      let view;
+      if (sessionHoldsHost) view = await host.ensure();
+      else { sessionHoldsHost = true; view = await host.acquire(); }
+      // Startup notes go to the UI only: in print mode they would end up in pi's output.
       if (ctx?.hasUI) {
         for (const note of host.takeNotes()) ctx.ui.notify(note, 'warning');
-        if (host.mode === 'unconfigured' || host.mode === 'error') ctx.ui.notify(host.lastError, host.mode === 'error' ? 'error' : 'warning');
+        if (view.issue) ctx.ui.notify(view.issue.message, view.issue.level);
       }
-      if (host.mode === 'client') {
-        try {
-          const control = await host.control();
-          const health = await control.health();
-          const base = baseUrl(host.config);
-          const issue = gatewayControlIssue(health, base, control.mode)
-            ?? (health.state === 'other' ? `Something else answers on ${base}; change gateway.port.`
-              : health.state === 'down' ? `Gateway at ${base} became unreachable during startup. Check the Gateway and retry.` : null);
-          if (issue) say(ctx, `Search broker: ${issue}`, 'warning');
-        } catch {
-          say(ctx, 'Search broker: unable to check authenticated control. Check the Gateway and retry.', 'warning');
-        }
-      }
-      await refreshFooter(ctx);
+      await refreshFooter(ctx, view);
     });
 
     // Owner takeover: if the process that owned the port exited, the next search makes this process the owner.
@@ -71,7 +59,7 @@ export function createExtension({ getHost = processHost } = {}) {
     });
 
     pi.on('tool_execution_end', async (event, ctx) => {
-      if (sessionHoldsHost && SEARCH_TOOLS.has(event.toolName)) await refreshFooter(ctx);
+      if (sessionHoldsHost && SEARCH_TOOLS.has(event.toolName)) await refreshFooter(ctx, getHost().view);
     });
 
     pi.on('session_shutdown', async (_event, ctx) => {
@@ -102,18 +90,16 @@ export function createExtension({ getHost = processHost } = {}) {
         const host = getHost();
         try {
           if (command.name === 'doctor') {
-            await host.ensure().catch(() => {});
-            const control = host.config ? await host.control() : null;
-            say(ctx, formatChecks(await runDoctor({ config: host.config, configError: host.lastError, control, env: host.env })));
+            say(ctx, formatChecks(await host.doctor()));
           } else {
-            await host.ensure();
-            const control = await host.control();
-            say(ctx, await runCommand(control, command, { config: host.config, label: STATUS_LABEL[control.mode] }));
+            const view = await host.ensure();
+            if (!view.control) throw new Error(view.issue?.message ?? 'Broker is not configured');
+            say(ctx, await runCommand(view.control, command, { url: view.url, label: STATUS_LABEL[view.role] }));
           }
         } catch (err) {
           say(ctx, `Broker: ${err.message}`, 'error');
         }
-        await refreshFooter(ctx);
+        await refreshFooter(ctx, host.view);
       }
     });
   };

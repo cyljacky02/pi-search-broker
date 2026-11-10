@@ -58,12 +58,11 @@ test('Status warns when Account pool state cannot be saved', async () => {
   const backing = memoryStore();
   let writable = true;
   const store = { load: () => backing.load(), save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); } };
-  const { configPath, gateway, cleanup } = await setup({ store });
+  const { gateway, cleanup } = await setup({ store });
   try {
-    const cfg = loadConfig(configPath);
     writable = false;
     await assert.rejects(gateway.control.disable('t'));
-    const report = await runCommand(gateway.control, { name: 'status' }, { config: cfg });
+    const report = await runCommand(gateway.control, { name: 'status' });
     assert.match(report, /state.*could not be saved/i);
     assert.match(report, /paused/i);
   } finally { await cleanup(); }

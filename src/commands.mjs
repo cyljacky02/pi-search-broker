@@ -1,7 +1,6 @@
 // Account commands shared by the CLI (`node src/cli.mjs <command>`) and pi's `/broker <command>`: one parser, one
 // usage text, one way to print results. Both run them against a broker control (control.mjs).
 import { statusReport } from './format.mjs';
-import { baseUrl } from './control.mjs';
 
 const COMMANDS = Object.freeze([
   { name: 'status', args: '', help: 'accounts and remaining credits' },
@@ -44,12 +43,13 @@ export function parseCommand(words, { prefix }) {
 
 /**
  * Run a parsed account command (not doctor) against a control and return the text to show.
+ * @param url    the gateway's base URL, shown with the status
  * @param label  how the caller describes where the status came from (default: the control's mode)
  */
-export async function runCommand(control, command, { config, label = control.mode } = {}) {
+export async function runCommand(control, command, { url, label = control.mode } = {}) {
   switch (command.name) {
     case 'status':
-      return statusReport(await control.status(), { mode: label, url: config ? baseUrl(config) : undefined });
+      return statusReport(await control.status(), { mode: label, url });
     case 'enable':
       await control.enable(command.id);
       return `Enabled ${command.id}`;

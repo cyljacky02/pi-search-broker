@@ -54,8 +54,8 @@ test('First host owns the port, a second process is a client, and takes over whe
   const a = new BrokerHost({ configPath, env: envA, store: memoryStore() });
   const b = new BrokerHost({ configPath, env: envB, store: memoryStore(), now: () => time.ms });
   try {
-    assert.equal(await a.acquire(), 'owner');
-    assert.equal(await b.acquire(), 'client');
+    assert.equal((await a.acquire()).role, 'owner');
+    assert.equal((await b.acquire()).role, 'client');
     // Environment wiring for pi-web-access in each "process".
     assert.equal(envA.EXA_BASE_URL, `http://127.0.0.1:${port}/exa`);
     assert.equal(envA.TAVILY_BASE_URL, `http://127.0.0.1:${port}/tavily`);
@@ -69,20 +69,20 @@ test('First host owns the port, a second process is a client, and takes over whe
     assert.match(notes, /TAVILY_API_KEY_n/);
     assert.ok(!notes.includes('exa-real') && !notes.includes(TOKEN));
     // The client controls the owner's gateway over HTTP.
-    assert.equal((await b.control()).mode, 'http');
-    assert.equal((await (await b.control()).status()).accounts[0].id, 'tavily-1');
-    await (await b.control()).disable('tavily-1');
-    assert.equal((await (await a.control()).status()).accounts[0].status, 'manual');
-    await (await b.control()).enable('tavily-1');
+    assert.equal(b.view.control.mode, 'http');
+    assert.equal((await b.view.control.status()).accounts[0].id, 'tavily-1');
+    await b.view.control.disable('tavily-1');
+    assert.equal((await a.view.control.status()).accounts[0].status, 'manual');
+    await b.view.control.enable('tavily-1');
     // Owner leaves: env restored, port freed; once the client's probe cache expires, it takes over.
     await a.release();
     assert.equal(envA.EXA_BASE_URL, undefined);
     assert.equal(envA.PI_SEARCH_BROKER_TOKEN, undefined);
-    assert.equal(await b.ensure(), 'client', 'a recent successful probe is trusted for a few seconds');
+    assert.equal((await b.ensure()).role, 'client', 'a recent successful probe is trusted for a few seconds');
     time.ms += 5000;
-    assert.equal(await b.ensure(), 'owner');
-    assert.equal((await b.control()).mode, 'in-process');
-    assert.equal((await (await b.control()).status()).accounts[0].status, 'active');
+    assert.equal((await b.ensure()).role, 'owner');
+    assert.equal(b.view.control.mode, 'in-process');
+    assert.equal((await b.view.control.status()).accounts[0].status, 'active');
   } finally {
     await a.release(); await b.release();
     cleanup();
@@ -114,24 +114,24 @@ test('A late balance response cannot overwrite spend recorded by a replacement P
   const replacement = new BrokerHost({ configPath, env: {}, store, fetchImpl });
   let reconcile;
   try {
-    assert.equal(await old.acquire(), 'owner');
-    reconcile = (await old.control()).reconcile().then((value) => ({ value }), (error) => ({ error }));
+    assert.equal((await old.acquire()).role, 'owner');
+    reconcile = old.view.control.reconcile().then((value) => ({ value }), (error) => ({ error }));
     await started;
     await old.release();
-    assert.equal(await replacement.acquire(), 'owner');
+    assert.equal((await replacement.acquire()).role, 'owner');
     const response = await fetch(`http://127.0.0.1:${port}/tavily/search`, {
       method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify({ query: 'q' })
     });
     assert.equal(response.status, 200);
-    assert.equal((await (await replacement.control()).status()).accounts[0].allocations[0].spent, 1);
+    assert.equal((await replacement.view.control.status()).accounts[0].allocations[0].spent, 1);
 
     finishBalance();
     await returned;
     await reconcile;
     await new Promise((resolve) => setImmediate(resolve));
     await replacement.release();
-    assert.equal(await old.acquire(), 'owner');
-    assert.equal((await (await old.control()).status()).accounts[0].allocations[0].spent, 1, 'the old Account pool must not write after takeover');
+    assert.equal((await old.acquire()).role, 'owner');
+    assert.equal((await old.view.control.status()).accounts[0].allocations[0].spent, 1, 'the old Account pool must not write after takeover');
     assert.equal(balanceSignal.aborted, true, 'shutdown aborts the obsolete balance request');
   } finally {
     finishBalance();
@@ -167,15 +167,15 @@ test('A Port owner drains an in-flight billed search before allowing takeover', 
   let releasing;
   let released = false;
   try {
-    assert.equal(await old.acquire(), 'owner');
-    const oldControl = await old.control();
+    assert.equal((await old.acquire()).role, 'owner');
+    const oldControl = old.view.control;
     const health = await fetch(`http://127.0.0.1:${port}/health`).then((res) => res.json());
     response = post().then((value) => ({ value }), (error) => ({ error }));
     await started;
     releasing = old.release().then(() => { released = true; });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(released, false, 'the listening port stays owned while the Provider outcome is pending');
-    assert.equal(await replacement.acquire(), 'client', 'another process sees the draining Port owner');
+    assert.equal((await replacement.acquire()).role, 'client', 'another process sees the draining Port owner');
     const drainingHealth = await fetch(`http://127.0.0.1:${port}/health`);
     assert.equal(drainingHealth.status, 200);
     assert.deepEqual(await drainingHealth.json(), health, 'Gateway identity is unchanged while draining');
@@ -189,8 +189,8 @@ test('A Port owner drains an in-flight billed search before allowing takeover', 
     assert.equal(finished.value.status, 200);
     await releasing;
     time.ms += 5000;
-    assert.equal(await replacement.ensure(), 'owner');
-    assert.equal((await (await replacement.control()).status()).accounts[0].allocations[0].spent, 2);
+    assert.equal((await replacement.ensure()).role, 'owner');
+    assert.equal((await replacement.view.control.status()).accounts[0].allocations[0].spent, 2);
     await assert.rejects(oldControl.setSpent('tavily-1', 'free', 0), /shutting down/i);
     await assert.rejects(oldControl.reconcile(), /shutting down/i);
   } finally {
@@ -211,10 +211,12 @@ test('A contender whose health probe fails cannot write the shared store before 
   const owner = new BrokerHost({ configPath, env: {}, store });
   const contender = new BrokerHost({ configPath, env: {}, store, fetchImpl: async () => { throw new Error('probe failed'); } });
   try {
-    assert.equal(await owner.acquire(), 'owner');
+    assert.equal((await owner.acquire()).role, 'owner');
     writes = 0;
-    assert.equal(await contender.acquire(), 'error');
-    assert.match(contender.lastError, /used by another program/);
+    const view = await contender.acquire();
+    assert.equal(view.role, 'offline');
+    assert.equal(view.issue.level, 'error');
+    assert.match(view.issue.message, /used by another program/);
     assert.equal(writes, 0, 'a failed bind must not construct a writing Account pool');
   } finally {
     await owner.release();
@@ -244,7 +246,7 @@ test('A client abort during shutdown settles the possibly billed Attempt before 
   let request;
   let releasing;
   try {
-    assert.equal(await old.acquire(), 'owner');
+    assert.equal((await old.acquire()).role, 'owner');
     request = fetch(`http://127.0.0.1:${port}/tavily/search`, {
       method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
       body: JSON.stringify({ query: 'q' }), signal: client.signal
@@ -255,8 +257,8 @@ test('A client abort during shutdown settles the possibly billed Attempt before 
     await aborted;
     await request;
     await releasing;
-    assert.equal(await replacement.acquire(), 'owner');
-    const account = (await (await replacement.control()).status()).accounts[0];
+    assert.equal((await replacement.acquire()).role, 'owner');
+    const account = (await replacement.view.control.status()).accounts[0];
     assert.equal(account.possiblyBilled, 1);
     assert.equal(account.allocations[0].spent, 1);
   } finally {
@@ -275,8 +277,9 @@ test('A failed Account pool startup releases the bound Port and reports the erro
   const store = { load: () => backing.load(), save: () => { throw new Error('disk failure'); } };
   const host = new BrokerHost({ configPath, env: {}, store });
   try {
-    assert.equal(await host.acquire(), 'error');
-    assert.match(host.lastError, /Could not start the broker gateway/);
+    const view = await host.acquire();
+    assert.equal(view.role, 'offline');
+    assert.match(view.issue.message, /Could not start the broker gateway/);
     await assertPortAvailable(port, 'failed initialization must release the Port');
   } finally {
     await host.release();
@@ -294,7 +297,7 @@ test('An admin request waiting for its body cannot mutate the Account pool after
   let response;
   let releasing;
   try {
-    assert.equal(await old.acquire(), 'owner');
+    assert.equal((await old.acquire()).role, 'owner');
     const accepted = new Promise((resolve) => { const stop = onServerRequest(port, () => { stop(); resolve(); }); });
     response = new Promise((resolve, reject) => {
       request = httpRequest(`http://127.0.0.1:${port}/admin/disable`, {
@@ -308,8 +311,8 @@ test('An admin request waiting for its body cannot mutate the Account pool after
     request.end(body.slice(1));
     assert.equal(await response, 503);
     await releasing;
-    assert.equal(await replacement.acquire(), 'owner');
-    assert.equal((await (await replacement.control()).status()).accounts[0].status, 'active');
+    assert.equal((await replacement.acquire()).role, 'owner');
+    assert.equal((await replacement.view.control.status()).accounts[0].status, 'active');
   } finally {
     request?.destroy();
     await response?.catch(() => {});
@@ -326,15 +329,15 @@ test('A retained in-process control cannot write after another Port owner takes 
   const old = new BrokerHost({ configPath, env: {}, store });
   const replacement = new BrokerHost({ configPath, env: {}, store });
   try {
-    assert.equal(await old.acquire(), 'owner');
-    const retained = await old.control();
+    assert.equal((await old.acquire()).role, 'owner');
+    const retained = old.view.control;
     const admitted = retained.disable('tavily-1');
     const releasing = old.release();
     await admitted;
     await releasing;
 
-    assert.equal(await replacement.acquire(), 'owner');
-    const control = await replacement.control();
+    assert.equal((await replacement.acquire()).role, 'owner');
+    const control = replacement.view.control;
     assert.equal((await control.status()).accounts[0].status, 'manual', 'an admitted operation finishes before takeover');
     await control.enable('tavily-1');
     await control.setSpent('tavily-1', 'free', 4);
@@ -346,8 +349,8 @@ test('A retained in-process control cannot write after another Port owner takes 
     ]) await assert.rejects(operation(), /shutting down/i);
     await replacement.release();
 
-    assert.equal(await old.acquire(), 'owner');
-    const account = (await (await old.control()).status()).accounts[0];
+    assert.equal((await old.acquire()).role, 'owner');
+    const account = (await old.view.control.status()).accounts[0];
     assert.equal(account.status, 'active');
     assert.equal(account.allocations[0].spent, 4);
   } finally {
@@ -367,28 +370,28 @@ test('An owner host sends searches upstream through its injected fetch', async (
   };
   const h = new BrokerHost({ configPath, env: {}, fetchImpl, store: memoryStore() });
   try {
-    assert.equal(await h.acquire(), 'owner');
+    assert.equal((await h.acquire()).role, 'owner');
     const res = await fetch(`http://127.0.0.1:${port}/tavily/search`, {
       method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify({ query: 'q' })
     });
     assert.equal(res.status, 200);
     assert.deepEqual(upstream, ['https://api.tavily.com/search']);
-    assert.equal((await (await h.control()).status()).accounts[0].allocations[0].spent, 1);
+    assert.equal((await h.view.control.status()).accounts[0].allocations[0].spent, 1);
   } finally { await h.release(); cleanup(); }
 });
 
 test('Reference counting keeps the gateway alive while any session in the process still uses it', async () => {
-  const { configPath, cleanup } = await setup();
+  const { configPath, port, cleanup } = await setup();
   const h = new BrokerHost({ configPath, env: {}, store: memoryStore() });
   try {
     await h.acquire(); // parent session
     await h.acquire(); // in-process subagent
     await h.release(); // subagent finished
-    assert.equal(h.mode, 'owner');
-    assert.ok(h.gateway, 'the Gateway still serves');
+    assert.equal(h.view.role, 'owner');
+    assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200, 'the Gateway still serves');
     await h.release();
-    assert.equal(h.mode, 'idle');
-    assert.equal(h.gateway, null);
+    assert.deepEqual(h.view, { role: 'idle', control: null, issue: null, url: null });
+    await assertPortAvailable(port, 'the last release stops the Gateway');
   } finally { cleanup(); }
 });
 
@@ -427,12 +430,12 @@ test('A session arriving during final cleanup keeps a Gateway and its pi environ
   const env = { ...originalEnv };
   const h = new BrokerHost({ configPath, env, store: memoryStore() });
   try {
-    assert.equal(await h.acquire(), 'owner');
+    assert.equal((await h.acquire()).role, 'owner');
     const releasing = h.release();
     const acquiring = h.acquire();
-    const [, mode] = await Promise.all([releasing, acquiring]);
+    const [, view] = await Promise.all([releasing, acquiring]);
 
-    assert.equal(mode, 'owner');
+    assert.equal(view.role, 'owner');
     assert.deepEqual(env, {
       ...originalEnv,
       EXA_BASE_URL: `http://127.0.0.1:${port}/exa`,
@@ -485,7 +488,7 @@ test('A late ensure during final release cannot restart the Gateway', async () =
   const env = { ...originalEnv };
   const h = new BrokerHost({ configPath, env, store: memoryStore() });
   try {
-    assert.equal(await h.acquire(), 'owner');
+    assert.equal((await h.acquire()).role, 'owner');
     const releasing = h.release();
     const ensuring = h.ensure();
     await Promise.all([releasing, ensuring]);
@@ -521,7 +524,7 @@ test('An ensure during reload uses the replacement session Gateway configuration
   const h = new BrokerHost({ configPath, env, fetchImpl, store: memoryStore() });
   const operations = [];
   try {
-    assert.equal(await h.acquire(), 'owner');
+    assert.equal((await h.acquire()).role, 'owner');
     const config = JSON.parse(readFileSync(configPath, 'utf8'));
     config.gateway.port = nextPort;
     writeFileSync(configPath, JSON.stringify(config));
@@ -532,9 +535,9 @@ test('An ensure during reload uses the replacement session Gateway configuration
     await probeStarted;
     await operations[0];
     resumeProbe();
-    const [, mode] = await Promise.all(operations);
+    const [, view] = await Promise.all(operations);
 
-    assert.equal(mode, 'owner');
+    assert.equal(view.role, 'owner');
     assert.equal(env.EXA_BASE_URL, `http://127.0.0.1:${nextPort}/exa`);
     const health = await fetch(`http://127.0.0.1:${nextPort}/health`).then((res) => res.json(), () => null);
     assert.equal(health?.service, 'pi-search-broker', 'the replacement session can reach its configured Gateway');
@@ -556,13 +559,13 @@ test('Sessions arriving during cleanup share the Gateway until their last releas
   const env = { ...originalEnv };
   const h = new BrokerHost({ configPath, env, store: memoryStore() });
   try {
-    assert.equal(await h.acquire(), 'owner');
+    assert.equal((await h.acquire()).role, 'owner');
     const releasing = h.release();
     const first = h.acquire();
     const second = h.acquire();
-    const [, firstMode, secondMode] = await Promise.all([releasing, first, second]);
-    assert.equal(firstMode, 'owner');
-    assert.equal(secondMode, 'owner');
+    const [, firstView, secondView] = await Promise.all([releasing, first, second]);
+    assert.equal(firstView.role, 'owner');
+    assert.equal(secondView.role, 'owner');
 
     await h.release();
     assert.equal(env.TAVILY_BASE_URL, `http://127.0.0.1:${port}/tavily`);
@@ -627,8 +630,8 @@ test('An older cleanup cannot discard a newer live session configuration', async
   const h = new BrokerHost({ configPath: first.configPath, env, fetchImpl, store: memoryStore() });
   const operations = [];
   try {
-    assert.equal(await other.acquire(), 'owner');
-    assert.equal(await h.acquire(), 'owner');
+    assert.equal((await other.acquire()).role, 'owner');
+    assert.equal((await h.acquire()).role, 'owner');
     operations.push(h.release());
     operations.push(h.acquire());
     operations.push(h.release());
@@ -638,14 +641,14 @@ test('An older cleanup cannot discard a newer live session configuration', async
     config.gateway.port = replacement.port;
     writeFileSync(first.configPath, JSON.stringify(config));
     operations.push(h.acquire());
-    assert.equal(await operations[3], 'client');
+    assert.equal((await operations[3]).role, 'client');
     writeFileSync(first.configPath, '{invalid until the next reload');
     await Promise.all(operations);
 
     assert.equal(env.EXA_BASE_URL, `http://127.0.0.1:${replacement.port}/exa`);
     assert.equal(env.TAVILY_BASE_URL, `http://127.0.0.1:${replacement.port}/tavily`);
     assert.equal(env.PI_SEARCH_BROKER_TOKEN, TOKEN);
-    assert.equal((await h.control()).mode, 'http');
+    assert.equal(h.view.control.mode, 'http');
     assert.equal((await (await fetch(`http://127.0.0.1:${replacement.port}/health`)).json()).service, 'pi-search-broker');
 
     await h.release();
@@ -682,8 +685,8 @@ test('Final release during a client takeover probe leaves the Gateway port free'
   const client = new BrokerHost({ configPath, env, fetchImpl, store: memoryStore(), now: () => time.ms });
   const operations = [];
   try {
-    assert.equal(await owner.acquire(), 'owner');
-    assert.equal(await client.acquire(), 'client');
+    assert.equal((await owner.acquire()).role, 'owner');
+    assert.equal((await client.acquire()).role, 'client');
     await owner.release();
     time.ms += 5000;
     holdProbe = true;
@@ -710,10 +713,12 @@ test('Final release during a client takeover probe leaves the Gateway port free'
 test('Missing config leaves the host unconfigured with an actionable message and no env changes', async () => {
   const env = {};
   const h = new BrokerHost({ configPath: join(tmpdir(), 'definitely-missing-broker', 'config.json'), env });
-  assert.equal(await h.acquire(), 'unconfigured');
-  assert.match(h.lastError, /npm run init/);
+  const view = await h.acquire();
+  assert.equal(view.role, 'unconfigured');
+  assert.equal(view.control, null, 'nothing to control without a config');
+  assert.equal(view.issue.level, 'warning');
+  assert.match(view.issue.message, /npm run init/);
   assert.deepEqual(env, {});
-  await assert.rejects(h.control(), /npm run init/);
   await h.release();
 });
 
@@ -735,7 +740,7 @@ test('pi extension: registers /broker, shows a footer status, re-reads config on
     createExtension({ getHost: () => host })(pi);
     assert.equal(statuses.length, 0, 'the factory must not start anything');
     await handlers.session_start({ reason: 'startup' }, ctx);
-    assert.equal(host.mode, 'owner');
+    assert.equal(host.view.role, 'owner');
     assert.deepEqual(notes, [], 'correct web-search.json wiring produces no warnings');
     assert.match(statuses.at(-1)[1], /^search: tavily 1,000cr \(1\/1\)/);
     assert.equal(env.TAVILY_BASE_URL?.endsWith('/tavily'), true);
@@ -765,7 +770,7 @@ test('pi extension: registers /broker, shows a footer status, re-reads config on
     assert.match(statuses.at(-1)[1], /^search: tavily 2,000cr \(2\/2\)/);
     await handlers.session_shutdown({ reason: 'quit' }, ctx);
     assert.equal(statuses.at(-1)[1], undefined);
-    assert.equal(host.mode, 'idle');
+    assert.equal(host.view.role, 'idle');
     assert.equal(env.TAVILY_BASE_URL, undefined);
   } finally {
     await host.release();
