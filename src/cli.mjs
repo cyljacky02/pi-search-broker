@@ -7,6 +7,7 @@ import { baseUrl, connectControl } from './control.mjs';
 import { runDoctor, formatChecks } from './doctor.mjs';
 import { usage, parseCommand, runCommand } from './commands.mjs';
 import { redact } from './providers.mjs';
+import { IMPORT_ARGS, IMPORT_OPTIONS, parseImportArgs, importKeyFile, importReport } from './import.mjs';
 
 const PREFIX = 'node src/cli.mjs';
 // How `status` names where the numbers came from, by control mode.
@@ -14,13 +15,15 @@ const STATUS_LABEL = Object.freeze({ 'in-process': 'live', http: 'live', offline
 const CLI_ONLY = [
   { name: 'init', args: '', help: 'create a private config (never overwrites)' },
   { name: 'serve', args: '', help: 'run the gateway in the foreground (standalone mode)' },
-  { name: 'fragment', args: '', help: 'print the web-search.json settings for standalone use' }
+  { name: 'fragment', args: '', help: 'print the web-search.json settings for standalone use' },
+  { name: 'import', args: IMPORT_ARGS, help: 'add one Account per key in a key file (one key per line)' }
 ];
 const HELP = `Pi Search Broker (Node 20.3+, no dependencies)
 ${usage(PREFIX, CLI_ONLY)}
 
 Every command accepts --config /path/to/config.json. The default is $PI_SEARCH_BROKER_CONFIG or
 ~/.config/pi-dual-key-manager/config.json. enable/disable/set-spent/reconcile need a running gateway.
+import options: ${IMPORT_OPTIONS}
 Never paste real provider API keys into shell commands or logs.`;
 
 /** Split argv into the --config path and the positional words. */
@@ -53,6 +56,13 @@ export async function main(argv, {
       out(`Created Pi web-search fragment: ${result.fragmentPath}`);
       out('Edit the config: replace placeholders, adjust expiry/limits, duplicate account records as needed.');
       out('Then install the pi extension (recommended) or run "npm start" and merge the fragment (see README).');
+      return 0;
+    }
+    if (cmd === 'import') {
+      const request = parseImportArgs(words.slice(1), { prefix: PREFIX });
+      if (request.error) { err(request.error); return 1; }
+      const result = importKeyFile(configPath, request);
+      for (const line of importReport({ provider: request.provider, ...result })) out(line);
       return 0;
     }
     const command = parseCommand(words, { prefix: PREFIX });
