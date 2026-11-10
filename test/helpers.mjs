@@ -1,6 +1,9 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:net';
+import diagnostics_channel from 'node:diagnostics_channel';
+import assert from 'node:assert/strict';
 import { createGateway } from '../src/gateway.mjs';
 import { createBroker } from '../src/broker.mjs';
 import { createAccountPool } from '../src/pool.mjs';
@@ -90,14 +93,41 @@ export async function serve(cfg, fetchImpl, fn, { time = { ms: DATE }, ...extra 
   const temp = mkdtempSync(join(tmpdir(), 'pi-search-broker-'));
   const statePath = join(temp, 'state.json');
   const gateway = createGateway(cfg, { store: fileStore(statePath), fetchImpl, clock: fakeClock(time), ...extra });
-  await new Promise((resolve) => gateway.server.listen(0, '127.0.0.1', resolve));
-  const base = `http://127.0.0.1:${gateway.server.address().port}`;
+  const { url: base } = await gateway.start({ port: 0 });
   const post = async (path, body, token = secret, headers = {}, signal = undefined) => fetch(`${base}${path}`, {
     method: 'POST', headers: { 'x-api-key': token, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal
   });
   try { await fn({ base, post, status: gateway.control.status, control: gateway.control, statePath, time }); }
   finally {
-    await new Promise((resolve) => gateway.server.close(resolve));
+    await gateway.stop();
     rmSync(temp, { recursive: true, force: true });
   }
+}
+
+/** A loopback port that was free a moment ago (not `avoid`). */
+export async function freePort(avoid = null) {
+  const srv = createServer();
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const { port } = srv.address();
+  await new Promise((resolve) => srv.close(resolve));
+  return port === avoid ? freePort(avoid) : port;
+}
+
+export async function assertPortAvailable(port, message) {
+  await assert.doesNotReject(new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => server.close(resolve));
+  }), message);
+}
+
+/**
+ * Call fn({ server, request, socket }) whenever an HTTP server on `port` starts handling a request. Uses Node's public
+ * diagnostics channel, so tests observe a Gateway without any back door into it. Returns the unsubscribe function.
+ */
+export function onServerRequest(port, fn) {
+  const channel = diagnostics_channel.channel('http.server.request.start');
+  const listener = (message) => { if (message.socket.localPort === port) fn(message); };
+  channel.subscribe(listener);
+  return () => channel.unsubscribe(listener);
 }

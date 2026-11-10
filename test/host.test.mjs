@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer } from 'node:net';
 import { request as httpRequest } from 'node:http';
 import { BrokerHost } from '../src/host.mjs';
 import { createExtension } from '../extension/index.js';
@@ -11,23 +10,9 @@ import { runDoctor, describeKey, piWebSearchConfigPath } from '../src/doctor.mjs
 import { loadConfig } from '../src/config.mjs';
 import { offlineControl, connectControl } from '../src/control.mjs';
 import { memoryStore } from '../src/pool/store.mjs';
+import { freePort, assertPortAvailable, onServerRequest } from './helpers.mjs';
 
 const TOKEN = 'local-only-secret-with-32-chars-12345';
-async function freePort(avoid = null) {
-  const srv = createServer();
-  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
-  const { port } = srv.address();
-  await new Promise((resolve) => srv.close(resolve));
-  return port === avoid ? freePort(avoid) : port;
-}
-
-async function assertPortAvailable(port, message) {
-  await assert.doesNotReject(new Promise((resolve, reject) => {
-    const server = createServer();
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', () => server.close(resolve));
-  }), message);
-}
 
 function deferHealthProbe() {
   let resume;
@@ -310,7 +295,7 @@ test('An admin request waiting for its body cannot mutate the Account pool after
   let releasing;
   try {
     assert.equal(await old.acquire(), 'owner');
-    const accepted = new Promise((resolve) => old.gateway.server.once('request', resolve));
+    const accepted = new Promise((resolve) => { const stop = onServerRequest(port, () => { stop(); resolve(); }); });
     response = new Promise((resolve, reject) => {
       request = httpRequest(`http://127.0.0.1:${port}/admin/disable`, {
         method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }
@@ -400,7 +385,7 @@ test('Reference counting keeps the gateway alive while any session in the proces
     await h.acquire(); // in-process subagent
     await h.release(); // subagent finished
     assert.equal(h.mode, 'owner');
-    assert.ok(h.gateway?.server.listening);
+    assert.ok(h.gateway, 'the Gateway still serves');
     await h.release();
     assert.equal(h.mode, 'idle');
     assert.equal(h.gateway, null);

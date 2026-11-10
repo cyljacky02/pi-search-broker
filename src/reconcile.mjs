@@ -2,8 +2,8 @@
 // Results are shown next to the local estimate in /status; they never change local accounting.
 // Correct local spend with `set-spent` if the two drift apart.
 import { PROVIDERS } from './providers.mjs';
-import { createPendingWork } from './pending-work.mjs';
 
+const SHUTDOWN = Object.freeze({ skipped: 'shutdown' });
 const unknown = () => { throw new Error('Unknown account id'); };
 
 /** Whether this account can be checked against the provider at all. */
@@ -28,39 +28,36 @@ export async function fetchBalance(account, { fetchImpl = fetch, timeoutMs = 100
   return balance.parse(data);
 }
 
-const SHUTDOWN = Object.freeze({ skipped: 'shutdown' });
-
 /**
- * On-demand (and, if intervalMs > 0, periodic) balance checks for the configured `accounts`, recorded in the Account
- * pool. A minimum gap per account keeps repeated requests within Tavily's /usage rate limit.
+ * Balance checks for the configured `accounts`, each result recorded in the Account `pool`. A minimum gap per account
+ * keeps repeated requests within Tavily's /usage rate limit. Once `signal` aborts (the Gateway is stopping), checks
+ * stop: one in flight is abandoned, since an adapter may ignore the signal, and nothing more is recorded.
  * fetchImpl defaults to the real fetch: balance endpoints are different hosts from the search routes.
  */
-export function createReconciler(accounts, pool, { fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, intervalMs = 0 } = {}) {
+export function createBalanceChecks({
+  accounts, pool, fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, signal = new AbortController().signal
+}) {
   const lastAttempt = new Map();
-  const stopping = new AbortController();
-  const pending = createPendingWork();
-  let timer = null;
 
   /** One account's balance: { remaining, details }, an Error with a key-free message, or { skipped: reason }. */
   async function check(account) {
-    if (stopping.signal.aborted) return SHUTDOWN;
+    if (signal.aborted) return SHUTDOWN;
     if (!canReconcile(account)) return { skipped: 'not-supported' };
     if (now() - (lastAttempt.get(account.id) ?? -Infinity) < minGapMs) return { skipped: 'too-soon' };
     lastAttempt.set(account.id, now());
-    // An adapter (or a response body) may ignore AbortSignal: stop waiting for it once shutdown begins.
     let cancel;
     const cancelled = new Promise((resolve) => {
       cancel = () => resolve(SHUTDOWN);
-      stopping.signal.addEventListener('abort', cancel, { once: true });
+      signal.addEventListener('abort', cancel, { once: true });
     });
     try {
-      const result = await Promise.race([fetchBalance(account, { fetchImpl, signal: stopping.signal }), cancelled]);
-      return stopping.signal.aborted ? SHUTDOWN : result;
+      const result = await Promise.race([fetchBalance(account, { fetchImpl, signal }), cancelled]);
+      return signal.aborted ? SHUTDOWN : result;
     } catch (err) {
-      if (stopping.signal.aborted) return SHUTDOWN;
+      if (signal.aborted) return SHUTDOWN;
       return err instanceof Error ? err : new Error('Balance check failed');
     } finally {
-      stopping.signal.removeEventListener('abort', cancel);
+      signal.removeEventListener('abort', cancel);
     }
   }
 
@@ -80,21 +77,5 @@ export function createReconciler(accounts, pool, { fetchImpl = fetch, now = () =
     return results;
   }
 
-  function reconcile(accountId) {
-    if (stopping.signal.aborted) return Promise.reject(new Error('Gateway is shutting down'));
-    return pending.track(run(accountId));
-  }
-
-  function start() {
-    if (timer || !intervalMs || stopping.signal.aborted) return;
-    timer = setInterval(() => { reconcile().catch(() => {}); }, intervalMs);
-    timer.unref?.();
-  }
-  async function stop() {
-    clearInterval(timer);
-    timer = null;
-    stopping.abort();
-    await pending.drain();
-  }
-  return { reconcile, start, stop };
+  return { run };
 }

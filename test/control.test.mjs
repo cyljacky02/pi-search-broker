@@ -10,7 +10,7 @@ import { connectControl, probeHealth } from '../src/control.mjs';
 import { SERVICE_NAME } from '../src/config.mjs';
 import { createGateway } from '../src/gateway.mjs';
 import { runDoctor, formatChecks } from '../src/doctor.mjs';
-import { config, serve, tavily, secret as ownerToken } from './helpers.mjs';
+import { config, serve, tavily, onServerRequest, secret as ownerToken } from './helpers.mjs';
 
 const clientToken = 'different-client-gateway-token-123456';
 
@@ -104,12 +104,13 @@ test('a port redirecting health to a Broker is not trusted with the Gateway toke
   const ownerConfig = config(tavily('account-1', 'tvly-owner-provider-key'));
   const gateway = createGateway(ownerConfig);
   let targetRequests = 0;
-  gateway.server.on('request', () => { targetRequests++; });
+  let gatewayPort;
+  let stopCounting = () => {};
   const received = [];
   const other = createServer((req, res) => {
     received.push({ path: req.url, authorization: Boolean(req.headers.authorization), apiKey: Boolean(req.headers['x-api-key']) });
     if (req.url === '/health') {
-      res.writeHead(302, { location: `http://127.0.0.1:${gateway.server.address().port}/health` });
+      res.writeHead(302, { location: `http://127.0.0.1:${gatewayPort}/health` });
       res.end();
     } else if (req.url === '/status') {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -121,9 +122,10 @@ test('a port redirecting health to a Broker is not trusted with the Gateway toke
   });
   let host;
   try {
-    await new Promise((resolve) => gateway.server.listen(0, '127.0.0.1', resolve));
+    ({ port: gatewayPort } = await gateway.start({ port: 0 }));
+    stopCounting = onServerRequest(gatewayPort, () => { targetRequests++; });
     await new Promise((resolve) => other.listen(0, '127.0.0.1', resolve));
-    ownerConfig.gateway.port = gateway.server.address().port;
+    ownerConfig.gateway.port = gatewayPort;
     assert.equal((await probeHealth(ownerConfig)).state, 'running', 'the redirect target is a genuine Broker');
     targetRequests = 0;
 
@@ -159,9 +161,10 @@ test('a port redirecting health to a Broker is not trusted with the Gateway toke
     assert.equal(targetRequests, 0, 'the Port owner must not follow the redirect');
     assert.ok(!output.includes(ownerToken) && !output.includes(clientToken));
   } finally {
+    stopCounting();
     if (host) await host.release();
     if (other.listening) await new Promise((resolve) => other.close(resolve));
-    if (gateway.server.listening) await new Promise((resolve) => gateway.server.close(resolve));
+    await gateway.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -269,7 +272,7 @@ test('doctor does not mistake a stale offline control for a usable newly arrived
     assert.equal(control.mode, 'offline');
     await new Promise((resolve) => other.close(resolve));
     gateway = createGateway(ownerConfig);
-    await new Promise((resolve) => gateway.server.listen(ownerConfig.gateway.port, '127.0.0.1', resolve));
+    await gateway.start();
     assert.equal((await probeHealth(clientConfig)).state, 'running');
 
     const checks = await runDoctor({ config: clientConfig, control, env: { PI_CODING_AGENT_DIR: dir }, home: dir });
@@ -278,7 +281,7 @@ test('doctor does not mistake a stale offline control for a usable newly arrived
     assert.ok(!checks.some(({ level, message }) => level === 'ok' && /Gateway is running/.test(message)), output);
     assert.ok(!output.includes(ownerToken) && !output.includes(clientToken));
   } finally {
-    if (gateway?.server.listening) await new Promise((resolve) => gateway.server.close(resolve));
+    await gateway?.stop();
     if (other.listening) await new Promise((resolve) => other.close(resolve));
     rmSync(dir, { recursive: true, force: true });
   }
@@ -288,9 +291,8 @@ test('extension warns when the joined Gateway disappears before control is usabl
   const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-control-'));
   const ownerConfig = config(tavily('account-1', 'tvly-owner-provider-key'));
   const gateway = createGateway(ownerConfig);
-  await new Promise((resolve) => gateway.server.listen(0, '127.0.0.1', resolve));
+  ({ port: ownerConfig.gateway.port } = await gateway.start({ port: 0 }));
   try {
-    ownerConfig.gateway.port = gateway.server.address().port;
     const configPath = join(dir, 'client-config.json');
     writeFileSync(configPath, JSON.stringify(ownerConfig));
     writeFileSync(join(dir, 'web-search.json'), JSON.stringify({
@@ -302,7 +304,7 @@ test('extension warns when the joined Gateway disappears before control is usabl
       const response = await fetch(url, options);
       if (!stopped && new URL(url).pathname === '/health') {
         stopped = true;
-        await new Promise((resolve) => gateway.server.close(resolve));
+        await gateway.stop();
       }
       return response;
     };
@@ -321,7 +323,7 @@ test('extension warns when the joined Gateway disappears before control is usabl
       await handlers.session_shutdown({}, ctx);
     }
   } finally {
-    if (gateway.server.listening) await new Promise((resolve) => gateway.server.close(resolve));
+    await gateway.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });

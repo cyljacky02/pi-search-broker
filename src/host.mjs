@@ -104,7 +104,7 @@ export class BrokerHost {
   async #ensure() {
     const config = this.loadConfig();
     if (!config) return this.mode;
-    if (this.mode === 'owner' && this.gateway?.server.listening) return this.mode;
+    if (this.mode === 'owner' && this.gateway) return this.mode;
     if (this.mode === 'client' && this.now() - this.lastProbeOk < PROBE_CACHE_MS) return this.mode;
     if (await this.probe()) { this.mode = 'client'; return this.mode; }
     if (this.refs === 0) return this.mode;
@@ -128,27 +128,20 @@ export class BrokerHost {
     return ok;
   }
 
-  listen(config) {
+  /** Become the Port owner. On failure the Gateway has already released the Port and written nothing. */
+  async listen(config) {
     const gateway = createGateway(config, {
       store: this.store ?? fileStore(this.statePath), fetchImpl: this.fetchImpl, reconcileFetch: this.fetchImpl,
       clock: { ...realClock, now: this.now }, logger: this.logger
     });
-    return new Promise((resolve, reject) => {
-      const onError = (err) => { gateway.shutdown().catch(() => {}); reject(err); };
-      gateway.server.once('error', onError);
-      gateway.server.listen(config.gateway.port, config.gateway.host, () => {
-        gateway.server.off('error', onError);
-        gateway.server.unref(); // never keep pi alive
-        this.gateway = gateway;
-        resolve();
-      });
-    });
+    await gateway.start({ unref: true }); // never keep pi alive
+    this.gateway = gateway;
   }
 
   async stopServer() {
     const gateway = this.gateway;
     if (!gateway) return;
-    await gateway.shutdown();
+    await gateway.stop();
     if (this.gateway === gateway) this.gateway = null;
   }
 

@@ -37,8 +37,11 @@ function parseArgs(argv, env) {
 /**
  * Run one CLI invocation. Returns the exit code (serve keeps the process alive and returns 0).
  * @param connect  (options) => broker control; tests pass one that returns an in-process control
+ * @param signals  where serve listens for SIGINT / SIGTERM (default: process; tests pass an EventEmitter)
  */
-export async function main(argv, { out = console.log, err = console.error, env = process.env, fetchImpl = fetch, connect = connectControl } = {}) {
+export async function main(argv, {
+  out = console.log, err = console.error, env = process.env, fetchImpl = fetch, connect = connectControl, signals = process
+} = {}) {
   const { words, configPath } = parseArgs(argv, env);
   const [cmd = 'help'] = words;
   let secrets = [];
@@ -70,19 +73,29 @@ export async function main(argv, { out = console.log, err = console.error, env =
     secrets = secretsOf(config);
     if (cmd === 'fragment') { out(JSON.stringify(webSearchFragment(config.gateway), null, 2)); return 0; }
     if (cmd === 'serve') {
-      const { server } = createGateway(config, {
-        store: fileStore(defaultStatePath(configPath)),
+      const gateway = createGateway(config, {
+        store: fileStore(defaultStatePath(configPath)), fetchImpl, reconcileFetch: fetchImpl,
         logger: (line) => out(`${new Date().toISOString()} ${line}`)
       });
-      server.on('error', (e) => {
-        err(e.code === 'EADDRINUSE' ? `Port ${config.gateway.port} is already in use (is the broker already running in pi?)` : `Server error: ${e.message}`);
-        process.exitCode = 1;
-      });
-      server.listen(config.gateway.port, config.gateway.host, () => {
-        out(`Gateway listening on ${config.gateway.host}:${config.gateway.port} (loopback only)`);
-        out(`Exa accounts: ${config.accounts.filter((a) => a.provider === 'exa').length}`);
-        out(`Tavily accounts: ${config.accounts.filter((a) => a.provider === 'tavily').length}`);
-      });
+      try {
+        await gateway.start();
+      } catch (e) {
+        err(e.code === 'EADDRINUSE' ? `Port ${config.gateway.port} is already in use (is the broker already running in pi?)` : `Gateway could not start: ${redact(e.message, secrets)}`);
+        return 1;
+      }
+      out(`Gateway listening on ${config.gateway.host}:${config.gateway.port} (loopback only)`);
+      out(`Exa accounts: ${config.accounts.filter((a) => a.provider === 'exa').length}`);
+      out(`Tavily accounts: ${config.accounts.filter((a) => a.provider === 'tavily').length}`);
+      // Ctrl+C / SIGTERM: let in-flight searches end their Reservations (so their spend is saved), then release the
+      // Port. The listeners go at the first signal, so a second one gets Node's default handling and exits at once.
+      const onSignal = (signal) => {
+        signals.off('SIGINT', onSignal);
+        signals.off('SIGTERM', onSignal);
+        out(`${signal}: finishing in-flight requests before exit (repeat to exit at once)`);
+        gateway.stop().then(() => out('Gateway stopped'), (e) => { err(`Gateway shutdown failed: ${e.message}`); process.exitCode = 1; });
+      };
+      signals.on('SIGINT', onSignal);
+      signals.on('SIGTERM', onSignal);
       return 0;
     }
     const control = await connect({ config, statePath: defaultStatePath(configPath), fetchImpl });

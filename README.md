@@ -152,7 +152,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
 
 ## Standalone mode (no extension)
 
-1. `npm start` (keep it running), or `node src/cli.mjs serve`.
+1. `npm start` (keep it running), or `node src/cli.mjs serve`. Ctrl+C (or SIGTERM) lets in-flight searches finish and saves their spend before the port is released; press Ctrl+C again to quit at once.
 2. Merge the fields from `web-search.fragment.json` (`npm run init` creates it; `node src/cli.mjs fragment` prints it) into `~/.pi/agent/web-search.json`. **Merge them; don't overwrite the file.**
 
    ```json
@@ -235,15 +235,14 @@ Layout:
 |---|---|
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
 | `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion and unsaved-state replies) and returns `{status, body}` |
-| `src/gateway.mjs` | HTTP server: auth, routing, body parsing and replies around the broker; drains in-flight work before releasing the port |
+| `src/gateway.mjs` | Gateway: `start()` binds the port, then loads the account pool; `stop()` refuses new work, cancels balance checks, lets in-flight work settle and releases the port. In between: auth, routing, body parsing and replies around the broker |
 | `src/pool.mjs` | Account pool: accounts, allocations, health and spend. `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends; a save that fails throws `StateNotSaved` with that ending); `recordBalanceCheck()` stores provider balances; keeps the attempt log |
 | `src/pool/health.mjs` | Account health: what each failure effect does to an account (disable, quota, cooldowns) and how it recovers |
 | `src/pool/allocation.mjs` | Allocation calendar: windows, reset days, spending order, and when an out-of-credit account is worth retrying |
 | `src/pool/store.mjs` | Where pool state lives: `fileStore` (`pool-state.json`, optionally read-only; started once from a 0.2.x `state.json`, which is never written) or `memoryStore` |
-| `src/reconcile.mjs` | Optional, report-only provider balance checks: one account at a time with a rate gap per account, each result recorded with `pool.recordBalanceCheck`; cancels safely on shutdown |
+| `src/reconcile.mjs` | Optional, report-only provider balance checks: one account at a time with a rate gap per account, each result recorded with `pool.recordBalanceCheck`; the Gateway cancels them when it stops |
 | `src/format.mjs` | Human-readable status: the footer line and the status report |
 | `src/log.mjs` | `quietLogger`: an optional logger that never throws |
-| `src/pending-work.mjs` | Tracks pending work and drains the current batch; admission and cancellation stay with the caller |
 | `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |
 | `src/clock.mjs` | Time for everything that waits on it (`now`, `sleep`, `timeout`): `realClock`; tests pass a fake clock that fires timeouts on demand |
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with in-process, HTTP and offline (read-only) adapters; `connectControl` picks one |
@@ -251,7 +250,7 @@ Layout:
 | `src/host.mjs` | Process singleton, port ownership, takeover and environment wiring, used by the extension |
 | `src/doctor.mjs` | Checks that pi-web-access really uses the broker |
 | `extension/index.js` | The pi extension |
-| `src/cli.mjs` | Standalone CLI (`main(argv)` is exported for tests) |
+| `src/cli.mjs` | Standalone CLI (`main(argv)` is exported for tests); `serve` drains on Ctrl+C / SIGTERM |
 | `scripts/check.mjs` | Syntax-checks every module (`npm run check`) |
 
 Re-run the pi-web-access audit ([docs/research/pi-web-access.md](docs/research/pi-web-access.md)) whenever pi-web-access is upgraded: a new Exa/Tavily endpoint there would return 404 here, which pi classifies as `unknown` (no fallback).

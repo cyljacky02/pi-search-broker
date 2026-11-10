@@ -4,11 +4,10 @@ import { createAccountPool, StateNotSaved } from './pool.mjs';
 import { memoryStore } from './pool/store.mjs';
 import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
 import { ROUTES } from './providers.mjs';
-import { createReconciler } from './reconcile.mjs';
+import { createBalanceChecks } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
-import { inProcessControl, serveAdmin } from './control.mjs';
+import { baseUrl, inProcessControl, serveAdmin } from './control.mjs';
 import { quietLogger } from './log.mjs';
-import { createPendingWork } from './pending-work.mjs';
 import { realClock } from './clock.mjs';
 
 function suppliedToken(req) {
@@ -57,51 +56,84 @@ async function readBody(req, maxBytes = 1024 * 1024) {
   }
 }
 
+const SHUTTING_DOWN = 'Gateway is shutting down';
+const shuttingDown = () => Object.assign(new Error(SHUTTING_DOWN), { statusCode: 503 });
+
 /**
+ * Admission for everything the Gateway does: run() admits a task and keeps it until it settles; close() refuses new
+ * work at once and resolves when everything admitted has settled, including work admitted while it waits.
+ */
+function createGate() {
+  const inFlight = new Set();
+  let open = true;
+  return {
+    get open() { return open; },
+    run(task) {
+      if (!open) return Promise.reject(shuttingDown());
+      const work = Promise.resolve().then(task);
+      const forget = () => inFlight.delete(work);
+      inFlight.add(work);
+      work.then(forget, forget);
+      return work;
+    },
+    async close() {
+      open = false;
+      while (inFlight.size) await Promise.allSettled([...inFlight]);
+    }
+  };
+}
+
+/**
+ * The loopback HTTP endpoint pi-web-access sends Exa and Tavily requests to. A Gateway serves once:
+ *   start({ port?, host?, unref? }) -> { port, url }   bind the Port, then load the Account pool and serve
+ *   stop()                                           refuse new work, cancel balance checks, let in-flight work
+ *                                                    settle, release the Port
+ *   control                                          broker control for this process (see control.mjs)
+ *
  * @param store           account pool state store (default: in memory; the host and CLI pass a fileStore)
  * @param reconcileFetch  fetch for provider balance endpoints (default: the real fetch)
  * @param clock           { now, sleep, timeout } (see clock.mjs) for everything the Gateway builds
+ * @param logger          optional (line) => void
  */
 export function createGateway(config, {
-  store = memoryStore(), fetchImpl = fetch, clock = realClock, logger = null, reconcileFetch = fetch
+  store = memoryStore(), fetchImpl = fetch, reconcileFetch = fetch, clock = realClock, logger = null
 } = {}) {
-  const now = () => clock.now();
   const log = quietLogger(logger);
-  let pool;
-  let reconciler;
-  let broker;
-  let internalControl;
-  let draining = false;
-  let shutdownPromise = null;
-  const pending = createPendingWork();
+  const now = () => clock.now();
+  const gate = createGate();
+  const cancelChecks = new AbortController(); // balance checks are report-only, so stopping cancels them
+  let serving = null; // what the Gateway runs once it owns the Port: { pool, broker, balanceChecks, control }
+  let timer = null;
+  let starting = null;
+  let stopping = null;
 
-  // Pool construction writes state, so initialize only after binding the Port.
-  function initialize() {
-    if (pool) return;
-    pool = createAccountPool(config.accounts, { store, now, logger });
-    reconciler = createReconciler(config.accounts, pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
-    broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, clock });
-    internalControl = inProcessControl({ pool, reconciler });
+  // Pool construction loads and saves state, so this runs only after the Port is bound.
+  function assemble() {
+    const pool = createAccountPool(config.accounts, { store, now, logger });
+    const balanceChecks = createBalanceChecks({ accounts: config.accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
+    const broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, clock });
+    return { pool, broker, balanceChecks, control: inProcessControl({ pool, reconciler: { reconcile: (id) => balanceChecks.run(id) } }) };
   }
 
+  // Broker control for this process: usable once the Gateway serves, refused once it stops.
   const control = {
     mode: 'in-process',
     ...Object.fromEntries(['health', 'status', 'enable', 'disable', 'setSpent', 'reconcile'].map((name) => [
       name, (...args) => {
-        if (draining) return Promise.reject(Object.assign(new Error('Gateway is shutting down'), { statusCode: 503 }));
-        if (!pool) return Promise.reject(new Error('Gateway has not acquired the Port'));
-        return pending.track(internalControl[name](...args));
+        if (!serving) return Promise.reject(gate.open ? new Error('Gateway has not acquired the Port') : shuttingDown());
+        return gate.run(() => serving.control[name](...args));
       }
     ]))
   };
 
   async function proxy(req, res, route) {
     const body = await readBody(req);
-    if (draining) return reply(res, 503, { error: 'Gateway is shutting down' });
+    // The body can finish arriving after stop() began: start no new Attempt then.
+    if (!gate.open) return reply(res, 503, { error: SHUTTING_DOWN });
     // Stop spending upstream credits once the client has gone away.
     const clientGone = new AbortController();
     res.on('close', () => { if (!res.writableFinished) clientGone.abort(); });
-    const result = await broker.execute(route, body, { headers: req.headers, signal: clientGone.signal });
+    const result = await serving.broker.execute(route, body, { headers: req.headers, signal: clientGone.signal });
     if (result.status !== CLIENT_CLOSED) reply(res, result.status, result.body);
   }
 
@@ -111,7 +143,6 @@ export function createGateway(config, {
       // Disallow query strings: no need to forward any untrusted host / URL fields.
       if (url.search) return reply(res, 400, { error: 'Query parameters are not supported' });
       if (url.pathname === '/health' && req.method === 'GET') return replyHealth(res);
-      if (draining) return reply(res, 503, { error: 'Gateway is shutting down' });
       if (!isAuthorized(req, config.gateway.token)) return reply(res, 401, { error: unauthorizedHint(req) });
       if (url.pathname === '/status' && req.method === 'GET') return reply(res, 200, await control.status());
       if (url.pathname.startsWith('/admin/') && req.method === 'POST') {
@@ -129,66 +160,78 @@ export function createGateway(config, {
       if (code === 500) log(`internal error: ${err?.name ?? 'Error'}`);
     }
   }
+
   const server = createServer((req, res) => {
-    // The draining Gateway still identifies the Port owner, but never accepts more mutating work.
-    if (draining) {
+    if (!gate.open) {
+      // A stopping Gateway still identifies the Port owner, but accepts no more work.
       if (req.method === 'GET' && req.url === '/health') return replyHealth(res);
-      return reply(res, 503, { error: 'Gateway is shutting down' });
+      return reply(res, 503, { error: SHUTTING_DOWN });
     }
-    // Register before entering any asynchronous handler. Closing a socket alone does not finish its work.
-    pending.track(Promise.resolve().then(() => handle(req, res)));
+    // Admit before any asynchronous step: stop() waits for this request even if its socket closes.
+    gate.run(() => handle(req, res)).catch(() => reply(res, 503, { error: SHUTTING_DOWN }));
   });
   // Never keep idle sockets open forever.
   server.requestTimeout = 60000;
   server.headersTimeout = 65000;
-  function activate() {
-    if (draining) throw new Error('Gateway is shutting down');
-    if (!server.listening) throw new Error('Gateway has not acquired the Port');
-    initialize();
-    reconciler.start();
-  }
-  let startupError = null;
-  server.on('listening', () => {
-    if (draining) return;
-    try { activate(); }
-    catch (err) {
-      startupError = err;
-      // Report initialization failure as a server error, but do not leave the port bound.
-      shutdown().then(
-        () => process.nextTick(() => server.emit('error', err)),
-        () => { log('Gateway shutdown failed'); process.nextTick(() => server.emit('error', err)); }
-      );
-    }
-  });
-  const listen = server.listen.bind(server);
-  server.listen = (...args) => {
-    if (draining) throw new Error('Gateway is shutting down');
-    const last = args.length - 1;
-    if (typeof args[last] === 'function') {
-      const callback = args[last];
-      args[last] = (...values) => { if (!startupError && !draining) callback.apply(server, values); };
-    }
-    return listen(...args);
-  };
 
-  const close = server.close.bind(server);
-  function shutdown() {
-    if (shutdownPromise) return shutdownPromise;
-    draining = true;
-    shutdownPromise = Promise.resolve().then(async () => {
-      // Reconciliation is report-only and can be cancelled; brokered requests must finish settlement.
-      if (reconciler) await reconciler.stop();
-      await pending.drain();
-      await new Promise((resolve, reject) => close((err) => err ? reject(err) : resolve()));
+  function bind(port, host) {
+    return new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, host, () => {
+        server.off('error', reject);
+        // From now on a server error (e.g. EMFILE on accept) is logged; with no listener it would crash the process.
+        server.on('error', (err) => log(`Gateway server error: ${err?.code ?? err?.name ?? 'Error'}`));
+        resolve();
+      });
     });
-    return shutdownPromise;
   }
-  // Preserve server.close(callback) for standalone and existing callers, but drain before unbinding.
-  server.close = (callback) => {
-    const work = shutdown();
-    if (callback) work.then(() => process.nextTick(callback), (err) => process.nextTick(callback, err));
-    else work.catch(() => log('Gateway shutdown failed'));
-    return server;
-  };
-  return { server, control, shutdown };
+
+  function release() {
+    if (!server.listening) return Promise.resolve();
+    return new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  }
+
+  /**
+   * Bind the Port, load the Account pool, and serve. Resolves with the bound { port, url }. Rejects with the Port
+   * released and nothing written when the Port is taken, the Account pool cannot load or save, or stop() began.
+   */
+  function start({ port = config.gateway.port, host = config.gateway.host, unref = false } = {}) {
+    if (!gate.open) return Promise.reject(shuttingDown());
+    starting ??= (async () => {
+      await bind(port, host);
+      try {
+        if (!gate.open) throw shuttingDown();
+        serving = assemble();
+      } catch (err) {
+        await release();
+        throw err;
+      }
+      if (config.reconcileIntervalMs) {
+        timer = setInterval(() => { gate.run(() => serving.balanceChecks.run()).catch(() => {}); }, config.reconcileIntervalMs);
+        timer.unref();
+      }
+      if (unref) server.unref();
+      const bound = { host, port: server.address().port };
+      return { port: bound.port, url: baseUrl({ gateway: bound }) };
+    })();
+    return starting;
+  }
+
+  /**
+   * Stop for good, in this order: refuse new work, cancel balance checks (report-only), let in-flight work settle
+   * (Brokered requests must end their Reservations), release the Port. Calling it again returns the same promise.
+   */
+  function stop() {
+    stopping ??= (async () => {
+      const settled = gate.close();
+      cancelChecks.abort();
+      clearInterval(timer);
+      await starting?.catch(() => {}); // a start in progress sees the closed gate and releases the Port itself
+      await settled;
+      await release();
+    })();
+    return stopping;
+  }
+
+  return { start, stop, control };
 }
