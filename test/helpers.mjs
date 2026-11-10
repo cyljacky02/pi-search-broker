@@ -25,13 +25,27 @@ export const json = (data, status = 200, headers = {}) => Response.json(data, { 
 /** The key an upstream request was sent with (Exa header or Tavily bearer). */
 export const keyOf = (opts) => opts.headers['x-api-key'] ?? opts.headers.Authorization;
 
+/** A store whose saves fail while `writable` is false, with key material in the error a reply must never echo. */
+export function flakyStore() {
+  const backing = memoryStore();
+  const store = {
+    writable: true,
+    load: () => backing.load(),
+    save: (state) => {
+      if (!store.writable) throw new Error('disk failure near tvly-secret-key and exa-secret-key');
+      backing.save(state);
+    }
+  };
+  return store;
+}
+
 /**
  * A brokered-request harness: no sockets, an in-memory account pool, a fake clock and recorded sleeps.
  * call(localPath, body, {headers, signal}) -> { status, body }; status() -> the /status snapshot.
  */
-export function broker(cfg, fetchImpl, { time = { ms: DATE } } = {}) {
+export function broker(cfg, fetchImpl, { time = { ms: DATE }, store = memoryStore() } = {}) {
   const now = () => time.ms;
-  const pool = createAccountPool(cfg.accounts, { store: memoryStore(), now });
+  const pool = createAccountPool(cfg.accounts, { store, now });
   const sleeps = [];
   const b = createBroker({ pool, limits: cfg, secrets: secretsOf(cfg), fetchImpl, now, sleep: async (ms) => { sleeps.push(ms); } });
   return {

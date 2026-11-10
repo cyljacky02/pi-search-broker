@@ -17,6 +17,22 @@ export const POSSIBLY_BILLED = Object.freeze({
   AMBIGUOUS_NETWORK: 'ambiguous-network' // delivery could not be determined
 });
 const POSSIBLY_BILLED_REASONS = new Set(Object.values(POSSIBLY_BILLED));
+
+/** How a Reservation ended: the ending a failed save leaves live but unsaved (see StateNotSaved). */
+export const ENDING = Object.freeze({ BILLED: 'billed', POSSIBLY_BILLED: 'possibly-billed', FAILED: 'failed' });
+
+/**
+ * The Account pool could not save its state. The change is live in this process, and new Attempts are paused until a
+ * save succeeds. `ending` is the Reservation ending that is live but unsaved (an ENDING), or null when no Attempt ended:
+ * an admin change, or the save retried before a new Attempt. Never carries the storage error's text.
+ */
+export class StateNotSaved extends Error {
+  constructor(ending = null) {
+    super('Account pool state could not be saved; new attempts are paused until storage recovers');
+    this.name = 'StateNotSaved';
+    this.ending = ending;
+  }
+}
 const RECENT_LIMIT = 50;
 const totalRemaining = (allocations) => allocations.reduce((sum, a) => sum + a.remaining, 0);
 
@@ -44,7 +60,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   const recent = [];
   const log = quietLogger(logger);
   let persistenceUnavailable = false;
-  const save = ({ attemptFinished = false } = {}) => {
+  const save = (ending = null) => {
     try {
       store.save(state);
       if (persistenceUnavailable) log('Account pool state storage recovered');
@@ -52,11 +68,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     } catch {
       if (!persistenceUnavailable) log('Account pool state could not be saved; new attempts are paused');
       persistenceUnavailable = true;
-      const message = attemptFinished
-        ? 'Request aborted: Account pool state could not be saved after the provider answered; the attempt may have been billed. New attempts are paused; check provider balances before retrying.'
-        : 'Account pool state could not be saved; new attempts are paused until storage recovers';
-      // pi-web-access recognizes "aborted" before HTTP status, stopping sequential fallback after a billed Attempt.
-      throw Object.assign(new Error(message), { statusCode: attemptFinished ? 409 : 503, persistenceFailure: true });
+      throw new StateNotSaved(ending);
     }
   };
   const byId = (id) => {
@@ -152,6 +164,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
    *  - settlePossiblyBilled(reason): sent, outcome unknown (a POSSIBLY_BILLED reason); charged at the estimate;
    *  - fail({status, effect, tag, retryAfterMs, requestId}): the provider refused; credit returns, the effect applies.
    * If `use` returns or throws without ending it, the request was never sent: the credit returns with no penalty.
+   * Throws StateNotSaved when an ending cannot be saved (with that ending), or when Attempts are paused (ending null).
    */
   async function attempt(route, estimate, excludedIds, use) {
     if (!isNonNegativeNumber(estimate)) throw new Error('estimate must be a nonnegative number');
@@ -165,14 +178,14 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     reserved.add(credit);
     const started = now();
     let open = true;
-    const end = (status, extra, apply) => {
+    const end = (ending, status, extra, apply) => {
       if (!open) throw new Error('Reservation already ended');
       open = false;
       reserved.delete(credit);
       refresh();
       apply();
       recordAttempt({ provider: route.provider, path: route.path, account: account.id, status, ms: now() - started, ...extra });
-      save({ attemptFinished: true });
+      save(ending);
     };
     const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null));
 
@@ -180,18 +193,18 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
       account,
       settle({ status = 200, amount, exact, requestId = null }) {
         if (!isNonNegativeNumber(amount)) throw new Error('amount must be a nonnegative number');
-        end(status, defined({ requestId, cost: amount, exact }), () => charge(account, amount, exact, { requestId }));
+        end(ENDING.BILLED, status, defined({ requestId, cost: amount, exact }), () => charge(account, amount, exact, { requestId }));
       },
       settlePossiblyBilled(reason) {
         if (!POSSIBLY_BILLED_REASONS.has(reason)) throw new Error(`Unknown possibly-billed reason: ${reason}`);
-        end(reason, {}, () => {
+        end(ENDING.POSSIBLY_BILLED, reason, {}, () => {
           charge(account, estimate, false, { possiblyBilled: true });
           // A timeout says something about the account's latency; a client leaving or a bad body does not.
           if (reason === POSSIBLY_BILLED.TIMEOUT) applyFailure(state.accounts[account.id], account, { status: reason }, now());
         });
       },
       fail({ status, effect = null, tag = null, retryAfterMs = 0, requestId = null }) {
-        end(status, defined({ tag, requestId }), () => applyFailure(state.accounts[account.id], account, { status, effect, tag, retryAfterMs }, now()));
+        end(ENDING.FAILED, status, defined({ tag, requestId }), () => applyFailure(state.accounts[account.id], account, { status, effect, tag, retryAfterMs }, now()));
       }
     };
     try {

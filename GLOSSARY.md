@@ -64,6 +64,10 @@ _Avoid_: Server, proxy
 The single process on a machine that runs the gateway on the fixed port. Every other pi process is a **client** of it and takes over the port when the owner exits.
 _Avoid_: Host, leader, primary
 
+**Paused**:
+The broker's state after it fails to save account state: no new attempt starts until a save succeeds. An attempt that was billed or possibly billed just before the failed save is reported to the client as aborted, so it is not retried elsewhere.
+_Avoid_: Read-only, storage error (for the state itself)
+
 ### Access
 
 **Gateway token**:

@@ -3,9 +3,10 @@
 // { status, body } to send. Billing-safety rules (docs/research/exa.md, docs/research/tavily.md):
 //  - every reservation ends exactly once (billed, possibly billed, or released);
 //  - an attempt that may have been billed (timeout, client gone, unreadable 2xx, ambiguous network) is never retried;
-//  - a refused request is never retried on another account.
+//  - a refused request is never retried on another account;
+//  - an Attempt whose ending cannot be saved stops the request: aborted if it may have cost money, else paused.
 import { PROVIDERS, ACTION, EFFECT, EXHAUST } from './providers.mjs';
-import { POSSIBLY_BILLED } from './pool.mjs';
+import { POSSIBLY_BILLED, ENDING, StateNotSaved } from './pool.mjs';
 
 /** Status returned when the caller aborted: nobody is listening, so there is nothing to send. */
 export const CLIENT_CLOSED = 499;
@@ -60,7 +61,7 @@ async function readErrorJson(response) {
  * @param secrets   strings to redact from anything returned to the client
  */
 export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, now = () => Date.now(), sleep = defaultSleep }) {
-  /** Run one request. Never throws for upstream behaviour; always returns { status, body }. */
+  /** Run one request. Never throws for upstream behaviour or unsaved account state; always returns { status, body }. */
   async function execute(route, body, { headers = {}, signal } = {}) {
     const policy = PROVIDERS[route.provider];
     // An SSE reply cannot be parsed or metered here, and would be retried (and billed) on every account.
@@ -153,11 +154,30 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
       return { done: { status: 200, body: policy.finalize(data, prepared.clientWantsUsage) } };
     }
 
+    // The Account pool could not save the ending of this request's latest Attempt (or Attempts are paused).
+    function unsaved(ending) {
+      if (clientGone.aborted) return { status: CLIENT_CLOSED, body: null };
+      if (ending === ENDING.BILLED || ending === ENDING.POSSIBLY_BILLED) {
+        // pi-web-access looks for "abort" in the message before it looks at the status, so it neither retries nor falls
+        // back to the other provider after an Attempt that cost, or may have cost, money (docs/research/pi-web-access.md).
+        const billed = ending === ENDING.BILLED ? `${policy.name} billed this Attempt` : 'this Attempt may have been billed';
+        return { status: 409, body: policy.errorBody(`Request aborted: ${billed}, but the local broker could not save its account state. New attempts are paused; check provider balances before retrying.`) };
+      }
+      // Nothing was billed, so this is transient and pi may fall back to the other provider.
+      return { status: 503, body: policy.errorBody(`The local broker could not save its account state; new ${policy.name} attempts are paused until storage recovers`) };
+    }
+
     const maxWaitMs = Math.max(0, deadline - now());
     const deadlineSignal = AbortSignal.timeout(maxWaitMs);
     while (now() < deadline && !clientGone.aborted && !deadlineSignal.aborted) {
-      // The pool gives the credit back if attemptOn throws before the reservation ended (e.g. while preparing).
-      const step = await pool.attempt(route, estimate, attempted, attemptOn);
+      let step;
+      try {
+        // The pool gives the credit back if attemptOn throws before the reservation ended (e.g. while preparing).
+        step = await pool.attempt(route, estimate, attempted, attemptOn);
+      } catch (err) {
+        if (err instanceof StateNotSaved) return unsaved(err.ending);
+        throw err;
+      }
       if (!step) break;
       if (step.done) return step.done;
       if (step.rotate) { attempted.add(step.rotate); continue; }

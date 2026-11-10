@@ -1,11 +1,10 @@
-// Gateway: the HTTP adapter only (auth, routing, admin routes, persistence, client disconnects).
-// Rotation and billing rules are tested through execute() in broker.test.mjs.
+// Gateway: the HTTP adapter only (auth, routing, admin routes, client disconnects).
+// Rotation, billing and unsaved-state replies are tested through execute() in broker.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { serve, config, exa, tavily, json, secret } from './helpers.mjs';
+import { serve, config, exa, tavily, json, secret, flakyStore } from './helpers.mjs';
 import { probeHealth } from '../src/control.mjs';
-import { memoryStore } from '../src/pool/store.mjs';
 
 test('Searches are proxied on the provider-compatible routes and persisted state never contains keys', async () => {
   await serve(config(exa('a', 'exa-real-aaa')), async (url) => json({ results: [{ url }], costDollars: { total: 0.007 } }),
@@ -53,57 +52,18 @@ test('Unknown routes, query strings and non-JSON bodies are rejected before any 
   });
 });
 
-test('A failed state save prevents further upstream Attempts until storage recovers', async () => {
-  const backing = memoryStore();
-  let writable = true;
-  let calls = 0;
-  const store = {
-    load: () => backing.load(),
-    save: (state) => { if (!writable) throw new Error('disk failure: tvly-secret-key'); backing.save(state); }
-  };
-  await serve(config(tavily('t', 'tvly-secret-key')), async () => { calls++; return json({ results: [] }); }, async ({ post, status }) => {
-    writable = false;
+test('An admin change that cannot be saved is a 503 that never echoes the storage error', async () => {
+  const store = flakyStore();
+  await serve(config(tavily('t', 'tvly-secret-key')), async () => json({ results: [] }), async ({ post, status }) => {
+    store.writable = false;
     const change = await post('/admin/disable', { id: 't' });
     assert.equal(change.status, 503);
-    assert.doesNotMatch(await change.text(), /tvly-secret-key/);
-    assert.equal((await status()).accounts[0].status, 'manual');
-    writable = true;
+    assert.doesNotMatch(await change.text(), /secret-key/);
+    assert.equal((await status()).accounts[0].status, 'manual', 'the live change is kept');
+    assert.equal((await status()).persistence.state, 'unavailable');
+    store.writable = true;
     assert.equal((await post('/admin/enable', { id: 't' })).status, 200);
-    writable = false;
-    const first = await post('/tavily/search', { query: 'q' });
-    assert.equal(first.status, 409, 'a billing-ambiguous storage failure is an aborted request, not a retryable server error');
-    const message = await first.text();
-    assert.match(message, /request aborted/i);
-    assert.match(message, /may have been billed/);
-    assert.doesNotMatch(message, /tvly-secret-key/);
-    assert.equal((await status()).persistence.state, 'unavailable');
-    assert.equal((await status()).recent.at(-1).cost, 1);
-    assert.equal((await post('/tavily/search', { query: 'q' })).status, 503);
-    assert.equal(calls, 1, 'no new Attempt is sent while saving still fails');
-    writable = true;
-    assert.equal((await post('/tavily/search', { query: 'q' })).status, 200);
-    assert.equal(calls, 2);
     assert.equal((await status()).persistence.state, 'ok');
-  }, { store });
-});
-
-test('An Exa Attempt with an unsaved charge returns the pi-web-access abort marker', async () => {
-  const backing = memoryStore();
-  let failNext = false;
-  const store = {
-    load: () => backing.load(),
-    save: (state) => { if (failNext) { failNext = false; throw new Error('disk failure'); } backing.save(state); }
-  };
-  await serve(config(exa('e', 'exa-secret-key')), async () => json({ results: [], costDollars: { total: 0.007 } }), async ({ post, status }) => {
-    failNext = true;
-    const response = await post('/exa/search', { query: 'q' });
-    assert.equal(response.status, 409);
-    const body = await response.text();
-    assert.match(body, /request aborted/i, 'pi-web-access treats this as an abort before classifying the HTTP status');
-    assert.match(body, /may have been billed/);
-    assert.doesNotMatch(body, /exa-secret-key/);
-    assert.equal((await status()).accounts[0].allocations[0].spent, 0.007);
-    assert.equal((await status()).persistence.state, 'unavailable');
   }, { store });
 });
 

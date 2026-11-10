@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
-import { broker, config, exa, tavily, json, keyOf, secret, DATE } from './helpers.mjs';
+import { broker, config, exa, tavily, json, keyOf, secret, flakyStore, DATE } from './helpers.mjs';
 import { EFFECT, ROUTES } from '../src/providers.mjs';
 import { CLIENT_CLOSED, createBroker } from '../src/broker.mjs';
 import { createAccountPool } from '../src/pool.mjs';
@@ -638,6 +638,85 @@ test('Proven pre-delivery connection failures rotate without charging the failed
     assert.equal(b.account(0).allocations[0].spent, 0, code);
     assert.equal(b.account(1).allocations[0].spent, 1, code);
     assert.equal(b.status().recent[0].status, 'network', code);
+  }
+});
+
+// ---------- unsaved Account pool state ----------
+
+test('An Attempt whose charge cannot be saved is aborted, and no new Attempt starts until storage recovers', async () => {
+  let calls = 0;
+  const store = flakyStore();
+  const b = broker(config(tavily('t', 'tvly-secret-key')), async () => { calls++; return json({ results: [] }); }, { store });
+  store.writable = false;
+  const first = await b.call('/tavily/search', { query: 'q' });
+  assert.equal(first.status, 409, 'a billed Attempt must not be retried or fall back');
+  assert.match(first.body.detail.error, /^Request aborted/, 'pi-web-access treats this as an abort before classifying the HTTP status');
+  assert.match(first.body.detail.error, /billed/);
+  assert.doesNotMatch(JSON.stringify(first.body), /secret-key/);
+  assert.equal(b.status().persistence.state, 'unavailable');
+  assert.equal(b.status().recent.at(-1).cost, 1);
+
+  const paused = await b.call('/tavily/search', { query: 'q' });
+  assert.equal(paused.status, 503);
+  assert.match(paused.body.detail.error, /paused/);
+  assert.doesNotMatch(paused.body.detail.error, /abort/i, 'nothing was sent, so pi may fall back');
+  assert.equal(calls, 1, 'no new Attempt is sent while saving still fails');
+
+  store.writable = true;
+  assert.equal((await b.call('/tavily/search', { query: 'q' })).status, 200);
+  assert.equal(calls, 2);
+  assert.equal(b.status().persistence.state, 'ok');
+});
+
+test('An Exa Attempt with an unsaved charge carries the abort marker in the Exa error shape', async () => {
+  const store = flakyStore();
+  const b = broker(config(exa('e', 'exa-secret-key')), async () => ok(0.007), { store });
+  store.writable = false;
+  const res = await b.call('/exa/search', { query: 'q' });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /^Request aborted/);
+  assert.doesNotMatch(JSON.stringify(res.body), /secret-key/);
+  assert.equal(b.account(0).allocations[0].spent, 0.007, 'the live charge is kept');
+  assert.equal(b.status().persistence.state, 'unavailable');
+});
+
+test('A possibly billed Attempt that cannot be saved is aborted; a vanished client still gets nothing', async () => {
+  const store = flakyStore();
+  const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), async () => {
+    throw new DOMException('The operation timed out.', 'TimeoutError');
+  }, { store });
+  store.writable = false;
+  const timedOut = await b.call('/tavily/search', { query: 'q' });
+  assert.equal(timedOut.status, 409);
+  assert.match(timedOut.body.detail.error, /^Request aborted.*may have been billed/);
+  assert.equal(b.account(0).possiblyBilled, 1);
+
+  const client = new AbortController();
+  const goneStore = flakyStore();
+  const gone = broker(config(tavily('t', 'tvly-aaaaaaaa')), (_u, opts) => new Promise((_resolve, reject) => {
+    opts.signal.addEventListener('abort', () => reject(opts.signal.reason));
+    goneStore.writable = false;
+    client.abort();
+  }), { store: goneStore });
+  assert.deepEqual(await gone.call('/tavily/search', { query: 'q' }, { signal: client.signal }), { status: CLIENT_CLOSED, body: null });
+});
+
+test('A failed Attempt that cannot be saved reports paused Attempts, never a possible bill', async () => {
+  const refusedConnection = async () => {
+    throw new TypeError('fetch failed', { cause: Object.assign(new Error('connect failed'), { code: 'ECONNREFUSED' }) });
+  };
+  const refusedRequest = async () => json({ detail: { error: 'Invalid topic' } }, 400);
+  for (const [name, upstream] of [['pre-delivery failure', refusedConnection], ['provider refusal', refusedRequest]]) {
+    const store = flakyStore();
+    const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), upstream, { store });
+    store.writable = false;
+    const res = await b.call('/tavily/search', { query: 'q' });
+    assert.equal(res.status, 503, name);
+    assert.match(res.body.detail.error, /paused/, name);
+    assert.doesNotMatch(res.body.detail.error, /abort|billed/i, `${name}: nothing was billed, so pi may fall back`);
+    assert.equal(b.account(0).possiblyBilled, 0, name);
+    assert.equal(b.account(0).allocations[0].spent, 0, name);
+    assert.equal(b.status().persistence.state, 'unavailable', name);
   }
 });
 

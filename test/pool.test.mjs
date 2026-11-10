@@ -5,11 +5,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createAccountPool, POSSIBLY_BILLED } from '../src/pool.mjs';
+import { createAccountPool, POSSIBLY_BILLED, ENDING, StateNotSaved } from '../src/pool.mjs';
 import { fileStore, memoryStore } from '../src/pool/store.mjs';
 import { nextCreditChange } from '../src/pool/allocation.mjs';
 import { ROUTES, EFFECT } from '../src/providers.mjs';
-import { config, exa, tavily, DATE } from './helpers.mjs';
+import { config, exa, tavily, flakyStore, DATE } from './helpers.mjs';
 
 const TAVILY = ROUTES['/tavily/search'];
 const EXA = ROUTES['/exa/search'];
@@ -323,21 +323,16 @@ test('Balance checks are stored report-only; skips store nothing; unknown ids th
   await assert.rejects(pool.checkBalances('nope', async () => ({ remaining: 1 })), /Unknown account id/);
 });
 
+const unsaved = (ending) => (err) => err instanceof StateNotSaved && err.ending === ending;
+
 test('Failed persistence preserves billed spend and pauses Attempts until the state can be saved', async () => {
-  const backing = memoryStore();
-  let writable = true;
-  const store = {
-    load: () => backing.load(),
-    save: (state) => { if (!writable) throw new Error('disk failure with tvly-secret-key'); backing.save(state); }
-  };
+  const store = flakyStore();
   const cfg = config(tavily('a', 'tvly-secret-key'));
   const pool = poolOf(cfg, { ms: DATE }, store);
-  writable = false;
+  store.writable = false;
   await assert.rejects(pool.attempt(TAVILY, 1, NONE, (r) => r.settle({ amount: 2, exact: true })), (err) => {
-    assert.equal(err.statusCode, 409);
-    assert.match(err.message, /request aborted/i);
-    assert.match(err.message, /may have been billed/);
-    assert.doesNotMatch(err.message, /tvly-secret-key/);
+    assert.ok(unsaved(ENDING.BILLED)(err));
+    assert.doesNotMatch(err.message, /secret-key/, 'the storage error never leaves the pool');
     return true;
   });
   let snapshot = pool.snapshot();
@@ -345,14 +340,23 @@ test('Failed persistence preserves billed spend and pauses Attempts until the st
   assert.equal(snapshot.recent.at(-1).cost, 2);
   assert.equal(snapshot.persistence.state, 'unavailable');
   let started = false;
-  await assert.rejects(pool.attempt(TAVILY, 1, NONE, () => { started = true; }), (err) => err.statusCode === 503);
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, () => { started = true; }), unsaved(null), 'Attempts are paused');
   assert.equal(started, false);
 
-  writable = true;
+  store.writable = true;
   await pool.attempt(TAVILY, 1, NONE, (r) => r.settle({ amount: 1, exact: true }));
   snapshot = pool.snapshot();
   assert.equal(snapshot.persistence.state, 'ok');
-  assert.equal(poolOf(cfg, { ms: DATE }, backing).snapshot().accounts[0].allocations[0].spent, 3);
+  assert.equal(poolOf(cfg, { ms: DATE }, store).snapshot().accounts[0].allocations[0].spent, 3);
+});
+
+test('A failed save after a refused Attempt reports the failed ending, with no charge', async () => {
+  const store = flakyStore();
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store);
+  store.writable = false;
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, (r) => r.fail({ status: 'network', effect: EFFECT.UPSTREAM })), unsaved(ENDING.FAILED));
+  assert.deepEqual([account(pool).allocations[0].spent, account(pool).possiblyBilled, account(pool).failures], [0, 0, 1]);
+  assert.equal(pool.snapshot().persistence.state, 'unavailable');
 });
 
 test('Restart after a failed billed save can only load the last successful state', () => withTempDir(async (dir) => {
@@ -366,7 +370,7 @@ test('Restart after a failed billed save can only load the last successful state
   const cfg = config(tavily('a', 'tvly-aaaaaaaa'));
   const pool = poolOf(cfg, { ms: DATE }, store);
   writable = false;
-  await assert.rejects(pool.attempt(TAVILY, 1, NONE, (reservation) => reservation.settle({ amount: 2, exact: true })));
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, (reservation) => reservation.settle({ amount: 2, exact: true })), StateNotSaved);
   assert.equal(account(pool).allocations[0].spent, 2);
   assert.equal(pool.snapshot().persistence.state, 'unavailable');
 
@@ -378,34 +382,30 @@ test('Restart after a failed billed save can only load the last successful state
 }));
 
 test('A failed save after a possibly billed Attempt keeps its estimate and reason', async () => {
-  const backing = memoryStore();
-  let writable = true;
-  const store = { load: () => backing.load(), save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); } };
+  const store = flakyStore();
   const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store);
-  writable = false;
-  await assert.rejects(pool.attempt(TAVILY, 2, NONE, (r) => r.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT)), (err) => err.statusCode === 409);
+  store.writable = false;
+  await assert.rejects(pool.attempt(TAVILY, 2, NONE, (r) => r.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT)), unsaved(ENDING.POSSIBLY_BILLED));
   assert.equal(account(pool).allocations[0].spent, 2);
   assert.equal(account(pool).possiblyBilled, 1);
   assert.equal(pool.snapshot().recent.at(-1).status, 'timeout');
-  writable = true;
+  store.writable = true;
   await pool.attempt(TAVILY, 1, NONE, (r) => r.fail({ status: 400 }));
-  assert.equal(poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, backing).snapshot().accounts[0].allocations[0].spent, 2);
+  assert.equal(poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store).snapshot().accounts[0].allocations[0].spent, 2);
 });
 
 test('A failed admin save keeps its live change and pauses Attempts until the change is durable', async () => {
-  const backing = memoryStore();
-  let writable = true;
-  const store = { load: () => backing.load(), save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); } };
+  const store = flakyStore();
   const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store);
-  writable = false;
-  assert.throws(() => pool.disable('a'), (err) => err.statusCode === 503);
+  store.writable = false;
+  assert.throws(() => pool.disable('a'), unsaved(null));
   assert.equal(account(pool).status, 'manual');
   assert.equal(pool.snapshot().persistence.state, 'unavailable');
-  await assert.rejects(pool.attempt(TAVILY, 1, NONE, () => assert.fail('paused')), (err) => err.statusCode === 503);
-  writable = true;
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, () => assert.fail('paused')), unsaved(null));
+  store.writable = true;
   assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('disabled')), null);
   assert.equal(pool.snapshot().persistence.state, 'ok');
-  assert.equal(poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, backing).snapshot().accounts[0].status, 'manual');
+  assert.equal(poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store).snapshot().accounts[0].status, 'manual');
 });
 
 test('fileStore persists state without keys; a read-only fileStore never writes', () => withTempDir(async (dir) => {

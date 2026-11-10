@@ -37,7 +37,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
   - A timed-out attempt or an ambiguous connection failure is counted as *possibly billed* and never retried on another account. pi-web-access may still fall back to a different provider on 503/504, which can also bill the search.
   - A 2xx with an unparseable body is never retried on another account.
   - If pi aborts the call, the upstream request is aborted too, including while its reply is being read.
-  - If account state cannot be saved, the broker keeps the live accounting and attempt record, reports the failure, and pauses new attempts until it can save the current state. A save failure after an attempt returns 409 with “Request aborted” so pi-web-access 0.47's sequential search routing does not automatically try another provider; inspect the provider balance before retrying. Exa content extraction may show only “Aborted”; check `/broker status` for the storage warning. This cannot prevent retries by other clients or concurrent multi-provider requests, and should be re-checked after pi-web-access upgrades.
+  - If account state cannot be saved, the broker keeps the live accounting and attempt record, reports the failure, and pauses new attempts until it can save the current state. A save failure after an attempt that was billed or possibly billed returns 409 with “Request aborted” so pi-web-access 0.47's sequential search routing does not automatically try another provider; inspect the provider balance before retrying. After an attempt the provider refused, or one that never reached it, nothing was billed, so the broker returns 503 and pi may fall back. Exa content extraction may show only “Aborted”; check `/broker status` for the storage warning. This cannot prevent retries by other clients or concurrent multi-provider requests, and should be re-checked after pi-web-access upgrades.
 - **Exact accounting where the provider allows it:**
   - Exa uses `costDollars.total`.
   - Tavily uses `usage.credits`; the broker adds `include_usage: true` upstream and removes `usage` from the reply unless you asked for it.
@@ -234,9 +234,9 @@ Layout:
 | Path | Purpose |
 |---|---|
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
-| `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion replies) and returns `{status, body}` |
+| `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion and unsaved-state replies) and returns `{status, body}` |
 | `src/gateway.mjs` | HTTP server: auth, routing, body parsing and replies around the broker; drains in-flight work before releasing the port |
-| `src/pool.mjs` | Account pool: accounts, allocations, health and spend. `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends); `checkBalances()` stores provider balances; keeps the attempt log |
+| `src/pool.mjs` | Account pool: accounts, allocations, health and spend. `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends; a save that fails throws `StateNotSaved` with that ending); `checkBalances()` stores provider balances; keeps the attempt log |
 | `src/pool/health.mjs` | Account health: what each failure effect does to an account (disable, quota, cooldowns) and how it recovers |
 | `src/pool/allocation.mjs` | Allocation calendar: windows, reset days, spending order, and when an out-of-credit account is worth retrying |
 | `src/pool/store.mjs` | Where pool state lives: `fileStore` (`pool-state.json`, optionally read-only; started once from a 0.2.x `state.json`, which is never written) or `memoryStore` |
