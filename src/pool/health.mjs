@@ -13,6 +13,14 @@ import { nextCreditChange } from './allocation.mjs';
 export const COOLDOWN_MS = Object.freeze({ [EFFECT.FORBIDDEN]: 10 * 60 * 1000, [EFFECT.UPSTREAM]: 10 * 1000 });
 export const RATE_LIMIT_MS = Object.freeze({ min: 1000, max: 120000, fallback: 30000 });
 
+/** An overlapping failure can extend a cooldown, but cannot shorten an existing one. */
+function coolDown(entry, reason, until) {
+  if (until > (entry.cooldownUntil || 0)) {
+    entry.cooldownUntil = until;
+    entry.cooldownReason = reason;
+  }
+}
+
 /** Apply one failed attempt to the account's state entry. */
 export function applyFailure(entry, account, { status, effect = null, tag = null, retryAfterMs = 0 }, now) {
   entry.failures++;
@@ -27,13 +35,20 @@ export function applyFailure(entry, account, { status, effect = null, tag = null
     entry.disabled = effect;
     entry.quotaRetryAt = nextCreditChange(account.allocations, now);
   } else if (effect === EFFECT.RATE_LIMIT) {
-    entry.cooldownUntil = now + Math.max(RATE_LIMIT_MS.min, Math.min(RATE_LIMIT_MS.max, retryAfterMs || RATE_LIMIT_MS.fallback));
-    entry.cooldownReason = effect;
+    coolDown(entry, effect, now + Math.max(RATE_LIMIT_MS.min, Math.min(RATE_LIMIT_MS.max, retryAfterMs || RATE_LIMIT_MS.fallback)));
   } else if (effect in COOLDOWN_MS) {
-    entry.cooldownUntil = now + COOLDOWN_MS[effect];
-    entry.cooldownReason = effect;
+    coolDown(entry, effect, now + COOLDOWN_MS[effect]);
   }
 }
+
+/** Administrative changes share the same health rules as failure and recovery transitions. */
+export function enable(entry, { clearCooldown = true } = {}) {
+  entry.disabled = null;
+  entry.quotaRetryAt = 0;
+  if (clearCooldown) { entry.cooldownUntil = 0; entry.cooldownReason = null; }
+}
+
+export function disable(entry) { entry.disabled = 'manual'; }
 
 /** Time-based recovery. `newWindow`: an allocation just started a new window, so an out-of-credit account has credit again. */
 export function recover(entry, now, { newWindow = false } = {}) {

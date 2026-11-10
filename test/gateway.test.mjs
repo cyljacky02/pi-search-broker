@@ -71,8 +71,9 @@ test('A failed state save prevents further upstream Attempts until storage recov
     assert.equal((await post('/admin/enable', { id: 't' })).status, 200);
     writable = false;
     const first = await post('/tavily/search', { query: 'q' });
-    assert.equal(first.status, 500, 'avoid cross-provider fallback after an Attempt that may have been billed');
+    assert.equal(first.status, 409, 'a billing-ambiguous storage failure is an aborted request, not a retryable server error');
     const message = await first.text();
+    assert.match(message, /request aborted/i);
     assert.match(message, /may have been billed/);
     assert.doesNotMatch(message, /tvly-secret-key/);
     assert.equal((await status()).persistence.state, 'unavailable');
@@ -83,6 +84,26 @@ test('A failed state save prevents further upstream Attempts until storage recov
     assert.equal((await post('/tavily/search', { query: 'q' })).status, 200);
     assert.equal(calls, 2);
     assert.equal((await status()).persistence.state, 'ok');
+  }, { store });
+});
+
+test('An Exa Attempt with an unsaved charge returns the pi-web-access abort marker', async () => {
+  const backing = memoryStore();
+  let failNext = false;
+  const store = {
+    load: () => backing.load(),
+    save: (state) => { if (failNext) { failNext = false; throw new Error('disk failure'); } backing.save(state); }
+  };
+  await serve(config(exa('e', 'exa-secret-key')), async () => json({ results: [], costDollars: { total: 0.007 } }), async ({ post, status }) => {
+    failNext = true;
+    const response = await post('/exa/search', { query: 'q' });
+    assert.equal(response.status, 409);
+    const body = await response.text();
+    assert.match(body, /request aborted/i, 'pi-web-access treats this as an abort before classifying the HTTP status');
+    assert.match(body, /may have been billed/);
+    assert.doesNotMatch(body, /exa-secret-key/);
+    assert.equal((await status()).accounts[0].allocations[0].spent, 0.007);
+    assert.equal((await status()).persistence.state, 'unavailable');
   }, { store });
 });
 

@@ -7,9 +7,9 @@ import { round6, isNonNegativeNumber } from './numbers.mjs';
 import { quietLogger } from './log.mjs';
 import { STATE_VERSION } from './pool/store.mjs';
 import { windowOf, isActive, remainingOf, spendingOrder } from './pool/allocation.mjs';
-import { applyFailure, recover, isUsable, healthStatus } from './pool/health.mjs';
+import { applyFailure, recover, isUsable, healthStatus, enable as enableHealth, disable as disableHealth } from './pool/health.mjs';
 
-/** Why an attempt is possibly billed: it reached the provider, but whether it was billed is unknown. */
+/** Why an attempt is possibly billed: it may have reached the provider, but whether it was billed is unknown. */
 export const POSSIBLY_BILLED = Object.freeze({
   TIMEOUT: 'timeout',                  // the provider did not answer in time
   CLIENT_CLOSED: 'client-closed',      // the client went away mid-attempt
@@ -53,10 +53,10 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
       if (!persistenceUnavailable) log('Account pool state could not be saved; new attempts are paused');
       persistenceUnavailable = true;
       const message = attemptFinished
-        ? 'Account pool state could not be saved after the provider answered; the attempt may have been billed. New attempts are paused; check provider balances before retrying.'
+        ? 'Request aborted: Account pool state could not be saved after the provider answered; the attempt may have been billed. New attempts are paused; check provider balances before retrying.'
         : 'Account pool state could not be saved; new attempts are paused until storage recovers';
-      // 500 avoids automatic cross-provider fallback after a possibly billed Attempt. Before dispatch, 503 is safe.
-      throw Object.assign(new Error(message), { statusCode: attemptFinished ? 500 : 503, persistenceFailure: true });
+      // pi-web-access recognizes "aborted" before HTTP status, stopping sequential fallback after a billed Attempt.
+      throw Object.assign(new Error(message), { statusCode: attemptFinished ? 409 : 503, persistenceFailure: true });
     }
   };
   const byId = (id) => {
@@ -114,7 +114,10 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   function charge(account, amount, exact, { possiblyBilled = false, requestId = null } = {}) {
     const entry = state.accounts[account.id];
     const tallies = entry.allocations;
-    const { parts, left } = spread(amount, activeAllocations(account), (a) => a.remaining);
+    // A completed charge follows the provider's spending order. Other Reservations are re-placed on the
+    // credit left afterwards by activeAllocations(), so their holds still block later Attempts.
+    const spendable = spendingOrder(account.allocations, now(), { spentOf: (id) => tallies[id]?.spent || 0, reservedOf: () => 0 });
+    const { parts, left } = spread(amount, spendable, (a) => a.remaining);
     for (const [allocation, used] of parts) tallies[allocation.id].spent = round6(tallies[allocation.id].spent + used);
     const first = account.allocations.find((a) => a.id in tallies);
     // A provider can bill more than our estimate. Attribute the overage to current credit, even when held or spent.
@@ -264,15 +267,14 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   return {
     attempt,
     snapshot,
-    enable: (id) => change(id, (_a, entry) => { entry.disabled = null; entry.quotaRetryAt = 0; entry.cooldownUntil = 0; entry.cooldownReason = null; }),
-    disable: (id) => change(id, (_a, entry) => { entry.disabled = 'manual'; }),
+    enable: (id) => change(id, (_a, entry) => enableHealth(entry)),
+    disable: (id) => change(id, (_a, entry) => disableHealth(entry)),
     /** Correct local spend for one allocation to match the provider dashboard. Also re-enables the account. */
     setSpent: (id, allocationId, amount) => change(id, (account, entry) => {
       if (!account.allocations.some((a) => a.id === allocationId)) throw new Error('Unknown allocation');
       if (!isNonNegativeNumber(amount)) throw new Error('spent must be nonnegative number');
       entry.allocations[allocationId].spent = round6(amount);
-      entry.disabled = null;
-      entry.quotaRetryAt = 0;
+      enableHealth(entry, { clearCooldown: false });
     }),
     checkBalances
   };

@@ -37,7 +37,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
   - A timed-out attempt or an ambiguous connection failure is counted as *possibly billed* and never retried on another account. pi-web-access may still fall back to a different provider on 503/504, which can also bill the search.
   - A 2xx with an unparseable body is never retried on another account.
   - If pi aborts the call, the upstream request is aborted too, including while its reply is being read.
-  - If account state cannot be saved, the broker keeps the live accounting and attempt record, reports the failure, and pauses new attempts until it can save the current state. A save failure after an attempt returns 500 rather than triggering automatic cross-provider fallback; inspect the provider balance before retrying.
+  - If account state cannot be saved, the broker keeps the live accounting and attempt record, reports the failure, and pauses new attempts until it can save the current state. A save failure after an attempt returns 409 with “Request aborted” so pi-web-access 0.47's sequential search routing does not automatically try another provider; inspect the provider balance before retrying. Exa content extraction may show only “Aborted”; check `/broker status` for the storage warning. This cannot prevent retries by other clients or concurrent multi-provider requests, and should be re-checked after pi-web-access upgrades.
 - **Exact accounting where the provider allows it:**
   - Exa uses `costDollars.total`.
   - Tavily uses `usage.credits`; the broker adds `include_usage: true` upstream and removes `usage` from the reply unless you asked for it.
@@ -204,6 +204,7 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
 
 - Real keys never go into `pool-state.json`, `/status`, logs, error bodies or pi session data. **`config.json` itself may contain literal keys**, so keep it out of cloud sync and Git, or use `$ENV` / `!command` sources.
 - `gateway.token` is a secret, too. With the extension it lives only in pi's process environment (`PI_SEARCH_BROKER_TOKEN`); in standalone mode protect the shell profile that exports it.
+- Gateway discovery does not authenticate the Port owner: another local process that impersonates the broker's `/health` response can receive the gateway token when a client connects. Health checks and authenticated requests do not follow redirects, but that does not prevent direct local impersonation.
 - Local numbers are estimates unless the provider reported the cost (`costDollars.total`, `usage.credits`). Balance checks are shown alongside them, never applied automatically.
   - If saving state fails, a running broker pauses new attempts and retries the save before accepting another one. A restart or Port owner takeover can only load the last successful save and cannot reliably detect missing spend. After a storage failure or crash, check the provider dashboards or `/broker reconcile`, then use `set-spent` to correct local figures.
   - Exa's `/credits` can lag by up to 5 minutes.
@@ -215,7 +216,7 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
   - Rate limits are per team (Exa) or per key (Tavily, likely).
   - Do not use rotation to evade either provider's terms of service.
 - Months and `resetDay` are UTC.
-- One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config.
+- One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config. On graceful shutdown the owner cancels balance checks and waits for in-flight searches to settle before releasing the port; an injected fetch that ignores cancellation and timeouts can delay shutdown indefinitely.
 - Upgrading from 0.2.x: the first 0.3 gateway starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
 
@@ -234,12 +235,12 @@ Layout:
 |---|---|
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
 | `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion replies) and returns `{status, body}` |
-| `src/gateway.mjs` | HTTP server: auth, routing, body parsing and replies around the broker |
+| `src/gateway.mjs` | HTTP server: auth, routing, body parsing and replies around the broker; drains in-flight work before releasing the port |
 | `src/pool.mjs` | Account pool: accounts, allocations, health and spend. `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends); `checkBalances()` stores provider balances; keeps the attempt log |
 | `src/pool/health.mjs` | Account health: what each failure effect does to an account (disable, quota, cooldowns) and how it recovers |
 | `src/pool/allocation.mjs` | Allocation calendar: windows, reset days, spending order, and when an out-of-credit account is worth retrying |
 | `src/pool/store.mjs` | Where pool state lives: `fileStore` (`pool-state.json`, optionally read-only; started once from a 0.2.x `state.json`, which is never written) or `memoryStore` |
-| `src/reconcile.mjs` | Optional, report-only provider balance checks (rate gap per account, run through `pool.checkBalances`) |
+| `src/reconcile.mjs` | Optional, report-only provider balance checks (rate gap per account, run through `pool.checkBalances`); cancels safely on shutdown |
 | `src/format.mjs` | Human-readable status: the footer line and the status report |
 | `src/log.mjs` | `quietLogger`: an optional logger that never throws |
 | `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |

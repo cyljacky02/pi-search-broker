@@ -79,13 +79,8 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
       const attemptMs = Math.max(1, Math.min(limits.attemptTimeoutMs ?? route.timeoutMs, deadline - now()));
       const timeoutSignal = AbortSignal.timeout(attemptMs);
 
-      let upstream;
-      try {
-        upstream = await fetchImpl(`${policy.origin}${route.path}`, {
-          method: 'POST', headers: prepared.headers, body: prepared.body, redirect: 'error',
-          signal: AbortSignal.any([timeoutSignal, clientGone])
-        });
-      } catch (err) {
+      // Fetch and successful-body reads share this settlement; client closure takes precedence over timeout.
+      function settleInterruption(err) {
         if (clientGone.aborted) {
           reservation.settlePossiblyBilled(POSSIBLY_BILLED.CLIENT_CLOSED);
           return { done: { status: CLIENT_CLOSED, body: null } };
@@ -96,6 +91,18 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
           reservation.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT);
           return { done: { status: 504, body: policy.errorBody(`${policy.name} did not answer within ${attemptMs} ms via the local broker; not retried to avoid double billing`) } };
         }
+        return null;
+      }
+
+      let upstream;
+      try {
+        upstream = await fetchImpl(`${policy.origin}${route.path}`, {
+          method: 'POST', headers: prepared.headers, body: prepared.body, redirect: 'error',
+          signal: AbortSignal.any([timeoutSignal, clientGone])
+        });
+      } catch (err) {
+        const interruption = settleInterruption(err);
+        if (interruption) return interruption;
         if (isPreDeliveryConnectionError(err)) {
           reservation.fail({ status: 'network', effect: EFFECT.UPSTREAM });
           outcome[EXHAUST.TRANSIENT] = true;
@@ -132,14 +139,8 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
         data = await upstream.json();
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid JSON');
       } catch (err) {
-        if (clientGone.aborted) {
-          reservation.settlePossiblyBilled(POSSIBLY_BILLED.CLIENT_CLOSED);
-          return { done: { status: CLIENT_CLOSED, body: null } };
-        }
-        if (timeoutSignal.aborted || err?.name === 'TimeoutError') {
-          reservation.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT);
-          return { done: { status: 504, body: policy.errorBody(`${policy.name} did not answer within ${attemptMs} ms via the local broker; not retried to avoid double billing`) } };
-        }
+        const interruption = settleInterruption(err);
+        if (interruption) return interruption;
         // A 2xx was probably billed. Do not retry on another account (it would bill again); let pi fall back.
         reservation.settlePossiblyBilled(POSSIBLY_BILLED.INVALID_RESPONSE);
         return { done: { status: 502, body: policy.errorBody(`${policy.name} returned an invalid response body via the local broker`) } };

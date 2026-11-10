@@ -16,7 +16,7 @@ Pi actually loads the bundled `./dist` build (`PWA/package.json` `"pi": { "exten
 
 - **pi-web-access 0.47.0 makes exactly three keyed HTTP calls that a gateway can intercept:** Exa `POST {exaBaseUrl}/search`, Exa `POST {exaBaseUrl}/contents`, and Tavily `POST {tavilyBaseUrl}/search`. **The broker already serves all three.** No keyed code path calls Exa `/answer`, `/research`, `/context`, or `/findSimilar`, or Tavily `/extract`, `/crawl`, `/map`, or `/research`. Exa `/answer` was removed (`PWA/CHANGELOG.md:336`) and `code_search` was removed (`PWA/CHANGELOG.md:812`). **No routes are missing today.**
 - The only other Exa call goes to the keyless MCP endpoint `https://mcp.exa.ai/mcp`. That URL is hardcoded and ignores `exaBaseUrl` (`PWA/exa.ts:10`, `PWA/exa.ts:246`, `PWA/README.md:767`). It runs only when no Exa key resolves. If the broker token is missing from pi's config, Exa searches silently go to the free MCP endpoint and skip the broker.
-- **Exhaustion contract:** pi turns a non-2xx reply into `"Exa API error <status>: <body[:300]>"` or `"Tavily API error <status>: ..."`. `searchRouting` classifies that text by status first: **402/429 (and 432 for Tavily) → `quota`; 408/425/≥500 → `transient`; 401/403 → `auth`; 400/422 → `invalid-request`** (`PWA/gemini-search.ts:415-474`). `auth` and `invalid-request` can never be listed in `fallbackOn`. The broker's current exhaustion reply (HTTP 429, or 503 after transient failures, with a JSON body) is correct.
+- **Exhaustion contract:** pi turns a non-2xx reply into `"Exa API error <status>: <body[:300]>"` or `"Tavily API error <status>: ..."`. `searchRouting` checks credential and abort errors before status; otherwise **402/429 (and 432 for Tavily) → `quota`; 408/425/≥500 → `transient`; 401/403 → `auth`; 400/422 → `invalid-request`** (`PWA/gemini-search.ts:415-474`). `aborted`, `auth` and `invalid-request` can never be listed in `fallbackOn`. The broker's normal exhaustion reply (HTTP 429, or 503 after transient failures, with a JSON body) is correct.
 - **pi-web-access ignores `Retry-After` for Exa and Tavily.** Only Brave reads it (`PWA/brave-rate-limit.ts:58`).
 - **pi-web-access rotates keys itself, for Tavily only:** `TAVILY_API_KEY_1..20`, retried on 401/402/403/429/432 (`PWA/tavily.ts:63-74`, `PWA/tavily.ts:204-222`). When those variables are set, pi sends the real pool keys **to the broker**, because the base URL still applies. The broker rejects them with 401 and pi falls through to the broker token last. This works, but it wastes round trips and hands real keys to the local process. The broker README says the pool "may bypass this gateway"; that is inaccurate.
 - **Credential precedence trap:** a plain `exaApiKey`/`tavilyApiKey` in `web-search.json` is **overridden by the `EXA_API_KEY`/`TAVILY_API_KEY` environment variables** (`PWA/credential-source.ts:241`). A shell that still exports a real provider key will send that key to the broker. The broker answers 401, pi classifies it as `auth`, and the search does not fall back.
@@ -126,7 +126,7 @@ pi is therefore on defaults: `searchProvider: "auto"`, no `searchRouting`, and k
 | Call | Thrown message on non-2xx |
 |---|---|
 | Exa search | `Exa API error <status>: <body, key-redacted, first 300 chars>` (`PWA/exa.ts:523-526`) |
-| Exa contents | `Exa contents error <status>: ...` (`PWA/exa.ts:577-579`). The fetch path records the error and moves on to the next fetch provider; `searchRouting` is not involved (`PWA/extract.ts:1119-1124`). |
+| Exa contents | `Exa contents error <status>: ...` (`PWA/exa.ts:577-579`). The fetch path stops on an abort message; otherwise it records the error and moves on to the next fetch provider (`PWA/extract.ts:1119-1124`). |
 | Tavily search | `Tavily API error <status>: ...` (`PWA/tavily.ts:245-248`) |
 
 ### 4.2 Classifier (`classifyProviderError`, `PWA/gemini-search.ts:421-474`)
@@ -151,6 +151,8 @@ The status is the first `\b(error|status|http)\s+(\d{3})\b` match in the message
 | — | Anything else, e.g. **404, 409, 433, 434** with no keyword match | `unknown` | no |
 
 Valid `fallbackOn` values: `transient`, `quota`, `network`, `invalid-response`, `unsupported`, `empty`, `domain-miss`, `off-topic` (`PWA/gemini-search.ts:136`, `PWA/gemini-search.ts:209-219`).
+
+**A failed state save after a possibly billed Attempt:** The broker returns HTTP 409 with a body beginning `Request aborted`. In v0.47.0, both configured sequential routing and default `auto` treat the resulting Provider error as aborted before considering the status, and Exa content extraction also stops on an abort message (`PWA/gemini-search.ts:358-360, 440-441, 813-818, 875-881`; `PWA/extract.ts:1118-1121`). HTTP 500 alone does not stop fallback: it is transient. This is a version-specific text contract, not a guarantee for arbitrary clients or concurrent multi-provider requests; re-check it on upgrades.
 
 - **`empty`:** a 200 response with no results **and** a blank answer (`PWA/gemini-search.ts:746-756`). For Exa, results without a `url` are dropped (`PWA/exa.ts:210-223`).
 - **`domain-miss`:** an include-domain filter matched no result.

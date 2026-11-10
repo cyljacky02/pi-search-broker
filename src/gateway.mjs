@@ -60,14 +60,42 @@ export function createGateway(config, {
   store = memoryStore(), fetchImpl = fetch, now = () => Date.now(), sleep, logger = null, reconcileFetch = fetch
 } = {}) {
   const log = quietLogger(logger);
-  const pool = createAccountPool(config.accounts, { store, now, logger });
-  const reconciler = createReconciler(pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
-  const broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, now, sleep });
+  let pool;
+  let reconciler;
+  let broker;
+  let internalControl;
+  let draining = false;
+  let shutdownPromise = null;
+  const active = new Set();
+  function track(work) {
+    active.add(work);
+    work.then(() => active.delete(work), () => active.delete(work));
+    return work;
+  }
 
-  const control = inProcessControl({ pool, reconciler });
+  // Pool construction writes state, so initialize only after binding the Port.
+  function initialize() {
+    if (pool) return;
+    pool = createAccountPool(config.accounts, { store, now, logger });
+    reconciler = createReconciler(pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
+    broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, now, sleep });
+    internalControl = inProcessControl({ pool, reconciler });
+  }
+
+  const control = {
+    mode: 'in-process',
+    ...Object.fromEntries(['health', 'status', 'enable', 'disable', 'setSpent', 'reconcile'].map((name) => [
+      name, (...args) => {
+        if (draining) return Promise.reject(Object.assign(new Error('Gateway is shutting down'), { statusCode: 503 }));
+        if (!pool) return Promise.reject(new Error('Gateway has not acquired the Port'));
+        return track(internalControl[name](...args));
+      }
+    ]))
+  };
 
   async function proxy(req, res, route) {
     const body = await readBody(req);
+    if (draining) return reply(res, 503, { error: 'Gateway is shutting down' });
     // Stop spending upstream credits once the client has gone away.
     const clientGone = new AbortController();
     res.on('close', () => { if (!res.writableFinished) clientGone.abort(); });
@@ -75,7 +103,7 @@ export function createGateway(config, {
     if (result.status !== CLIENT_CLOSED) reply(res, result.status, result.body);
   }
 
-  const server = createServer(async (req, res) => {
+  async function handle(req, res) {
     try {
       const url = new URL(req.url || '/', 'http://localhost');
       // Disallow query strings: no need to forward any untrusted host / URL fields.
@@ -83,6 +111,7 @@ export function createGateway(config, {
       if (url.pathname === '/health' && req.method === 'GET') {
         return reply(res, 200, { ok: true, service: SERVICE_NAME, version: VERSION, pid: process.pid });
       }
+      if (draining) return reply(res, 503, { error: 'Gateway is shutting down' });
       if (!isAuthorized(req, config.gateway.token)) return reply(res, 401, { error: unauthorizedHint(req) });
       if (url.pathname === '/status' && req.method === 'GET') return reply(res, 200, await control.status());
       if (url.pathname.startsWith('/admin/') && req.method === 'POST') {
@@ -95,17 +124,74 @@ export function createGateway(config, {
       await proxy(req, res, route);
     } catch (err) {
       const code = err.statusCode || 500;
-      // Never include upstream response bodies, key strings or raw exception traces. A storage failure can follow
-      // a billed provider response; returning 503 could cause pi to retry the request against another provider.
+      // Never include upstream response bodies, key strings or raw exception traces. Preserve the pool's
+      // sanitized persistence message and status, including its post-Attempt "Request aborted" diagnostic
+      // so pi-web-access does not fall back after a possibly billed Attempt.
       const message = err.persistenceFailure ? err.message : code === 500 ? 'Gateway internal error; inspect local logs' : err.message;
       reply(res, code, { error: message });
       if (code === 500) log(`internal error: ${err?.name ?? 'Error'}`);
     }
+  }
+  const server = createServer((req, res) => {
+    // The draining Gateway still identifies the Port owner, but never accepts more mutating work.
+    if (draining) {
+      if (req.method === 'GET' && req.url === '/health') return reply(res, 200, { ok: true, service: SERVICE_NAME, version: VERSION, pid: process.pid });
+      return reply(res, 503, { error: 'Gateway is shutting down' });
+    }
+    // Register before entering any asynchronous handler. Closing a socket alone does not finish its work.
+    track(Promise.resolve().then(() => handle(req, res)));
   });
   // Never keep idle sockets open forever.
   server.requestTimeout = 60000;
   server.headersTimeout = 65000;
-  server.on('listening', () => reconciler.start());
-  server.on('close', () => reconciler.stop());
-  return { server, control };
+  function activate() {
+    if (draining) throw new Error('Gateway is shutting down');
+    if (!server.listening) throw new Error('Gateway has not acquired the Port');
+    initialize();
+    reconciler.start();
+  }
+  let startupError = null;
+  server.on('listening', () => {
+    if (draining) return;
+    try { activate(); }
+    catch (err) {
+      startupError = err;
+      // Report initialization failure as a server error, but do not leave the port bound.
+      shutdown().then(
+        () => process.nextTick(() => server.emit('error', err)),
+        () => { log('Gateway shutdown failed'); process.nextTick(() => server.emit('error', err)); }
+      );
+    }
+  });
+  const listen = server.listen.bind(server);
+  server.listen = (...args) => {
+    if (draining) throw new Error('Gateway is shutting down');
+    const last = args.length - 1;
+    if (typeof args[last] === 'function') {
+      const callback = args[last];
+      args[last] = (...values) => { if (!startupError && !draining) callback.apply(server, values); };
+    }
+    return listen(...args);
+  };
+
+  const close = server.close.bind(server);
+  function shutdown() {
+    if (shutdownPromise) return shutdownPromise;
+    draining = true;
+    shutdownPromise = Promise.resolve().then(async () => {
+      // Reconciliation is report-only and can be cancelled; brokered requests must finish settlement.
+      if (reconciler) await reconciler.stop();
+      await Promise.allSettled([...active]);
+      await new Promise((resolve, reject) => close((err) => err ? reject(err) : resolve()));
+    });
+    return shutdownPromise;
+  }
+  // Preserve server.close(callback) for standalone and existing callers, but drain before unbinding.
+  server.close = (callback) => {
+    const work = shutdown();
+    if (callback) work.then(() => process.nextTick(callback), (err) => process.nextTick(callback, err));
+    else work.catch(() => log('Gateway shutdown failed'));
+    return server;
+  };
+  return { server, control, shutdown };
 }

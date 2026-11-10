@@ -99,6 +99,102 @@ test('an unrelated port owner remains offline and never receives a Gateway token
   }
 });
 
+test('a port redirecting health to a Broker is not trusted with the Gateway token', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-control-'));
+  const ownerConfig = config(tavily('account-1', 'tvly-owner-provider-key'));
+  const gateway = createGateway(ownerConfig);
+  let targetRequests = 0;
+  gateway.server.on('request', () => { targetRequests++; });
+  const received = [];
+  const other = createServer((req, res) => {
+    received.push({ path: req.url, authorization: Boolean(req.headers.authorization), apiKey: Boolean(req.headers['x-api-key']) });
+    if (req.url === '/health') {
+      res.writeHead(302, { location: `http://127.0.0.1:${gateway.server.address().port}/health` });
+      res.end();
+    } else if (req.url === '/status') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ accounts: [] }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  let host;
+  try {
+    await new Promise((resolve) => gateway.server.listen(0, '127.0.0.1', resolve));
+    await new Promise((resolve) => other.listen(0, '127.0.0.1', resolve));
+    ownerConfig.gateway.port = gateway.server.address().port;
+    assert.equal((await probeHealth(ownerConfig)).state, 'running', 'the redirect target is a genuine Broker');
+    targetRequests = 0;
+
+    const clientConfig = { ...ownerConfig, gateway: { ...ownerConfig.gateway, port: other.address().port, token: clientToken } };
+    const identity = await probeHealth(clientConfig);
+    const control = await connectControl({ config: clientConfig, statePath: join(dir, 'client-state.json') });
+    const health = await control.health();
+    const checks = await runDoctor({ config: clientConfig, control, env: { PI_CODING_AGENT_DIR: dir }, home: dir });
+    const output = formatChecks(checks);
+
+    assert.deepEqual({
+      identity: identity.state,
+      selectedControl: control.mode,
+      health: health.state,
+      doctorReportsOther: checks.some(({ level, message }) => level === 'error' && /Something else answers.*change gateway\.port/.test(message)),
+      credentialsDisclosed: received.some(({ authorization, apiKey }) => authorization || apiKey),
+      targetRequests
+    }, {
+      identity: 'other', selectedControl: 'offline', health: 'other', doctorReportsOther: true, credentialsDisclosed: false, targetRequests: 0
+    });
+    assert.equal((await control.status()).accounts[0].status, 'active');
+    await assert.rejects(control.disable('account-1'), /not running/);
+    assert.equal((await gateway.control.status()).accounts[0].status, 'active');
+    assert.ok(received.length > 0 && received.every(({ path, authorization, apiKey }) => path === '/health' && !authorization && !apiKey));
+    assert.equal(targetRequests, 0, 'control and doctor must not follow the redirect');
+    const configPath = join(dir, 'client-config.json');
+    writeFileSync(configPath, JSON.stringify(clientConfig));
+    host = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: dir } });
+    assert.equal(await host.acquire(), 'error');
+    assert.match(host.lastError, /port .*another program/i);
+    assert.equal((await probeHealth(clientConfig)).state, 'other', 'the unrelated port remains occupied');
+    assert.ok(received.every(({ authorization, apiKey }) => !authorization && !apiKey));
+    assert.equal(targetRequests, 0, 'the Port owner must not follow the redirect');
+    assert.ok(!output.includes(ownerToken) && !output.includes(clientToken));
+  } finally {
+    if (host) await host.release();
+    if (other.listening) await new Promise((resolve) => other.close(resolve));
+    if (gateway.server.listening) await new Promise((resolve) => gateway.server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a legacy Broker identity on the configured port still permits HTTP control', async () => {
+  const received = [];
+  const server = createServer((req, res) => {
+    const authorized = req.headers.authorization === `Bearer ${clientToken}`;
+    received.push({ path: req.url, authorized, authorization: Boolean(req.headers.authorization), apiKey: Boolean(req.headers['x-api-key']) });
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/health') res.end(JSON.stringify({ service: 'pi-dual-key-manager', version: '0.2.0' }));
+    else if (req.url === '/status' && authorized) res.end(JSON.stringify({ accounts: [{ id: 'legacy-account' }] }));
+    else { res.writeHead(401); res.end('{}'); }
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-control-'));
+  try {
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const clientConfig = config(tavily('account-1', 'tvly-owner-provider-key'));
+    clientConfig.gateway.port = server.address().port;
+    clientConfig.gateway.token = clientToken;
+    assert.deepEqual(await probeHealth(clientConfig), { state: 'running', version: '0.2.0' });
+    const control = await connectControl({ config: clientConfig, statePath: join(dir, 'state.json') });
+    assert.equal(control.mode, 'http');
+    assert.deepEqual(await control.health(), { state: 'running', version: '0.2.0', control: 'ready' });
+    assert.equal((await control.status()).accounts[0].id, 'legacy-account');
+    assert.ok(received.some(({ path, authorized }) => path === '/status' && authorized));
+    assert.ok(received.filter(({ path }) => path === '/health').every(({ authorization, apiKey }) => !authorization && !apiKey));
+  } finally {
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('an identified port owner with an invalid status response is not treated as usable control', async () => {
   const server = createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });

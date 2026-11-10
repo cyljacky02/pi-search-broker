@@ -129,10 +129,11 @@ export class BrokerHost {
 
   listen(config) {
     const gateway = createGateway(config, {
-      store: this.store ?? fileStore(this.statePath), fetchImpl: this.fetchImpl, reconcileFetch: this.fetchImpl, now: this.now, logger: this.logger
+      store: this.store ?? fileStore(this.statePath), fetchImpl: this.fetchImpl, reconcileFetch: this.fetchImpl,
+      now: this.now, logger: this.logger
     });
     return new Promise((resolve, reject) => {
-      const onError = (err) => { gateway.server.close(); reject(err); };
+      const onError = (err) => { gateway.shutdown().catch(() => {}); reject(err); };
       gateway.server.once('error', onError);
       gateway.server.listen(config.gateway.port, config.gateway.host, () => {
         gateway.server.off('error', onError);
@@ -145,12 +146,9 @@ export class BrokerHost {
 
   async stopServer() {
     const gateway = this.gateway;
-    this.gateway = null;
     if (!gateway) return;
-    await new Promise((resolve) => {
-      gateway.server.close(() => resolve());
-      gateway.server.closeAllConnections?.();
-    });
+    await gateway.shutdown();
+    if (this.gateway === gateway) this.gateway = null;
   }
 
   /**

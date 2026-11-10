@@ -22,7 +22,8 @@ export function baseUrl(config) {
 /** Ask whatever listens on the gateway port who it is. Never throws. */
 export async function probeHealth(config, { fetchImpl = fetch } = {}) {
   try {
-    const res = await fetchImpl(`${baseUrl(config)}/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
+    // A redirect belongs to this port's occupant; do not identify or authenticate to its target.
+    const res = await fetchImpl(`${baseUrl(config)}/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS), redirect: 'manual' });
     const data = res.ok ? await res.json() : null;
     const ours = data?.service === SERVICE_NAME || LEGACY_SERVICE_NAMES.includes(data?.service);
     return ours ? { state: 'running', version: data.version ?? null } : { state: 'other' };

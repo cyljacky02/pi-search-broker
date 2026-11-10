@@ -64,6 +64,25 @@ test('A higher actual cost preserves credit held by overlapping Reservations', a
   assert.deepEqual(account(pool).allocations.map((a) => a.spent), [2, 1]);
 });
 
+test('A settled Attempt spends promo credit first even if another Reservation later fails', async () => {
+  const time = { ms: Date.parse('2026-11-09T23:59:59Z') };
+  const a = { ...tavily('a', 'tvly-aaaaaaaa'), allocations: [
+    { id: 'promo', period: 'once', limit: 1, expiresAt: '2026-11-10T00:00:00Z' },
+    { id: 'monthly', period: 'monthly', limit: 1 }
+  ] };
+  const pool = poolOf(config(a), time);
+  await pool.attempt(TAVILY, 1, NONE, async (settled) => {
+    await pool.attempt(TAVILY, 1, NONE, (failed) => {
+      settled.settle({ amount: 1, exact: true });
+      assert.equal(account(pool).available, 0, 'the other Reservation still holds all unspent credit');
+      failed.fail({ status: 400 });
+    });
+  });
+  assert.deepEqual(account(pool).allocations.map((allocation) => allocation.spent), [1, 0]);
+  time.ms = Date.parse('2026-11-10T00:00:01Z');
+  assert.equal(account(pool).available, 1, 'the unspent monthly credit remains after the promo expires');
+});
+
 test('An open Reservation continues to hold credit when its promo Allocation expires', async () => {
   const time = { ms: Date.parse('2026-11-09T23:59:59Z') };
   const a = { ...tavily('a', 'tvly-aaaaaaaa'), allocations: [
@@ -157,6 +176,23 @@ test('Failure effects: rate limit honours Retry-After within 1-120 s; auth disab
   assert.equal(account(pool, 1).status, 'active');
 });
 
+test('A later upstream failure cannot shorten an overlapping Retry-After cooldown', async () => {
+  const time = { ms: DATE };
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), time);
+  await pool.attempt(TAVILY, 1, NONE, async (limited) => {
+    await pool.attempt(TAVILY, 1, NONE, (upstream) => {
+      limited.fail({ status: 429, effect: EFFECT.RATE_LIMIT, retryAfterMs: 120000 });
+      upstream.fail({ status: 500, effect: EFFECT.UPSTREAM });
+    });
+  });
+  assert.equal(account(pool).retryAt, new Date(DATE + 120000).toISOString());
+  assert.equal(account(pool).cooldownReason, EFFECT.RATE_LIMIT);
+  time.ms += 11000;
+  assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('Retry-After has not elapsed')), null);
+  time.ms = DATE + 120001;
+  assert.equal(account(pool).status, 'active');
+});
+
 test('An auth-disabled Account reports no automatic retry time after an overlapping rate limit', async () => {
   const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')));
   await pool.attempt(TAVILY, 1, NONE, async (auth) => {
@@ -168,6 +204,21 @@ test('An auth-disabled Account reports no automatic retry time after an overlapp
   assert.equal(account(pool).status, 'auth');
   assert.equal(account(pool).cooldownReason, null);
   assert.equal(account(pool).retryAt, null, 'the cooldown expiry does not undo the auth disable');
+});
+
+test('Correcting spend clears a disable without discarding a concurrent cooldown', async () => {
+  const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')));
+  await pool.attempt(TAVILY, 1, NONE, async (auth) => {
+    await pool.attempt(TAVILY, 1, NONE, (limited) => {
+      auth.fail({ status: 401, effect: EFFECT.AUTH });
+      limited.fail({ status: 429, effect: EFFECT.RATE_LIMIT, retryAfterMs: 30000 });
+    });
+  });
+  pool.setSpent('a', 'free', 5);
+  assert.equal(account(pool).status, 'cooldown');
+  assert.equal(account(pool).retryAt, new Date(DATE + 30000).toISOString());
+  pool.enable('a');
+  assert.equal(account(pool).status, 'active');
 });
 
 test('A later quota failure cannot undo an auth disable from an overlapping Attempt', async () => {
@@ -283,7 +334,8 @@ test('Failed persistence preserves billed spend and pauses Attempts until the st
   const pool = poolOf(cfg, { ms: DATE }, store);
   writable = false;
   await assert.rejects(pool.attempt(TAVILY, 1, NONE, (r) => r.settle({ amount: 2, exact: true })), (err) => {
-    assert.equal(err.statusCode, 500);
+    assert.equal(err.statusCode, 409);
+    assert.match(err.message, /request aborted/i);
     assert.match(err.message, /may have been billed/);
     assert.doesNotMatch(err.message, /tvly-secret-key/);
     return true;
@@ -303,13 +355,35 @@ test('Failed persistence preserves billed spend and pauses Attempts until the st
   assert.equal(poolOf(cfg, { ms: DATE }, backing).snapshot().accounts[0].allocations[0].spent, 3);
 });
 
+test('Restart after a failed billed save can only load the last successful state', () => withTempDir(async (dir) => {
+  const path = join(dir, 'pool-state.json');
+  const backing = fileStore(path);
+  let writable = true;
+  const store = {
+    load: () => backing.load(),
+    save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); }
+  };
+  const cfg = config(tavily('a', 'tvly-aaaaaaaa'));
+  const pool = poolOf(cfg, { ms: DATE }, store);
+  writable = false;
+  await assert.rejects(pool.attempt(TAVILY, 1, NONE, (reservation) => reservation.settle({ amount: 2, exact: true })));
+  assert.equal(account(pool).allocations[0].spent, 2);
+  assert.equal(pool.snapshot().persistence.state, 'unavailable');
+
+  // The process dies before its live state is saved. Once storage returns, a new pool only sees the old file.
+  writable = true;
+  const restarted = poolOf(cfg, { ms: DATE }, fileStore(path));
+  assert.equal(account(restarted).allocations[0].spent, 0);
+  assert.equal(restarted.snapshot().recent.length, 0);
+}));
+
 test('A failed save after a possibly billed Attempt keeps its estimate and reason', async () => {
   const backing = memoryStore();
   let writable = true;
   const store = { load: () => backing.load(), save: (state) => { if (!writable) throw new Error('disk failure'); backing.save(state); } };
   const pool = poolOf(config(tavily('a', 'tvly-aaaaaaaa')), { ms: DATE }, store);
   writable = false;
-  await assert.rejects(pool.attempt(TAVILY, 2, NONE, (r) => r.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT)), (err) => err.statusCode === 500);
+  await assert.rejects(pool.attempt(TAVILY, 2, NONE, (r) => r.settlePossiblyBilled(POSSIBLY_BILLED.TIMEOUT)), (err) => err.statusCode === 409);
   assert.equal(account(pool).allocations[0].spent, 2);
   assert.equal(account(pool).possiblyBilled, 1);
   assert.equal(pool.snapshot().recent.at(-1).status, 'timeout');
