@@ -78,7 +78,10 @@ const exaTag = (parsed) => (typeof parsed?.tag === 'string' && /^[A-Z0-9_]{1,64}
 
 const exa = Object.freeze({
   name: 'exa',
+  label: 'Exa',
   unit: 'USD',
+  // The free plan a key file gives each key by default: $10 a month (only for a user's first team).
+  freePlanLimit: 10,
   origin: 'https://api.exa.ai',
 
   prepare(body, account, clientHeaders = {}) {
@@ -169,7 +172,10 @@ const exa = Object.freeze({
 
 const tavily = Object.freeze({
   name: 'tavily',
+  label: 'Tavily',
   unit: 'credits',
+  // The free plan a key file gives each key by default: 1,000 credits a month.
+  freePlanLimit: 1000,
   origin: 'https://api.tavily.com',
 
   prepare(body, account) {

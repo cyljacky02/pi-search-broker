@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createServer } from 'node:http';
-import { BrokerHost } from '../src/host.mjs';
+import { TestHost as BrokerHost } from './helpers.mjs';
 import { createExtension } from '../extension/index.js';
 import { connectControl, probeHealth } from '../src/control.mjs';
 import { SERVICE_NAME } from '../src/config.mjs';
@@ -169,14 +169,14 @@ test('a port redirecting health to a Broker is not trusted with the Gateway toke
   }
 });
 
-test('a legacy Broker identity on the configured port still permits HTTP control', async () => {
+test('a Broker identified on the configured port permits HTTP control, and /health carries no credentials', async () => {
   const received = [];
   const server = createServer((req, res) => {
     const authorized = req.headers.authorization === `Bearer ${clientToken}`;
     received.push({ path: req.url, authorized, authorization: Boolean(req.headers.authorization), apiKey: Boolean(req.headers['x-api-key']) });
     res.setHeader('content-type', 'application/json');
-    if (req.url === '/health') res.end(JSON.stringify({ service: 'pi-dual-key-manager', version: '0.2.0' }));
-    else if (req.url === '/status' && authorized) res.end(JSON.stringify({ accounts: [{ id: 'legacy-account' }] }));
+    if (req.url === '/health') res.end(JSON.stringify({ service: 'pi-search-broker', version: '0.5.0' }));
+    else if (req.url === '/status' && authorized) res.end(JSON.stringify({ accounts: [{ id: 'remote-account' }] }));
     else { res.writeHead(401); res.end('{}'); }
   });
   const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-control-'));
@@ -185,11 +185,11 @@ test('a legacy Broker identity on the configured port still permits HTTP control
     const clientConfig = config(tavily('account-1', 'tvly-owner-provider-key'));
     clientConfig.gateway.port = server.address().port;
     clientConfig.gateway.token = clientToken;
-    assert.deepEqual(await probeHealth(clientConfig), { state: 'running', version: '0.2.0' });
+    assert.deepEqual(await probeHealth(clientConfig), { state: 'running', version: '0.5.0' });
     const control = await connectControl({ config: clientConfig, statePath: join(dir, 'state.json') });
     assert.equal(control.mode, 'http');
-    assert.deepEqual(await control.health(), { state: 'running', version: '0.2.0', control: 'ready' });
-    assert.equal((await control.status()).accounts[0].id, 'legacy-account');
+    assert.deepEqual(await control.health(), { state: 'running', version: '0.5.0', control: 'ready' });
+    assert.equal((await control.status()).accounts[0].id, 'remote-account');
     assert.ok(received.some(({ path, authorized }) => path === '/status' && authorized));
     assert.ok(received.filter(({ path }) => path === '/health').every(({ authorization, apiKey }) => !authorization && !apiKey));
   } finally {

@@ -1,11 +1,14 @@
-// "Is pi-web-access actually going through the broker?" checks.
+// pi-web-access wiring: "is pi-web-access actually going through the broker?" checks, and filling in the key settings
+// web-search.json lacks (addBrokerKeySources, used by the host on first start).
 // Mirrors pi-web-access 0.47.0 resolution rules (docs/research/pi-web-access.md §2-§4).
 // Never prints secret values: only "set / not set / matches the broker token".
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { TOKEN_ENV, TAVILY_POOL_VARS, parseEnvSource } from './config.mjs';
+import { TOKEN_ENV, TAVILY_POOL_VARS, PROVIDER_NAMES, parseEnvSource } from './config.mjs';
+import { PROVIDERS } from './providers.mjs';
 import { baseUrl } from './control.mjs';
+import { atomicWriteJson } from './files.mjs';
 
 /** Same order as pi-web-access getWebSearchConfigDir(). */
 export function piWebSearchConfigPath(env = process.env, home = homedir()) {
@@ -26,6 +29,19 @@ export function piWebSearchConfigPath(env = process.env, home = homedir()) {
 /** Parsed web-search.json ({} when missing); throws on invalid JSON. */
 export function readPiWebSearchConfig(path) {
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
+}
+
+/**
+ * Point pi-web-access's missing (absent, null or empty) Exa / Tavily key settings at the broker token
+ * ("$PI_SEARCH_BROKER_TOKEN"), creating web-search.json if needed. A setting that has a value is never changed. Returns the names it added; throws on
+ * invalid JSON without writing.
+ */
+export function addBrokerKeySources(path) {
+  const pi = readPiWebSearchConfig(path);
+  const missing = KEY_FIELDS.map((f) => f.cfgKey).filter((name) => pi[name] === undefined || pi[name] === null || (typeof pi[name] === 'string' && !pi[name].trim()));
+  if (!missing.length) return [];
+  atomicWriteJson(path, { ...pi, ...Object.fromEntries(missing.map((name) => [name, `$${TOKEN_ENV}`])) });
+  return missing;
 }
 
 /** Describe how pi-web-access would resolve a provider key, without revealing it. */
@@ -102,9 +118,9 @@ export async function runDoctor({ config, configError, control, env = process.en
     add('error', `Broker config: ${configError ?? 'not loaded'}`);
     return checks;
   }
-  const byProvider = (p) => config.accounts.filter((a) => a.provider === p).length;
-  add('ok', `Broker config structure valid: ${byProvider('exa')} Exa and ${byProvider('tavily')} Tavily account(s)`);
-  add('info', 'Provider credentials are checked only at local Gateway startup; doctor does not resolve them.');
+  const inConfig = PROVIDER_NAMES.map((p) => `${config.accounts.filter((a) => a.provider === p).length} ${PROVIDERS[p].label}`).join(' and ');
+  add('ok', `Broker config structure valid: ${inConfig} account(s) in config.json`);
+  add('info', 'Key files and provider credentials are read only at local Gateway startup; doctor reads neither.');
   if (config.attemptTimeoutMs !== undefined && config.attemptTimeoutMs < 20000) {
     add('warn', `attemptTimeoutMs is ${config.attemptTimeoutMs} ms; slow searches will time out. Remove it to use the 30 s per-route default.`);
   }
@@ -116,6 +132,12 @@ export async function runDoctor({ config, configError, control, env = process.en
   else if (health.state === 'running') add('ok', `Gateway is running at ${base} (version ${health.version ?? '?'})`);
   else if (health.state === 'other') add('error', `Something else answers on ${base}; change gateway.port`);
   else add('warn', `Gateway is not running at ${base}. Start pi with the extension installed, or run "npm start".`);
+  try {
+    const { accounts } = await control.status();
+    const counts = PROVIDER_NAMES.map((p) => `${accounts.filter((a) => a.provider === p).length} ${PROVIDERS[p].label}`).join(' and ');
+    const when = health.state === 'running' ? 'serving now' : 'as of the last Gateway start';
+    add('info', `Accounts including key files (${when}): ${counts}`);
+  } catch { /* status needs a reachable, authorized Gateway or a readable state file */ }
 
   const piPath = piWebSearchConfigPath(env, home);
   let pi;

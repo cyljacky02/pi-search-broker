@@ -251,7 +251,7 @@ Ordered by impact.
 11. **Optional response cache.** Use a short TTL (for example 5-15 min), keyed on provider, path, and canonical JSON body. Skip it for recency-filtered queries or give those a shorter TTL. Make it opt-in, because results go stale.
 12. **Health and "is pi using me?" check.** Because Exa silently falls back to the keyless MCP endpoint when no key resolves (`PWA/exa.ts:502-505`), add a `status` hint showing the last request time per provider, or a CLI `doctor` command that checks `~/.pi/agent/web-search.json` for `exaBaseUrl`, `tavilyBaseUrl`, the key fields, and a conflicting top-level `provider`. Print values only as "set / not set".
 13. **Explicit-provider calls bypass routing.** Document that when the model passes `provider: "exa"` or `"tavily"`, an exhausted broker yields a hard error with no fallback (`PWA/gemini-search.ts:838`).
-14. **Naming leftovers (cosmetic).** `broker/src/config.mjs:6-8` and the `/health` service name (`broker/src/gateway.mjs:59`) still say `pi-dual-key-manager`.
+14. **Naming leftovers (resolved in 0.6.0).** The config folder (`~/.config/pi-search-broker`) and the `/health` service name now both use the product name.
 
 ### Not needed
 

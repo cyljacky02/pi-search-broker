@@ -303,7 +303,7 @@ Source: `$DOCS/extensions.md` §Extension Locations (l.123-153).
    - Store a `version` so a reloaded, newer module can replace an older singleton.
 2. **A machine-level single owner.** The README already says "Run only one gateway instance per machine", because `state.json` has a single writer (`README.md` §Security and accuracy limitations).
    - Keep the fixed port (default 19473).
-   - On acquire: probe `GET /health`, which returns `{ ok: true, service: "pi-dual-key-manager" }` (`src/gateway.mjs` l.58-60). If a broker answers, run as a **client**. Otherwise call `listen()`. If that fails with `EADDRINUSE`, probe again.
+   - On acquire: probe `GET /health`, which returns `{ ok: true, service: "pi-search-broker" }` (`src/gateway.mjs` l.58-60). If a broker answers, run as a **client**. Otherwise call `listen()`. If that fails with `EADDRINUSE`, probe again.
 3. **Takeover.** An in-process gateway dies with its owner pi process, so clients need to re-acquire. A good place is the `tool_call` handler for pi-web-access's search and fetch tools, which runs before every call and may be async (`$DOCS/extensions.md` l.971-1011). It can probe the gateway and become the owner if needed.
 4. **Do not keep pi alive.** Call `server.unref()` on the server and on any timers, as the upstream workaround in #2584 suggests. Close the server explicitly in `session_shutdown` as well.
 

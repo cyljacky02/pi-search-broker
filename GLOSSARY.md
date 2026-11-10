@@ -14,6 +14,10 @@ _Avoid_: Backend, upstream (as a noun for the service)
 One provider account, with its own API key and its own credit, that the broker can send requests through.
 _Avoid_: Key, team, user
 
+**Key file**:
+A private text file that lists one provider's API keys, one per line, together with the allocations every key in it gets. Each key in it is one account, and the key file is the only source of those accounts: removing a key removes its account.
+_Avoid_: Key list, import file
+
 **Account pool**:
 All accounts for one provider that the broker rotates through.
 _Avoid_: Key pool, manager
@@ -50,7 +54,7 @@ _Avoid_: Reconciled balance, remote balance
 
 **Broker**:
 The whole product: the gateway, its account pools, and the tools to run and inspect it.
-_Avoid_: Key manager, dual-key manager, proxy
+_Avoid_: Key manager, proxy
 
 **Broker control**:
 The operations for inspecting the broker and managing its accounts, distinct from submitting search requests.

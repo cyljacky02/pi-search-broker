@@ -10,6 +10,7 @@ import { createAccountPool } from '../src/pool.mjs';
 import { fileStore, memoryStore } from '../src/pool/store.mjs';
 import { ROUTES } from '../src/providers.mjs';
 import { validateConfig, secretsOf } from '../src/config.mjs';
+import { BrokerHost } from '../src/host.mjs';
 
 export const DATE = Date.parse('2026-11-09T06:00:00Z');
 export const secret = 'local-only-secret-with-32-chars-12345';
@@ -130,4 +131,22 @@ export function onServerRequest(port, fn) {
   const listener = (message) => { if (message.socket.localPort === port) fn(message); };
   channel.subscribe(listener);
   return () => channel.unsubscribe(listener);
+}
+
+/**
+ * A BrokerHost that can never touch the real ~/.pi/agent/web-search.json: unless the test points pi at its own
+ * agent dir (PI_CODING_AGENT_DIR), pi-web-access's config lives in a fresh temp dir.
+ */
+let agentSandbox = null; // one temp dir per test process, removed when the process exits
+export class TestHost extends BrokerHost {
+  constructor(options = {}) {
+    if (!options.piConfigPath && !options.env?.PI_CODING_AGENT_DIR && !agentSandbox) {
+      agentSandbox = mkdtempSync(join(tmpdir(), 'pi-search-broker-agent-'));
+      process.once('exit', () => rmSync(agentSandbox, { recursive: true, force: true }));
+    }
+    const sandboxed = options.piConfigPath ?? (options.env?.PI_CODING_AGENT_DIR
+      ? undefined
+      : join(mkdtempSync(join(agentSandbox, 'host-')), 'web-search.json'));
+    super({ ...options, piConfigPath: sandboxed });
+  }
 }

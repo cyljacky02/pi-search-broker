@@ -3,13 +3,14 @@
 //   in-process  this process owns the gateway; the Gateway builds this adapter (gateway.mjs), since it lives and stops
 //               with the Gateway
 //   http        another process owns it; authenticated loopback HTTP
-//   offline     nobody runs it; status is read from the state file, and changes are refused so that only the running
-//               gateway ever writes account state
+//   offline     nobody runs it; status is read from the state file (key-file Accounts from the key-free index the last
+//               Gateway left, never from key files), and changes are refused so only the running gateway writes state
 // Every adapter: { mode, health(), status(), enable(id), disable(id), setSpent(id, allocationId, amount), reconcile(id?) }
 // health() never rejects: { state: 'running', version } | { state: 'other' } (something else owns the port) |
 // { state: 'down' }. The in-process and HTTP adapters add control: 'ready' | 'unauthorized' | 'unavailable' when
 // running ('unavailable' includes a Gateway that is stopping).
-import { SERVICE_NAME, LEGACY_SERVICE_NAMES } from './config.mjs';
+import { SERVICE_NAME } from './config.mjs';
+import { readKeyIndex } from './keys.mjs';
 import { createAccountPool } from './pool.mjs';
 import { fileStore } from './pool/store.mjs';
 
@@ -27,8 +28,7 @@ export async function probeHealth(config, { fetchImpl = fetch } = {}) {
     // A redirect belongs to this port's occupant; do not identify or authenticate to its target.
     const res = await fetchImpl(`${baseUrl(config)}/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS), redirect: 'manual' });
     const data = res.ok ? await res.json() : null;
-    const ours = data?.service === SERVICE_NAME || LEGACY_SERVICE_NAMES.includes(data?.service);
-    return ours ? { state: 'running', version: data.version ?? null } : { state: 'other' };
+    return data?.service === SERVICE_NAME ? { state: 'running', version: data.version ?? null } : { state: 'other' };
   } catch {
     return { state: 'down' };
   }
@@ -104,13 +104,18 @@ export function httpControl(config, { fetchImpl = fetch, timeoutMs = 30000 } = {
   };
 }
 
-export function offlineControl(config, { statePath, fetchImpl = fetch }) {
+/** @param indexPath  keys.index.json (keys.mjs keyIndexPathOf); key-file Accounts are listed from it */
+export function offlineControl(config, { statePath, indexPath = null, fetchImpl = fetch }) {
   const refuse = async () => { throw new Error('The broker gateway is not running. Start pi with the extension installed, or run "npm start".'); };
   return {
     mode: 'offline',
     // Re-probe identity; if a Broker appears later, this adapter remains offline until the caller reconnects.
     health: () => probeHealth(config, { fetchImpl }),
-    status: async () => createAccountPool(config.accounts, { store: fileStore(statePath, { readOnly: true }) }).snapshot(),
+    status: async () => {
+      const ids = new Set(config.accounts.map((a) => a.id));
+      const fromKeyFiles = indexPath ? readKeyIndex(indexPath).filter((a) => !ids.has(a.id)) : [];
+      return createAccountPool([...config.accounts, ...fromKeyFiles], { store: fileStore(statePath, { readOnly: true }) }).snapshot();
+    },
     enable: refuse, disable: refuse, setSpent: refuse, reconcile: refuse
   };
 }
@@ -119,7 +124,7 @@ export function offlineControl(config, { statePath, fetchImpl = fetch }) {
  * Control for a process that never runs the gateway itself (the CLI): HTTP when a broker answers on the port, else
  * offline (read-only status from `statePath`). The pi extension's host picks its own, since it may take over the port.
  */
-export async function connectControl({ config, statePath, fetchImpl = fetch }) {
+export async function connectControl({ config, statePath, indexPath = null, fetchImpl = fetch }) {
   if ((await probeHealth(config, { fetchImpl })).state === 'running') return httpControl(config, { fetchImpl });
-  return offlineControl(config, { statePath, fetchImpl });
+  return offlineControl(config, { statePath, indexPath, fetchImpl });
 }
