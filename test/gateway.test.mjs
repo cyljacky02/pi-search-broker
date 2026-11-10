@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import { serve, config, exa, tavily, json, secret, flakyStore, freePort, assertPortAvailable, onServerRequest } from './helpers.mjs';
 import { probeHealth } from '../src/control.mjs';
 import { createGateway } from '../src/gateway.mjs';
+import { VERSION } from '../src/config.mjs';
 import { StateNotSaved } from '../src/pool.mjs';
 import { memoryStore } from '../src/pool/store.mjs';
 
@@ -149,6 +150,37 @@ test('A server error after start is logged instead of crashing the process, and 
     assert.equal((await fetch(`${url}/health`)).status, 200);
   } finally {
     unsubscribe();
+    await gateway.stop();
+  }
+});
+
+test('In-process health() never rejects: down, ready while serving, unavailable while stopping, then down', async () => {
+  let startSearch;
+  let finishSearch;
+  const started = new Promise((resolve) => { startSearch = resolve; });
+  const upstream = new Promise((resolve) => { finishSearch = resolve; });
+  const gateway = createGateway(config(tavily('t', 'tvly-aaaaaaaa')), {
+    fetchImpl: async () => { startSearch(); await upstream; return json({ results: [] }); }
+  });
+  assert.deepEqual(await gateway.control.health(), { state: 'down' });
+  const { url } = await gateway.start({ port: 0 });
+  let search;
+  try {
+    assert.deepEqual(await gateway.control.health(), { state: 'running', version: VERSION, control: 'ready' });
+    search = fetch(`${url}/tavily/search`, {
+      method: 'POST', headers: { 'x-api-key': secret, 'content-type': 'application/json' }, body: JSON.stringify({ query: 'q' })
+    });
+    await started;
+    const stopping = gateway.stop();
+    assert.deepEqual(await gateway.control.health(), { state: 'running', version: VERSION, control: 'unavailable' },
+      'what the HTTP adapter reports for a draining Port owner');
+    finishSearch();
+    assert.equal((await search).status, 200);
+    await stopping;
+    assert.deepEqual(await gateway.control.health(), { state: 'down' });
+  } finally {
+    finishSearch();
+    await search;
     await gateway.stop();
   }
 });

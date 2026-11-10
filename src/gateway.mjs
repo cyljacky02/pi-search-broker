@@ -6,7 +6,7 @@ import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
 import { ROUTES } from './providers.mjs';
 import { createBalanceChecks } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
-import { baseUrl, inProcessControl, serveAdmin } from './control.mjs';
+import { baseUrl, serveAdmin } from './control.mjs';
 import { quietLogger } from './log.mjs';
 import { realClock } from './clock.mjs';
 
@@ -102,7 +102,7 @@ export function createGateway(config, {
   const now = () => clock.now();
   const gate = createGate();
   const cancelChecks = new AbortController(); // balance checks are report-only, so stopping cancels them
-  let serving = null; // what the Gateway runs once it owns the Port: { pool, broker, balanceChecks, control }
+  let serving = null; // what the Gateway runs once it owns the Port: { pool, broker, balanceChecks }
   let timer = null;
   let starting = null;
   let stopping = null;
@@ -112,19 +112,29 @@ export function createGateway(config, {
     const pool = createAccountPool(config.accounts, { store, now, logger });
     const balanceChecks = createBalanceChecks({ accounts: config.accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
     const broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, clock });
-    return { pool, broker, balanceChecks, control: inProcessControl({ pool, reconciler: { reconcile: (id) => balanceChecks.run(id) } }) };
+    return { pool, broker, balanceChecks };
   }
 
-  // Broker control for this process: usable once the Gateway serves, refused once it stops.
-  const control = {
+  /** Run a broker-control task once the Gateway serves; refuse it before that, and once it stops. */
+  function admitted(task) {
+    if (!serving) return Promise.reject(gate.open ? new Error('Gateway has not acquired the Port') : shuttingDown());
+    return gate.run(task);
+  }
+
+  // The in-process adapter of broker control (the interface is in control.mjs). health() never rejects: a stopping
+  // Gateway is reported the way the HTTP adapter sees a draining Port owner.
+  const control = Object.freeze({
     mode: 'in-process',
-    ...Object.fromEntries(['health', 'status', 'enable', 'disable', 'setSpent', 'reconcile'].map((name) => [
-      name, (...args) => {
-        if (!serving) return Promise.reject(gate.open ? new Error('Gateway has not acquired the Port') : shuttingDown());
-        return gate.run(() => serving.control[name](...args));
-      }
-    ]))
-  };
+    async health() {
+      if (!serving || !server.listening) return { state: 'down' };
+      return { state: 'running', version: VERSION, control: gate.open ? 'ready' : 'unavailable' };
+    },
+    status: () => admitted(() => serving.pool.snapshot()),
+    enable: (id) => admitted(() => serving.pool.enable(id)),
+    disable: (id) => admitted(() => serving.pool.disable(id)),
+    setSpent: (id, allocationId, amount) => admitted(() => serving.pool.setSpent(id, allocationId, amount)),
+    reconcile: (id) => admitted(() => serving.balanceChecks.run(id))
+  });
 
   async function proxy(req, res, route) {
     const body = await readBody(req);

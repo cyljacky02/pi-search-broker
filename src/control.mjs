@@ -1,13 +1,15 @@
 // Broker control: inspect and change the broker from the CLI, the pi extension and doctor, whoever owns the gateway.
 // One interface, three adapters:
-//   in-process  this process owns the gateway (pi extension owner, tests)
+//   in-process  this process owns the gateway; the Gateway builds this adapter (gateway.mjs), since it lives and stops
+//               with the Gateway
 //   http        another process owns it; authenticated loopback HTTP
 //   offline     nobody runs it; status is read from the state file, and changes are refused so that only the running
 //               gateway ever writes account state
 // Every adapter: { mode, health(), status(), enable(id), disable(id), setSpent(id, allocationId, amount), reconcile(id?) }
-// health() -> { state: 'running', version } | { state: 'other' } (something else owns the port) | { state: 'down' }
-// HTTP health also reports control: 'ready' | 'unauthorized' | 'unavailable' when the Broker is identified.
-import { SERVICE_NAME, LEGACY_SERVICE_NAMES, VERSION } from './config.mjs';
+// health() never rejects: { state: 'running', version } | { state: 'other' } (something else owns the port) |
+// { state: 'down' }. The in-process and HTTP adapters add control: 'ready' | 'unauthorized' | 'unavailable' when
+// running ('unavailable' includes a Gateway that is stopping).
+import { SERVICE_NAME, LEGACY_SERVICE_NAMES } from './config.mjs';
 import { createAccountPool } from './pool.mjs';
 import { fileStore } from './pool/store.mjs';
 
@@ -57,18 +59,6 @@ export async function serveAdmin(control, op, body) {
   } else if (typeof body.id !== 'string') throw new Error('Account id required');
   const results = await wire.call(control, body);
   return results === undefined ? { ok: true } : { ok: true, results };
-}
-
-export function inProcessControl({ pool, reconciler }) {
-  return {
-    mode: 'in-process',
-    health: async () => ({ state: 'running', version: VERSION }),
-    status: async () => pool.snapshot(),
-    enable: async (id) => pool.enable(id),
-    disable: async (id) => pool.disable(id),
-    setSpent: async (id, allocationId, amount) => pool.setSpent(id, allocationId, amount),
-    reconcile: async (id) => reconciler.reconcile(id)
-  };
 }
 
 export function httpControl(config, { fetchImpl = fetch, timeoutMs = 30000 } = {}) {
