@@ -99,7 +99,7 @@ export function createGateway(config, {
   store = memoryStore(), fetchImpl = fetch, reconcileFetch = fetch, clock = realClock, logger = null
 } = {}) {
   const log = quietLogger(logger);
-  const now = () => clock.now();
+  const now = () => clock.now(); // called through the clock, so an adapter's methods may rely on `this`
   const gate = createGate();
   const cancelChecks = new AbortController(); // balance checks are report-only, so stopping cancels them
   let serving = null; // what the Gateway runs once it owns the Port: { pool, broker, balanceChecks }
@@ -177,8 +177,12 @@ export function createGateway(config, {
       if (req.method === 'GET' && req.url === '/health') return replyHealth(res);
       return reply(res, 503, { error: SHUTTING_DOWN });
     }
-    // Admit before any asynchronous step: stop() waits for this request even if its socket closes.
-    gate.run(() => handle(req, res)).catch(() => reply(res, 503, { error: SHUTTING_DOWN }));
+    // Admit before any asynchronous step: stop() waits for this request even if its socket closes. The gate is open
+    // in this tick, so a rejection here can only be handle() itself failing.
+    gate.run(() => handle(req, res)).catch((err) => {
+      log(`internal error: ${err?.name ?? 'Error'}`);
+      reply(res, 500, { error: 'Gateway internal error; inspect local logs' });
+    });
   });
   // Never keep idle sockets open forever.
   server.requestTimeout = 60000;
@@ -204,6 +208,7 @@ export function createGateway(config, {
   /**
    * Bind the Port, load the Account pool, and serve. Resolves with the bound { port, url }. Rejects with the Port
    * released and nothing written when the Port is taken, the Account pool cannot load or save, or stop() began.
+   * A Gateway serves once: a second call returns the first call's promise (its options are ignored).
    */
   function start({ port = config.gateway.port, host = config.gateway.host, unref = false } = {}) {
     if (!gate.open) return Promise.reject(shuttingDown());

@@ -14,7 +14,8 @@
 //   url      the gateway's base URL, null when unconfigured or idle
 import { createGateway } from './gateway.mjs';
 import { fileStore } from './pool/store.mjs';
-import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig } from './config.mjs';
+import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig, secretsOf } from './config.mjs';
+import { redact } from './providers.mjs';
 import { baseUrl, httpControl, offlineControl } from './control.mjs';
 import { piWebSearchConfigPath, readPiWebSearchConfig, piWiringIssues, gatewayControlIssue, runDoctor } from './doctor.mjs';
 import { realClock } from './clock.mjs';
@@ -154,7 +155,7 @@ export class BrokerHost {
         level: 'error',
         message: err.code === 'EADDRINUSE'
           ? `Port ${config.gateway.port} is used by another program (not the broker). Change gateway.port.`
-          : `Could not start the broker gateway: ${err.message}`
+          : `Could not start the broker gateway: ${redact(err.message, secretsOf(config))}`
       });
     }
   }

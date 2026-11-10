@@ -58,7 +58,7 @@ async function readErrorJson(response) {
  * @param clock     { now, sleep, timeout } (see clock.mjs): the attempt timeout, the deadline and backoff all run on it
  */
 export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, clock = realClock }) {
-  const now = () => clock.now();
+  const now = () => clock.now(); // called through the clock, so an adapter's methods may rely on `this`
   /** Run one request. Never throws for upstream behaviour or unsaved account state; always returns { status, body }. */
   async function execute(route, body, { headers = {}, signal } = {}) {
     const policy = PROVIDERS[route.provider];

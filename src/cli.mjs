@@ -92,7 +92,7 @@ export async function main(argv, {
         signals.off('SIGINT', onSignal);
         signals.off('SIGTERM', onSignal);
         out(`${signal}: finishing in-flight requests before exit (repeat to exit at once)`);
-        gateway.stop().then(() => out('Gateway stopped'), (e) => { err(`Gateway shutdown failed: ${e.message}`); process.exitCode = 1; });
+        gateway.stop().then(() => out('Gateway stopped'), (e) => { err(`Gateway shutdown failed: ${redact(e.message, secrets)}`); process.exitCode = 1; });
       };
       signals.on('SIGINT', onSignal);
       signals.on('SIGTERM', onSignal);

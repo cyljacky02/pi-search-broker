@@ -66,7 +66,6 @@ test('matching Gateway token permits HTTP control and doctor reports a running G
     });
     assert.ok(checks.some(({ level, message }) => level === 'ok' && /Gateway is running/.test(message)));
     assert.ok(!formatChecks(checks).includes(ownerToken));
-    assert.equal(await connectControl({ config: ownerConfig, statePath, inProcess: ownerControl }), ownerControl);
   });
 });
 

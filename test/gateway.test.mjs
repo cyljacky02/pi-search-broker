@@ -58,6 +58,21 @@ test('A Gateway whose Account pool cannot be saved fails to start and releases i
   await gateway.stop();
 });
 
+test('A stop that begins while start() binds wins: start rejects, nothing is written, the Port is free', async () => {
+  const backing = memoryStore();
+  let writes = 0;
+  const store = { load: () => backing.load(), save: (state) => { writes++; backing.save(state); } };
+  const port = await freePort();
+  const gateway = createGateway(config(tavily('t', 'tvly-aaaaaaaa')), { store });
+  const starting = gateway.start({ port });
+  const stopping = gateway.stop();
+  await assert.rejects(starting, /shutting down/i);
+  await stopping;
+  assert.equal(writes, 0, 'the Account pool was never loaded');
+  await assertPortAvailable(port, 'the Port is released');
+  assert.deepEqual(await gateway.control.health(), { state: 'down' });
+});
+
 test('Stopping a Gateway that never started resolves; a stopped Gateway cannot start again', async () => {
   const gateway = createGateway(config(tavily('t', 'tvly-aaaaaaaa')));
   await gateway.stop();

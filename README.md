@@ -218,7 +218,7 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
 - Months and `resetDay` are UTC.
 - One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config. On graceful shutdown the owner cancels balance checks and waits for in-flight searches to settle before releasing the port; an injected fetch that ignores cancellation and timeouts can delay shutdown indefinitely.
 - Upgrading from 0.2.x: the first gateway of 0.3 or later starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
-- Upgrading from 0.3.x: `/reload` replaces the extension's idle 0.3 host. If an in-process subagent still holds it during the reload, restart pi so the new extension does not keep using the old host.
+- Upgrading from 0.3.x: `/reload` switches to the new extension only when no in-process subagent is still using the broker. Otherwise restart pi, so the new extension does not keep running against the 0.3 one.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
 
 ## Development
@@ -245,8 +245,8 @@ Layout:
 | `src/format.mjs` | Human-readable status: the footer line and the status report |
 | `src/log.mjs` | `quietLogger`: an optional logger that never throws |
 | `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |
-| `src/clock.mjs` | Time for everything that waits on it (`now`, `sleep`, `timeout`): `realClock`; tests pass a fake clock that fires timeouts on demand |
-| `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with HTTP and offline (read-only) adapters here and an in-process adapter built by the Gateway; `connectControl` picks one |
+| `src/clock.mjs` | Time for the brokered request (`now`, `sleep`, `timeout`: attempt timeouts, the deadline, backoff): `realClock`; tests pass a fake clock that fires timeouts on demand |
+| `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with HTTP and offline (read-only) adapters here and an in-process adapter built by the Gateway; `connectControl` picks HTTP or offline for the CLI |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
 | `src/host.mjs` | Process singleton used by the extension: decides with one look at the port whether this process is the Port owner, a client or offline, and hands out one view (`role`, `control`, `issue`, `url`); takeover, environment wiring, and doctor as this process sees it |
 | `src/doctor.mjs` | Checks that pi-web-access really uses the broker; words broker-control problems for doctor and the host |

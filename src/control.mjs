@@ -116,11 +116,10 @@ export function offlineControl(config, { statePath, fetchImpl = fetch }) {
 }
 
 /**
- * The right control for this process: `inProcess` when it owns the gateway (pass that gateway's control), else HTTP
- * when a broker answers on the port, else offline (read-only status from `statePath`).
+ * Control for a process that never runs the gateway itself (the CLI): HTTP when a broker answers on the port, else
+ * offline (read-only status from `statePath`). The pi extension's host picks its own, since it may take over the port.
  */
-export async function connectControl({ config, statePath, inProcess = null, fetchImpl = fetch }) {
-  if (inProcess) return inProcess;
+export async function connectControl({ config, statePath, fetchImpl = fetch }) {
   if ((await probeHealth(config, { fetchImpl })).state === 'running') return httpControl(config, { fetchImpl });
   return offlineControl(config, { statePath, fetchImpl });
 }

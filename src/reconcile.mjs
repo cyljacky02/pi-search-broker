@@ -4,7 +4,7 @@
 import { PROVIDERS } from './providers.mjs';
 
 const SHUTDOWN = Object.freeze({ skipped: 'shutdown' });
-const unknown = () => { throw new Error('Unknown account id'); };
+const throwUnknownAccount = () => { throw new Error('Unknown account id'); };
 
 /** Whether this account can be checked against the provider at all. */
 export function canReconcile(account) {
@@ -66,7 +66,8 @@ export function createBalanceChecks({
    * or error; a skipped check records nothing. Results: { id, remaining } | { id, skipped } | { id, error }.
    */
   async function run(accountId) {
-    const targets = accountId ? [accounts.find((a) => a.id === accountId) ?? unknown()] : accounts;
+    // The account itself (with its keys) is needed before any request, and the pool hands out no accounts.
+    const targets = accountId ? [accounts.find((a) => a.id === accountId) ?? throwUnknownAccount()] : accounts;
     const results = [];
     for (const account of targets) {
       const outcome = await check(account);
