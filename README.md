@@ -104,6 +104,8 @@ The design decisions below are backed by the research notes in [`docs/research/`
    - `"$$..."` escapes a literal leading `$`.
    - Anything else is a literal key.
 
+   Have many keys? Import them from a key file instead of writing one Account per key; see [Importing many keys](#importing-many-keys-from-a-key-file).
+
    Every `id` must be unique. Reading config validates its structure and credential source syntax, but never resolves Account credentials. CLI inspection (`status`, `fragment`, `doctor`), remote Broker control and joining an existing Port owner work even when provider credentials are unavailable; `!command` sources are not executed for them. `doctor` checks Gateway access and pi-web-access wiring, not provider credentials, and never starts a Gateway or triggers takeover.
 
    A local Gateway first binds the Port, then resolves **all** Account credentials and rejects missing values, placeholders or duplicate resolved keys before loading or saving Account pool state. This also applies to takeover: a client without usable credentials can inspect the broker but cannot become the Port owner. Failed startup releases the Port without changing saved spend; a later takeover retries the current credential sources. The provider dashboard is the source of truth for limits and expiry dates.
@@ -198,6 +200,36 @@ node src/cli.mjs set-spent exa-account-1 promo 12.50
 node src/cli.mjs set-spent tavily-account-1 monthly 230
 ```
 
+### Importing many keys from a key file
+
+Put one Provider's API keys in a plain text file, **one key per line**, outside this repository. Blank lines and lines starting with `#` are ignored; Windows line endings and a UTF-8 BOM are fine. Then import it once:
+
+```bash
+# Tavily free plan: 1,000 credits a month, resetting on the 1st (UTC)
+npm run import -- tavily C:\keys\tavily.txt --limit 1000 --period monthly --reset-day 1
+
+# Exa promo credit that expires, with ids exa-promo-01, exa-promo-02, ...
+node src/cli.mjs import exa ~/keys/exa.txt --limit 20 --period once --expires 2026-12-01 --prefix exa-promo
+
+# Copy every Allocation (for example promo + monthly) from an Account you already configured
+node src/cli.mjs import exa ~/keys/exa.txt --like exa-account-1
+
+# Show what would happen without writing anything
+node src/cli.mjs import tavily ~/keys/tavily.txt --limit 1000 --period monthly --dry-run
+```
+
+- Each new key becomes one Account (`tavily-01`, `tavily-02`, ... or `<prefix>-NN`), numbered from the lowest free id. Ids never change afterwards, because saved spend is kept per Account id.
+- The Allocation comes from either `--limit <n>` / `--period <monthly|once>` or `--like <account>`, never both. One of them is required: keys say nothing about real credit, and the importer never guesses.
+  - `--limit` is a plain decimal number: USD for Exa, credits for Tavily.
+  - `--reset-day <1-28>` applies to `monthly` only.
+  - `--expires <YYYY-MM-DD|ISO time|never>` is required for `once` and optional for `monthly`. A bare date means midnight UTC.
+  - Bad flags are reported in flag terms before anything is read or written. Adjust single Accounts in `config.json` afterwards if needed.
+- Importing is **add-only**. Keys already present as literal keys in the config (for either Provider, since the Gateway refuses duplicate keys at startup), and repeats within the file, are skipped (reported by line number). If nothing is added or removed, the config is not written at all. Existing Accounts and their spend are never changed or removed; use `disable` or edit `config.json` to retire one. `$ENV` / `!command` sources are not resolved during an import; a duplicate there is still caught when the Gateway starts.
+- Accounts of the same Provider whose key is still an example value (such as the ones `init` writes) are removed, so they no longer block Gateway startup.
+- The whole file is rejected if any key is unusable (shorter than 8 characters, an example value, or containing control characters). Surrounding whitespace is trimmed. Errors name line numbers only, never key contents.
+- The config is only written if it remains valid, atomically and with mode 0600. The keys are **copied** into `config.json` as literal keys, so afterwards you can delete the key file. Exa `adminKey` values are not imported; add them by hand.
+- Importing contacts neither the Providers nor the Gateway. Run `/reload` in pi (or restart `serve`) to start using the new Accounts.
+
 `set-spent` corrects **the amount already spent from an allocation** to match the dashboard: USD for Exa, credits for Tavily. It does not set the remaining balance. It also clears the account's disabled state; any separate cooldown remains in effect.
 
 After changing keys, expiry dates or the account list in `config.json`, run `/reload` in pi, or restart the standalone gateway.
@@ -220,7 +252,7 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
 - Months and `resetDay` are UTC.
 - One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config. On graceful shutdown the owner cancels balance checks and waits for in-flight searches to settle before releasing the port; an injected fetch that ignores cancellation and timeouts can delay shutdown indefinitely.
 - Upgrading from 0.2.x: the first gateway of 0.3 or later starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
-- Upgrading from 0.3.x or 0.4.0: `/reload` switches to the new extension only when no in-process subagent is still using the broker. Otherwise restart pi, so the new extension does not keep running against the older Port owner module.
+- Upgrading from 0.3.x or 0.4.x: `/reload` switches to the new extension only when no in-process subagent is still using the broker. Otherwise restart pi, so the new extension does not keep running against the older Port owner module.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
 
 ## Development
@@ -236,7 +268,8 @@ Layout:
 
 | Path | Purpose |
 |---|---|
-| `src/config.mjs` | Validated metadata and credential source syntax for inspection; resolves and validates all Account credentials only for local Gateway startup |
+| `src/config.mjs` | Validated metadata and credential source syntax for inspection (the one owner of `$ENV` / `!command` / literal rules and Allocation checks); reads and atomically saves the config file; resolves and validates all Account credentials only for local Gateway startup |
+| `src/files.mjs` | `atomicWriteJson`: temp file plus rename, mode 0600, shared by the config and pool state writers |
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
 | `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion and unsaved-state replies) and returns `{status, body}` |
 | `src/gateway.mjs` | Gateway: `start()` binds the Port, resolves Account credentials, then loads the Account pool; credential or pool failure releases the Port without writing state. `stop()` refuses new work, cancels balance checks, lets in-flight work settle and releases the Port. In between: auth, routing, body parsing and replies around the broker |
@@ -250,6 +283,7 @@ Layout:
 | `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |
 | `src/clock.mjs` | Time for the brokered request (`now`, `sleep`, `timeout`: attempt timeouts, the deadline, backoff): `realClock`; tests pass a fake clock that fires timeouts on demand |
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with HTTP and offline (read-only) adapters here and an in-process adapter built by the Gateway; `connectControl` picks HTTP or offline for the CLI |
+| `src/import.mjs` | Key file import: reads one key per line, adds one Account per new key to the private config (add-only, atomic, validated); the only module that reads key files |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
 | `src/host.mjs` | Process singleton used by the extension: decides with one look at the port whether this process is the Port owner, a client or offline, and hands out one view (`role`, `control`, `issue`, `url`); takeover, environment wiring, and doctor as this process sees it |
 | `src/doctor.mjs` | Checks Gateway access and pi-web-access wiring without resolving Account credentials or starting a Gateway; words broker-control problems for doctor and the host |

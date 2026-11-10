@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
+import { atomicWriteJson } from './files.mjs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -10,13 +11,16 @@ export const SERVICE_NAME = 'pi-search-broker';
 export const LEGACY_SERVICE_NAMES = Object.freeze(['pi-dual-key-manager']);
 /** Config folder name, kept from before the product rename so existing configs and account state are still found. */
 export const CONFIG_DIR_NAME = 'pi-dual-key-manager';
-export const VERSION = '0.4.1';
+export const VERSION = '0.5.0';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
 export const TOKEN_ENV = 'PI_SEARCH_BROKER_TOKEN';
 /** Optional override for the broker config path (used by the CLI default and the pi extension). */
 export const CONFIG_ENV = 'PI_SEARCH_BROKER_CONFIG';
 export const DEFAULT_DIR = join(homedir(), '.config', CONFIG_DIR_NAME);
 export const DEFAULT_CONFIG = join(DEFAULT_DIR, 'config.json');
+
+/** The Providers the broker can forward to. */
+export const PROVIDER_NAMES = Object.freeze(['exa', 'tavily']);
 
 /** pi-web-access's built-in Tavily key pool (TAVILY_API_KEY_1..20). */
 export const TAVILY_POOL_VARS = Object.freeze(Array.from({ length: 20 }, (_, i) => `TAVILY_API_KEY_${i + 1}`));
@@ -36,6 +40,34 @@ const ENV_SOURCE = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))
 export function parseEnvSource(source) {
   const match = typeof source === 'string' ? source.trim().match(ENV_SOURCE) : null;
   return match ? match[1] ?? match[2] : null;
+}
+
+/** Whether a resolved key could be a real Provider key: long enough and not an example value. */
+export function isRealKey(key) {
+  return typeof key === 'string' && key.length >= 8 && !PLACEHOLDER.test(key);
+}
+
+/** Whether a value contains control characters, so it cannot be a single-line secret. */
+export const hasControlCharacters = (value) => /[\0-\x1f\x7f]/.test(value);
+
+/**
+ * The key a literal source stands for ("$$x" -> "$x", "$!x" -> "!x", "x" -> "x"), or null for an
+ * environment or command source, which only resolveSecret may resolve.
+ */
+export function literalKeyOf(source) {
+  if (typeof source !== 'string') return null;
+  const s = source.trim();
+  if (s.startsWith('$$') || s.startsWith('$!')) return s.slice(1);
+  return /^[$!]/.test(s) ? null : s;
+}
+
+/** The literal source for a key, escaping a leading $ or ! so it is never read as an env or command source. */
+export const literalSourceOf = (key) => (/^[$!]/.test(key) ? `$${key}` : key);
+
+/** Whether a credential source is still an unedited example value, such as the ones `init` writes. */
+export function isPlaceholderSource(source) {
+  const key = literalKeyOf(source);
+  return key !== null && PLACEHOLDER.test(key);
 }
 
 /** Every secret the broker holds, for redaction. */
@@ -72,22 +104,20 @@ function secretSource(value, label) {
  */
 export function resolveSecret(value, label, { env = process.env, runCommand = defaultRunCommand } = {}) {
   const source = secretSource(value, label);
-  if (source.startsWith('$$') || source.startsWith('$!')) return source.slice(1);
+  const literal = literalKeyOf(source);
+  if (literal !== null) return literal;
   if (source.startsWith('!')) {
     const command = source.slice(1).trim();
     let out;
     try { out = runCommand(command); } catch { throw new Error(`Command source for ${label} failed`); }
     const resolved = String(out ?? '').trim();
-    if (!resolved || /[\0-\x1f\x7f]/.test(resolved)) throw new Error(`Command source for ${label} produced no usable single-line value`);
+    if (!resolved || hasControlCharacters(resolved)) throw new Error(`Command source for ${label} produced no usable single-line value`);
     return resolved;
   }
-  if (source.startsWith('$')) {
-    const name = parseEnvSource(source);
-    const resolved = env[name]?.trim();
-    if (!resolved) throw new Error(`Environment variable ${name} for ${label} is empty or unset`);
-    return resolved;
-  }
-  return source;
+  const name = parseEnvSource(source);
+  const resolved = env[name]?.trim();
+  if (!resolved) throw new Error(`Environment variable ${name} for ${label} is empty or unset`);
+  return resolved;
 }
 
 function intInRange(value, name, min, max, fallback, { allowZero = false } = {}) {
@@ -97,6 +127,25 @@ function intInRange(value, name, min, max, fallback, { allowZero = false } = {})
     throw new Error(`${name} must be an integer ${allowZero ? '0 or ' : ''}${min}..${max}`);
   }
   return value;
+}
+
+/**
+ * Validate one Allocation's limit, period and dates (not its id). `where` names it in errors:
+ * "exa-1/promo", or "the imported Allocation" before its Account exists.
+ */
+export function validateAllocation(bucket, where) {
+  if (typeof bucket.limit !== 'number' || !Number.isFinite(bucket.limit) || bucket.limit <= 0) {
+    throw new Error(`Invalid allocation limit ${where}`);
+  }
+  if (!['monthly', 'once'].includes(bucket.period)) throw new Error(`Invalid period on ${where}`);
+  if (bucket.startsAt !== undefined && !goodDate(bucket.startsAt)) throw new Error(`Invalid ISO startsAt on ${where}`);
+  if (bucket.expiresAt !== undefined && !goodDate(bucket.expiresAt)) throw new Error(`Invalid ISO expiresAt on ${where}`);
+  if (bucket.resetDay !== undefined && (bucket.period !== 'monthly' || !Number.isInteger(bucket.resetDay) || bucket.resetDay < 1 || bucket.resetDay > 28)) {
+    throw new Error(`resetDay must be 1..28 for monthly allocation ${where}`);
+  }
+  if (bucket.period === 'once' && !bucket.expiresAt && bucket.expires !== 'never') {
+    throw new Error(`One-time allocation needs expiresAt (or "expires": "never") on ${where}`);
+  }
 }
 
 /** Validate and normalize metadata and credential source syntax, without reading secrets or running commands. */
@@ -123,7 +172,7 @@ export function validateConfig(input) {
     }
     if (ids.has(account.id)) throw new Error(`Duplicate account id: ${account.id}`);
     ids.add(account.id);
-    if (!['exa', 'tavily'].includes(account.provider)) throw new Error(`Invalid provider on ${account.id}`);
+    if (!PROVIDER_NAMES.includes(account.provider)) throw new Error(`Invalid provider on ${account.id}`);
     const apiKey = secretSource(account.apiKey, `apiKey of ${account.id}`);
     let adminKey;
     if (account.adminKey !== undefined) {
@@ -147,22 +196,7 @@ export function validateConfig(input) {
       }
       if (bucketIds.has(bucket.id)) throw new Error(`Duplicate allocation ${bucket.id} for ${account.id}`);
       bucketIds.add(bucket.id);
-      if (typeof bucket.limit !== 'number' || !Number.isFinite(bucket.limit) || bucket.limit <= 0) {
-        throw new Error(`Invalid allocation limit ${account.id}/${bucket.id}`);
-      }
-      if (!['monthly', 'once'].includes(bucket.period)) throw new Error(`Invalid period on ${account.id}/${bucket.id}`);
-      if (bucket.startsAt !== undefined && !goodDate(bucket.startsAt)) {
-        throw new Error(`Invalid ISO startsAt on ${account.id}/${bucket.id}`);
-      }
-      if (bucket.expiresAt !== undefined && !goodDate(bucket.expiresAt)) {
-        throw new Error(`Invalid ISO expiresAt on ${account.id}/${bucket.id}`);
-      }
-      if (bucket.resetDay !== undefined && (bucket.period !== 'monthly' || !Number.isInteger(bucket.resetDay) || bucket.resetDay < 1 || bucket.resetDay > 28)) {
-        throw new Error(`resetDay must be 1..28 for monthly allocation ${account.id}/${bucket.id}`);
-      }
-      if (bucket.period === 'once' && !bucket.expiresAt && bucket.expires !== 'never') {
-        throw new Error(`One-time allocation needs expiresAt (or "expires": "never") on ${account.id}/${bucket.id}`);
-      }
+      validateAllocation(bucket, `${account.id}/${bucket.id}`);
     }
     accounts.push({ ...account, apiKey, ...(adminKey ? { adminKey } : {}) });
   }
@@ -184,7 +218,7 @@ export function resolveAccountCredentials(config, secretOptions = {}) {
   const keys = new Set();
   const accounts = config.accounts.map((account) => {
     const apiKey = resolveSecret(account.apiKey, `apiKey of ${account.id}`, secretOptions);
-    if (apiKey.length < 8 || PLACEHOLDER.test(apiKey)) throw new Error(`Missing real apiKey for ${account.id}`);
+    if (!isRealKey(apiKey)) throw new Error(`Missing real apiKey for ${account.id}`);
     if (keys.has(apiKey)) throw new Error(`Duplicate apiKey (possible shared quota) for ${account.id}`);
     keys.add(apiKey);
     if (account.adminKey === undefined) return { ...account, apiKey };
@@ -195,15 +229,24 @@ export function resolveAccountCredentials(config, secretOptions = {}) {
   return { ...config, accounts };
 }
 
-/** Read validated metadata. Provider credentials remain sources until a local Gateway starts. */
-export function loadConfig(path = defaultConfigPath()) {
-  let config;
-  try { config = JSON.parse(readFileSync(path, 'utf8')); }
+/** The config file as written, before validation and defaults: what saveConfig should write back. */
+export function readConfigFile(path = defaultConfigPath()) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); }
   catch (err) {
     if (err.code === 'ENOENT') throw Object.assign(new Error(`Missing config; run npm run init first: ${path}`), { code: 'ENOCONFIG' });
     throw new Error('Unable to read/parse private config; check path, permissions and JSON syntax');
   }
-  return validateConfig(config);
+}
+
+/** Read validated metadata. Provider credentials remain sources until a local Gateway starts. */
+export function loadConfig(path = defaultConfigPath()) {
+  return validateConfig(readConfigFile(path));
+}
+
+/** Replace the config file atomically (mode 0600), only if `config` is valid. Never resolves credentials. */
+export function saveConfig(path, config) {
+  validateConfig(config);
+  atomicWriteJson(path, config);
 }
 
 export function webSearchFragment(gateway) {
