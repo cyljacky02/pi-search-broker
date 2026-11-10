@@ -2,6 +2,7 @@
 // Results are shown next to the local estimate in /status; they never change local accounting.
 // Correct local spend with `set-spent` if the two drift apart.
 import { PROVIDERS } from './providers.mjs';
+import { createPendingWork } from './pending-work.mjs';
 
 /** Whether this account can be checked against the provider at all. */
 export function canReconcile(account) {
@@ -33,7 +34,7 @@ export async function fetchBalance(account, { fetchImpl = fetch, timeoutMs = 100
 export function createReconciler(pool, { fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, intervalMs = 0 } = {}) {
   const lastAttempt = new Map();
   const stopping = new AbortController();
-  const active = new Set();
+  const pending = createPendingWork();
   let timer = null;
 
   /** One account's check, for pool.checkBalances: a balance, a skip reason, or a thrown key-free Error. */
@@ -63,10 +64,7 @@ export function createReconciler(pool, { fetchImpl = fetch, now = () => Date.now
   /** Results per account: { id, remaining } | { id, skipped } | { id, error }. Unknown ids throw. */
   function reconcile(accountId) {
     if (stopping.signal.aborted) return Promise.reject(new Error('Gateway is shutting down'));
-    const work = pool.checkBalances(accountId, check);
-    active.add(work);
-    work.then(() => active.delete(work), () => active.delete(work));
-    return work;
+    return pending.track(pool.checkBalances(accountId, check));
   }
 
   function start() {
@@ -78,7 +76,7 @@ export function createReconciler(pool, { fetchImpl = fetch, now = () => Date.now
     clearInterval(timer);
     timer = null;
     stopping.abort();
-    await Promise.allSettled([...active]);
+    await pending.drain();
   }
   return { reconcile, start, stop };
 }

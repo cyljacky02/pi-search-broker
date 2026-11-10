@@ -8,6 +8,7 @@ import { createReconciler } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
 import { inProcessControl, serveAdmin } from './control.mjs';
 import { quietLogger } from './log.mjs';
+import { createPendingWork } from './pending-work.mjs';
 
 function suppliedToken(req) {
   const headerKey = req.headers['x-api-key'];
@@ -34,6 +35,9 @@ function reply(res, code, data) {
     'x-content-type-options': 'nosniff'
   });
   res.end(JSON.stringify(data));
+}
+function replyHealth(res) {
+  return reply(res, 200, { ok: true, service: SERVICE_NAME, version: VERSION, pid: process.pid });
 }
 async function readBody(req, maxBytes = 1024 * 1024) {
   let size = 0;
@@ -66,12 +70,7 @@ export function createGateway(config, {
   let internalControl;
   let draining = false;
   let shutdownPromise = null;
-  const active = new Set();
-  function track(work) {
-    active.add(work);
-    work.then(() => active.delete(work), () => active.delete(work));
-    return work;
-  }
+  const pending = createPendingWork();
 
   // Pool construction writes state, so initialize only after binding the Port.
   function initialize() {
@@ -88,7 +87,7 @@ export function createGateway(config, {
       name, (...args) => {
         if (draining) return Promise.reject(Object.assign(new Error('Gateway is shutting down'), { statusCode: 503 }));
         if (!pool) return Promise.reject(new Error('Gateway has not acquired the Port'));
-        return track(internalControl[name](...args));
+        return pending.track(internalControl[name](...args));
       }
     ]))
   };
@@ -108,9 +107,7 @@ export function createGateway(config, {
       const url = new URL(req.url || '/', 'http://localhost');
       // Disallow query strings: no need to forward any untrusted host / URL fields.
       if (url.search) return reply(res, 400, { error: 'Query parameters are not supported' });
-      if (url.pathname === '/health' && req.method === 'GET') {
-        return reply(res, 200, { ok: true, service: SERVICE_NAME, version: VERSION, pid: process.pid });
-      }
+      if (url.pathname === '/health' && req.method === 'GET') return replyHealth(res);
       if (draining) return reply(res, 503, { error: 'Gateway is shutting down' });
       if (!isAuthorized(req, config.gateway.token)) return reply(res, 401, { error: unauthorizedHint(req) });
       if (url.pathname === '/status' && req.method === 'GET') return reply(res, 200, await control.status());
@@ -135,11 +132,11 @@ export function createGateway(config, {
   const server = createServer((req, res) => {
     // The draining Gateway still identifies the Port owner, but never accepts more mutating work.
     if (draining) {
-      if (req.method === 'GET' && req.url === '/health') return reply(res, 200, { ok: true, service: SERVICE_NAME, version: VERSION, pid: process.pid });
+      if (req.method === 'GET' && req.url === '/health') return replyHealth(res);
       return reply(res, 503, { error: 'Gateway is shutting down' });
     }
     // Register before entering any asynchronous handler. Closing a socket alone does not finish its work.
-    track(Promise.resolve().then(() => handle(req, res)));
+    pending.track(Promise.resolve().then(() => handle(req, res)));
   });
   // Never keep idle sockets open forever.
   server.requestTimeout = 60000;
@@ -181,7 +178,7 @@ export function createGateway(config, {
     shutdownPromise = Promise.resolve().then(async () => {
       // Reconciliation is report-only and can be cancelled; brokered requests must finish settlement.
       if (reconciler) await reconciler.stop();
-      await Promise.allSettled([...active]);
+      await pending.drain();
       await new Promise((resolve, reject) => close((err) => err ? reject(err) : resolve()));
     });
     return shutdownPromise;

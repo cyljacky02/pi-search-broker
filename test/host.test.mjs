@@ -184,12 +184,16 @@ test('A Port owner drains an in-flight billed search before allowing takeover', 
   try {
     assert.equal(await old.acquire(), 'owner');
     const oldControl = await old.control();
+    const health = await fetch(`http://127.0.0.1:${port}/health`).then((res) => res.json());
     response = post().then((value) => ({ value }), (error) => ({ error }));
     await started;
     releasing = old.release().then(() => { released = true; });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(released, false, 'the listening port stays owned while the Provider outcome is pending');
     assert.equal(await replacement.acquire(), 'client', 'another process sees the draining Port owner');
+    const drainingHealth = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal(drainingHealth.status, 200);
+    assert.deepEqual(await drainingHealth.json(), health, 'Gateway identity is unchanged while draining');
     assert.equal((await post()).status, 503, 'new searches are refused before dispatch');
     await assert.rejects(oldControl.disable('tavily-1'), /shutting down/i);
     assert.equal(searchCalls, 1);

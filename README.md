@@ -243,6 +243,7 @@ Layout:
 | `src/reconcile.mjs` | Optional, report-only provider balance checks (rate gap per account, run through `pool.checkBalances`); cancels safely on shutdown |
 | `src/format.mjs` | Human-readable status: the footer line and the status report |
 | `src/log.mjs` | `quietLogger`: an optional logger that never throws |
+| `src/pending-work.mjs` | Tracks pending work and drains the current batch; admission and cancellation stay with the caller |
 | `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with in-process, HTTP and offline (read-only) adapters; `connectControl` picks one |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
