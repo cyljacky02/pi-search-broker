@@ -104,7 +104,9 @@ The design decisions below are backed by the research notes in [`docs/research/`
    - `"$$..."` escapes a literal leading `$`.
    - Anything else is a literal key.
 
-   Every `id` must be unique, and duplicate keys are rejected. The provider dashboard is the source of truth for limits and expiry dates.
+   Every `id` must be unique. Reading config validates its structure and credential source syntax, but never resolves Account credentials. CLI inspection (`status`, `fragment`, `doctor`), remote Broker control and joining an existing Port owner work even when provider credentials are unavailable; `!command` sources are not executed for them. `doctor` checks Gateway access and pi-web-access wiring, not provider credentials, and never starts a Gateway or triggers takeover.
+
+   A local Gateway first binds the Port, then resolves **all** Account credentials and rejects missing values, placeholders or duplicate resolved keys before loading or saving Account pool state. This also applies to takeover: a client without usable credentials can inspect the broker but cannot become the Port owner. Failed startup releases the Port without changing saved spend; a later takeover retries the current credential sources. The provider dashboard is the source of truth for limits and expiry dates.
 
    Optional settings:
 
@@ -218,7 +220,7 @@ After changing keys, expiry dates or the account list in `config.json`, run `/re
 - Months and `resetDay` are UTC.
 - One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config. On graceful shutdown the owner cancels balance checks and waits for in-flight searches to settle before releasing the port; an injected fetch that ignores cancellation and timeouts can delay shutdown indefinitely.
 - Upgrading from 0.2.x: the first gateway of 0.3 or later starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
-- Upgrading from 0.3.x: `/reload` switches to the new extension only when no in-process subagent is still using the broker. Otherwise restart pi, so the new extension does not keep running against the 0.3 one.
+- Upgrading from 0.3.x or 0.4.0: `/reload` switches to the new extension only when no in-process subagent is still using the broker. Otherwise restart pi, so the new extension does not keep running against the older Port owner module.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
 
 ## Development
@@ -228,15 +230,16 @@ npm run check
 npm test
 ```
 
-The tests use only the standard library and the built-in test runner. They need no network access and no real API keys.
+The tests use only the standard library and the built-in test runner. They need no external network access and no real provider credentials. Balance policy is tested through the balance-check module's interface with a real Account pool, `memoryStore`, controlled time and Provider replies; focused HTTP translation and Gateway shutdown tests remain separate.
 
 Layout:
 
 | Path | Purpose |
 |---|---|
+| `src/config.mjs` | Validated metadata and credential source syntax for inspection; resolves and validates all Account credentials only for local Gateway startup |
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
 | `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion and unsaved-state replies) and returns `{status, body}` |
-| `src/gateway.mjs` | Gateway: `start()` binds the port, then loads the account pool; `stop()` refuses new work, cancels balance checks, lets in-flight work settle and releases the port. In between: auth, routing, body parsing and replies around the broker |
+| `src/gateway.mjs` | Gateway: `start()` binds the Port, resolves Account credentials, then loads the Account pool; credential or pool failure releases the Port without writing state. `stop()` refuses new work, cancels balance checks, lets in-flight work settle and releases the Port. In between: auth, routing, body parsing and replies around the broker |
 | `src/pool.mjs` | Account pool: accounts, allocations, health and spend. `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends; a save that fails throws `StateNotSaved` with that ending); `recordBalanceCheck()` stores provider balances; keeps the attempt log |
 | `src/pool/health.mjs` | Account health: what each failure effect does to an account (disable, quota, cooldowns) and how it recovers |
 | `src/pool/allocation.mjs` | Allocation calendar: windows, reset days, spending order, and when an out-of-credit account is worth retrying |
@@ -249,7 +252,7 @@ Layout:
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with HTTP and offline (read-only) adapters here and an in-process adapter built by the Gateway; `connectControl` picks HTTP or offline for the CLI |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
 | `src/host.mjs` | Process singleton used by the extension: decides with one look at the port whether this process is the Port owner, a client or offline, and hands out one view (`role`, `control`, `issue`, `url`); takeover, environment wiring, and doctor as this process sees it |
-| `src/doctor.mjs` | Checks that pi-web-access really uses the broker; words broker-control problems for doctor and the host |
+| `src/doctor.mjs` | Checks Gateway access and pi-web-access wiring without resolving Account credentials or starting a Gateway; words broker-control problems for doctor and the host |
 | `extension/index.js` | The pi extension |
 | `src/cli.mjs` | Standalone CLI (`main(argv)` is exported for tests); `serve` drains on Ctrl+C / SIGTERM |
 | `scripts/check.mjs` | Syntax-checks every module (`npm run check`) |

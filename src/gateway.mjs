@@ -2,8 +2,8 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { createAccountPool, StateNotSaved } from './pool.mjs';
 import { memoryStore } from './pool/store.mjs';
-import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf } from './config.mjs';
-import { ROUTES } from './providers.mjs';
+import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf, resolveAccountCredentials } from './config.mjs';
+import { ROUTES, redact } from './providers.mjs';
 import { createBalanceChecks } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
 import { baseUrl, serveAdmin } from './control.mjs';
@@ -85,7 +85,7 @@ function createGate() {
 
 /**
  * The loopback HTTP endpoint pi-web-access sends Exa and Tavily requests to. A Gateway serves once:
- *   start({ port?, host?, unref? }) -> { port, url }   bind the Port, then load the Account pool and serve
+ *   start({ port?, host?, unref? }) -> { port, url }   bind the Port, resolve credentials, load the Account pool and serve
  *   stop()                                           refuse new work, cancel balance checks, let in-flight work
  *                                                    settle, release the Port
  *   control                                          broker control for this process (see control.mjs)
@@ -93,10 +93,11 @@ function createGate() {
  * @param store           account pool state store (default: in memory; the host and CLI pass a fileStore)
  * @param reconcileFetch  fetch for provider balance endpoints (default: the real fetch)
  * @param clock           { now, sleep, timeout } (see clock.mjs) for everything the Gateway builds
+ * @param secretOptions   environment and command runner for Account credentials, resolved only after binding the Port
  * @param logger          optional (line) => void
  */
 export function createGateway(config, {
-  store = memoryStore(), fetchImpl = fetch, reconcileFetch = fetch, clock = realClock, logger = null
+  store = memoryStore(), fetchImpl = fetch, reconcileFetch = fetch, clock = realClock, secretOptions = {}, logger = null
 } = {}) {
   const log = quietLogger(logger);
   const now = () => clock.now(); // called through the clock, so an adapter's methods may rely on `this`
@@ -107,12 +108,23 @@ export function createGateway(config, {
   let starting = null;
   let stopping = null;
 
-  // Pool construction loads and saves state, so this runs only after the Port is bound.
+  // Resolve credentials and construct the writing Account pool only after the Port is bound.
   function assemble() {
-    const pool = createAccountPool(config.accounts, { store, now, logger });
-    const balanceChecks = createBalanceChecks({ accounts: config.accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
-    const broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, clock });
-    return { pool, broker, balanceChecks };
+    const active = resolveAccountCredentials(config, secretOptions);
+    const secrets = secretsOf(active);
+    try {
+      const pool = createAccountPool(active.accounts, { store, now, logger });
+      const balanceChecks = createBalanceChecks({ accounts: active.accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
+      const broker = createBroker({ pool, limits: config, secrets, fetchImpl, clock });
+      return { pool, broker, balanceChecks };
+    } catch (err) {
+      // Only the Gateway holds resolved credentials; callers cannot redact them after a startup failure.
+      if (err instanceof Error) {
+        err.message = redact(err.message, secrets);
+        err.stack = redact(err.stack, secrets);
+      }
+      throw err;
+    }
   }
 
   /** Run a broker-control task once the Gateway serves; refuse it before that, and once it stops. */
@@ -206,8 +218,9 @@ export function createGateway(config, {
   }
 
   /**
-   * Bind the Port, load the Account pool, and serve. Resolves with the bound { port, url }. Rejects with the Port
-   * released and nothing written when the Port is taken, the Account pool cannot load or save, or stop() began.
+   * Bind the Port, resolve all Account credentials, load the Account pool, and serve. Resolves with the bound
+   * { port, url }. Rejects with the Port released and nothing written when the Port is taken, credentials cannot
+   * resolve or validate, the Account pool cannot load or save, or stop() began.
    * A Gateway serves once: a second call returns the first call's promise (its options are ignored).
    */
   function start({ port = config.gateway.port, host = config.gateway.host, unref = false } = {}) {

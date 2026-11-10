@@ -33,7 +33,6 @@ export class BrokerHost {
   #store;
   #logger;
   #config = null;
-  #configError = null;
   #view = IDLE;
   #gateway = null;      // this process's Gateway while it is the Port owner
   #checkedAt = 0;       // when a client last saw the Port owner answer
@@ -86,7 +85,6 @@ export class BrokerHost {
       await this.#stopGateway();
       this.#restoreEnvironment();
       this.#config = null;
-      this.#configError = null;
       this.#view = IDLE;
     })();
     this.#releasing = releasing;
@@ -112,23 +110,25 @@ export class BrokerHost {
     return notes;
   }
 
-  /** Doctor's checks as this process sees them: its config, its environment, and the control for its role. */
+  /** Inspect wiring and Gateway access without starting a Gateway or resolving Account credentials. */
   async doctor() {
-    const view = await this.ensure();
-    return runDoctor({ config: this.#config, configError: this.#configError, control: view.control, env: this.#env });
+    let config;
+    try { config = this.#config ?? loadConfig(this.#configPath); }
+    catch (err) { return runDoctor({ configError: err.message }); }
+    const control = this.#gateway?.control ?? httpControl(config, { fetchImpl: this.#fetchImpl });
+    return runDoctor({ config, control, env: this.#env });
   }
 
   #loadConfig() {
     if (this.#config) return this.#config;
     try {
-      this.#config = loadConfig(this.#configPath, { env: this.#env });
-      this.#configError = null;
+      this.#config = loadConfig(this.#configPath);
       return this.#config;
     } catch (err) {
-      this.#configError = err.code === 'ENOCONFIG'
+      const message = err.code === 'ENOCONFIG'
         ? `No broker config at ${this.#configPath}. Run "npm run init" in the pi-search-broker folder and add accounts, then /reload.`
         : `Broker config error: ${err.message}`;
-      this.#view = Object.freeze({ role: 'unconfigured', control: null, issue: { level: 'warning', message: this.#configError }, url: null });
+      this.#view = Object.freeze({ role: 'unconfigured', control: null, issue: { level: 'warning', message }, url: null });
       return null;
     }
   }
@@ -177,7 +177,7 @@ export class BrokerHost {
   async #listen(config) {
     const gateway = createGateway(config, {
       store: this.#store ?? fileStore(this.#statePath), fetchImpl: this.#fetchImpl, reconcileFetch: this.#fetchImpl,
-      clock: { ...realClock, now: this.#now }, logger: this.#logger
+      clock: { ...realClock, now: this.#now }, secretOptions: { env: this.#env }, logger: this.#logger
     });
     await gateway.start({ unref: true }); // never keep pi alive
     this.#gateway = gateway;

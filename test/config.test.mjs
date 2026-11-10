@@ -16,9 +16,9 @@ test('gateway.host "localhost" is normalized so every base URL agrees', () => {
   }
 });
 
-test('Config rejects non-loopback listeners, duplicate API keys and expiry dates without a timezone', () => {
+test('Config rejects non-loopback listeners, duplicate Account ids and expiry dates without a timezone', () => {
   assert.throws(() => withHost('0.0.0.0'), /loopback/);
-  assert.throws(() => config(tavily('a', 'tvly-key-1'), tavily('b', 'tvly-key-1')), /Duplicate apiKey/);
+  assert.throws(() => config(tavily('a', 'tvly-key-1'), tavily('a', 'tvly-key-2')), /Duplicate account id/);
   assert.throws(() => config({ ...exa('a', 'exa-secret-1'), allocations: [{ id: 'promo', limit: 60, period: 'once', expiresAt: '2026-11-30' }] }), /ISO expiresAt/);
 });
 
@@ -26,7 +26,7 @@ test('Balance checks are optional: periodic checks are off by default', () => {
   assert.equal(config(tavily('t', 'tvly-aaaaaaaa')).reconcileIntervalMs, 0);
 });
 
-test('Secrets can come from $ENV and !command sources and are validated after resolution', () => {
+test('Credential sources retain their syntax until local Gateway startup', () => {
   const env = { MY_TAVILY: 'tvly-from-env-123' };
   assert.equal(resolveSecret('$MY_TAVILY', 'k', { env }), 'tvly-from-env-123');
   assert.equal(resolveSecret('${MY_TAVILY}', 'k', { env }), 'tvly-from-env-123');
@@ -35,8 +35,11 @@ test('Secrets can come from $ENV and !command sources and are validated after re
   assert.throws(() => resolveSecret('$MISSING', 'k', { env }), /empty or unset/);
   assert.throws(() => resolveSecret('!x', 'k', { runCommand: () => { throw new Error('tvly-should-not-leak'); } }), (e) => !e.message.includes('tvly-should-not-leak'));
   const gateway = { host: '127.0.0.1', port: 19473, token: secret };
-  assert.equal(validateConfig({ gateway, accounts: [tavily('t', '$MY_TAVILY')] }, { env }).accounts[0].apiKey, 'tvly-from-env-123');
-  assert.throws(() => validateConfig({ gateway, accounts: [tavily('a', '$MY_TAVILY'), tavily('b', 'tvly-from-env-123')] }, { env }), /Duplicate apiKey/);
+  assert.equal(validateConfig({ gateway, accounts: [tavily('t', '$MY_TAVILY')] }).accounts[0].apiKey, '$MY_TAVILY');
+  assert.equal(config(tavily('t', '!unavailable-credential-command')).accounts[0].apiKey, '!unavailable-credential-command');
+  for (const source of [undefined, '', '$malformed source', '! ']) {
+    assert.throws(() => config(tavily('t', source)), /Missing|Malformed|Empty command/);
+  }
   // Exa onboarding bonus never expires.
   const never = validateConfig({
     gateway,

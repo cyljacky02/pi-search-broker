@@ -21,13 +21,95 @@ test('A Gateway that cannot bind its Port writes nothing and refuses broker cont
   const { port } = await owner.start({ port: 0 });
   try {
     writes = 0;
-    const contender = createGateway(cfg, { store });
+    let resolutions = 0;
+    const contender = createGateway(config(tavily('t', '!unlock-account')), {
+      store, secretOptions: { runCommand: () => { resolutions++; return 'tvly-aaaaaaaa'; } }
+    });
+    assert.equal(resolutions, 0, 'construction does not resolve credentials');
     await assert.rejects(contender.start({ port }), { code: 'EADDRINUSE' });
+    assert.equal(resolutions, 0, 'a failed bind must not execute credential commands');
     assert.equal(writes, 0, 'a failed bind must not persist Account pool state');
     await assert.rejects(contender.control.setSpent('t', 'free', 9), /Port/);
   } finally {
     await owner.stop();
   }
+});
+
+test('A Gateway validates every resolved Account credential before writing state or serving', async () => {
+  const cases = [
+    { accounts: [tavily('t', '$MISSING')], error: /empty or unset/ },
+    { accounts: [tavily('t', 'short')], error: /Missing real apiKey/ },
+    { accounts: [tavily('t', 'REPLACE_TAVILY_KEY')], error: /Missing real apiKey/ },
+    { accounts: [tavily('a', '$SHARED'), tavily('b', 'secret-without-provider-prefix')], error: /Duplicate apiKey/ },
+    { accounts: [{ ...exa('e', 'exa-aaaaaaaa'), adminKey: '$MISSING_ADMIN' }], error: /empty or unset/ },
+    { accounts: [{ ...exa('e', 'exa-aaaaaaaa'), adminKey: 'REPLACE_ADMIN_KEY' }], error: /Missing real adminKey/ },
+    { accounts: [tavily('t', '!fails')], error: /Command source.*failed/ }
+  ];
+  for (const { accounts, error } of cases) {
+    const store = memoryStore();
+    const port = await freePort();
+    const gateway = createGateway(config(...accounts), {
+      store, secretOptions: {
+        env: { SHARED: 'secret-without-provider-prefix' },
+        runCommand: () => { throw new Error('secret-without-provider-prefix'); }
+      }
+    });
+    try {
+      await assert.rejects(gateway.start({ port }), (err) => {
+        assert.match(err.message, error);
+        assert.doesNotMatch(err.message, /secret-without-provider-prefix/);
+        return true;
+      });
+      assert.equal(store.load(), null, 'credential failure leaves Account pool state untouched');
+      assert.deepEqual(await gateway.control.health(), { state: 'down' });
+      await assert.rejects(gateway.control.status(), /Port/);
+      await assertPortAvailable(port, 'credential failure releases the Port');
+    } finally { await gateway.stop(); }
+  }
+});
+
+test('A Gateway resolves Account sources once and retains resolved secrets for Attempts and balance checks', async () => {
+  const cfg = config({ ...exa('e', '$EXA_ACCOUNT'), adminKey: '!read-admin' });
+  let commands = 0;
+  const seen = [];
+  const gateway = createGateway(cfg, {
+    secretOptions: { env: { EXA_ACCOUNT: 'search-secret-without-prefix' }, runCommand: () => { commands++; return 'admin-secret-without-prefix'; } },
+    fetchImpl: async (_url, options) => { seen.push(options.headers['x-api-key']); return json({ results: [], costDollars: { total: 0.007 } }); },
+    reconcileFetch: async (_url, options) => { seen.push(options.headers['x-api-key']); return json({ credits_usd: 3 }); }
+  });
+  try {
+    const started = gateway.start({ port: 0 });
+    assert.equal(gateway.start({ port: 0 }), started, 'repeat start shares the same activation');
+    const { url } = await started;
+    assert.equal(commands, 1);
+    assert.equal((await fetch(`${url}/exa/search`, {
+      method: 'POST', headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' }, body: JSON.stringify({ query: 'q' })
+    })).status, 200);
+    assert.deepEqual(await gateway.control.reconcile(), [{ id: 'e', remaining: 3 }]);
+    assert.deepEqual(seen, ['search-secret-without-prefix', 'admin-secret-without-prefix']);
+    assert.equal(commands, 1);
+    assert.equal(cfg.accounts[0].apiKey, '$EXA_ACCOUNT', 'the input remains metadata, not resolved credentials');
+    assert.equal(cfg.accounts[0].adminKey, '!read-admin');
+    assert.doesNotMatch(JSON.stringify(await gateway.control.status()), /search-secret|admin-secret/);
+  } finally { await gateway.stop(); }
+});
+
+test('A Gateway startup error never exposes resolved Account credentials to its caller', async () => {
+  const gateway = createGateway(config({ ...exa('e', '$EXA_ACCOUNT'), adminKey: '!read-admin' }), {
+    secretOptions: { env: { EXA_ACCOUNT: 'search-secret-without-prefix' }, runCommand: () => 'admin-secret-without-prefix' },
+    store: {
+      load: () => { throw Object.assign(new Error('Could not load near search-secret-without-prefix and admin-secret-without-prefix'), { code: 'ESTORE' }); },
+      save: () => assert.fail('a failed load must not save')
+    }
+  });
+  try {
+    await assert.rejects(gateway.start({ port: 0 }), (err) => {
+      assert.equal(err.code, 'ESTORE');
+      assert.equal(err.message, 'Could not load near [redacted] and [redacted]');
+      assert.doesNotMatch(err.stack, /search-secret|admin-secret/);
+      return true;
+    });
+  } finally { await gateway.stop(); }
 });
 
 test('A Gateway loads the latest Account pool only once it owns the Port', async () => {
@@ -63,11 +145,15 @@ test('A stop that begins while start() binds wins: start rejects, nothing is wri
   let writes = 0;
   const store = { load: () => backing.load(), save: (state) => { writes++; backing.save(state); } };
   const port = await freePort();
-  const gateway = createGateway(config(tavily('t', 'tvly-aaaaaaaa')), { store });
+  let resolutions = 0;
+  const gateway = createGateway(config(tavily('t', '!unlock-account')), {
+    store, secretOptions: { runCommand: () => { resolutions++; return 'tvly-aaaaaaaa'; } }
+  });
   const starting = gateway.start({ port });
   const stopping = gateway.stop();
   await assert.rejects(starting, /shutting down/i);
   await stopping;
+  assert.equal(resolutions, 0, 'a stop before activation must not execute credential commands');
   assert.equal(writes, 0, 'the Account pool was never loaded');
   await assertPortAvailable(port, 'the Port is released');
   assert.deepEqual(await gateway.control.health(), { state: 'down' });
