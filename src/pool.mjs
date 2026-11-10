@@ -222,26 +222,16 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   }
 
   /**
-   * Check provider balances, one account (`accountId`) or all of them, sequentially (gentle on rate limits).
-   * `check(account)` returns { remaining, details }, or { skipped: reason } (nothing stored), or throws an Error
-   * with a key-free message (stored as the account's balance-check error). Report-only: local spend never changes.
+   * Record one account's balance check: `{ remaining, details }` as the provider reported it, or an Error whose
+   * key-free message is kept until the next good check. Report-only: local spend never changes. Unknown ids throw.
    */
-  async function checkBalances(accountId, check) {
-    const targets = accountId ? [byId(accountId)] : accounts;
-    const results = [];
-    for (const account of targets) {
-      let outcome;
-      try { outcome = await check(account); } catch (err) { outcome = err instanceof Error ? err : new Error(String(err)); }
-      if (outcome?.skipped) { results.push({ id: account.id, skipped: outcome.skipped }); continue; }
-      const at = new Date(now()).toISOString();
-      change(account.id, (_a, entry) => {
-        if (outcome instanceof Error) { entry.reconcileError = { at, message: outcome.message }; return; }
-        entry.providerBalance = { at, remaining: round6(outcome.remaining), details: outcome.details ?? {} };
-        delete entry.reconcileError;
-      });
-      results.push(outcome instanceof Error ? { id: account.id, error: outcome.message } : { id: account.id, remaining: outcome.remaining });
-    }
-    return results;
+  function recordBalanceCheck(accountId, outcome) {
+    const at = new Date(now()).toISOString();
+    change(accountId, (_a, entry) => {
+      if (outcome instanceof Error) { entry.reconcileError = { at, message: outcome.message }; return; }
+      entry.providerBalance = { at, remaining: round6(outcome.remaining), details: outcome.details ?? {} };
+      delete entry.reconcileError;
+    });
   }
 
   function snapshot() {
@@ -289,6 +279,6 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
       entry.allocations[allocationId].spent = round6(amount);
       enableHealth(entry, { clearCooldown: false });
     }),
-    checkBalances
+    recordBalanceCheck
   };
 }

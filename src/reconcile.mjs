@@ -4,6 +4,8 @@
 import { PROVIDERS } from './providers.mjs';
 import { createPendingWork } from './pending-work.mjs';
 
+const unknown = () => { throw new Error('Unknown account id'); };
+
 /** Whether this account can be checked against the provider at all. */
 export function canReconcile(account) {
   return account.reconcile !== false && PROVIDERS[account.provider].balance.supports(account);
@@ -26,45 +28,61 @@ export async function fetchBalance(account, { fetchImpl = fetch, timeoutMs = 100
   return balance.parse(data);
 }
 
+const SHUTDOWN = Object.freeze({ skipped: 'shutdown' });
+
 /**
- * On-demand (and, if intervalMs > 0, periodic) balance checks for the accounts in an account pool.
- * A minimum gap per account keeps repeated requests within Tavily's /usage rate limit.
+ * On-demand (and, if intervalMs > 0, periodic) balance checks for the configured `accounts`, recorded in the Account
+ * pool. A minimum gap per account keeps repeated requests within Tavily's /usage rate limit.
  * fetchImpl defaults to the real fetch: balance endpoints are different hosts from the search routes.
  */
-export function createReconciler(pool, { fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, intervalMs = 0 } = {}) {
+export function createReconciler(accounts, pool, { fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, intervalMs = 0 } = {}) {
   const lastAttempt = new Map();
   const stopping = new AbortController();
   const pending = createPendingWork();
   let timer = null;
 
-  /** One account's check, for pool.checkBalances: a balance, a skip reason, or a thrown key-free Error. */
+  /** One account's balance: { remaining, details }, an Error with a key-free message, or { skipped: reason }. */
   async function check(account) {
-    if (stopping.signal.aborted) return { skipped: 'shutdown' };
+    if (stopping.signal.aborted) return SHUTDOWN;
     if (!canReconcile(account)) return { skipped: 'not-supported' };
     if (now() - (lastAttempt.get(account.id) ?? -Infinity) < minGapMs) return { skipped: 'too-soon' };
     lastAttempt.set(account.id, now());
-    // An adapter (or response body) may ignore AbortSignal. Detach it from the pool on shutdown, and
-    // return a skip rather than throwing: checkBalances persists thrown errors as well as balances.
+    // An adapter (or a response body) may ignore AbortSignal: stop waiting for it once shutdown begins.
     let cancel;
     const cancelled = new Promise((resolve) => {
-      cancel = () => resolve({ skipped: 'shutdown' });
+      cancel = () => resolve(SHUTDOWN);
       stopping.signal.addEventListener('abort', cancel, { once: true });
     });
     try {
       const result = await Promise.race([fetchBalance(account, { fetchImpl, signal: stopping.signal }), cancelled]);
-      return stopping.signal.aborted ? { skipped: 'shutdown' } : result;
+      return stopping.signal.aborted ? SHUTDOWN : result;
     } catch (err) {
-      if (stopping.signal.aborted) return { skipped: 'shutdown' };
-      throw err;
+      if (stopping.signal.aborted) return SHUTDOWN;
+      return err instanceof Error ? err : new Error('Balance check failed');
     } finally {
       stopping.signal.removeEventListener('abort', cancel);
     }
   }
 
-  /** Results per account: { id, remaining } | { id, skipped } | { id, error }. Unknown ids throw. */
+  /**
+   * Check one account (`accountId`) or all of them, one at a time (gentle on rate limits), and record every balance
+   * or error; a skipped check records nothing. Results: { id, remaining } | { id, skipped } | { id, error }.
+   */
+  async function run(accountId) {
+    const targets = accountId ? [accounts.find((a) => a.id === accountId) ?? unknown()] : accounts;
+    const results = [];
+    for (const account of targets) {
+      const outcome = await check(account);
+      if (outcome.skipped) { results.push({ id: account.id, skipped: outcome.skipped }); continue; }
+      pool.recordBalanceCheck(account.id, outcome);
+      results.push(outcome instanceof Error ? { id: account.id, error: outcome.message } : { id: account.id, remaining: outcome.remaining });
+    }
+    return results;
+  }
+
   function reconcile(accountId) {
     if (stopping.signal.aborted) return Promise.reject(new Error('Gateway is shutting down'));
-    return pending.track(pool.checkBalances(accountId, check));
+    return pending.track(run(accountId));
   }
 
   function start() {

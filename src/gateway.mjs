@@ -79,7 +79,7 @@ export function createGateway(config, {
   function initialize() {
     if (pool) return;
     pool = createAccountPool(config.accounts, { store, now, logger });
-    reconciler = createReconciler(pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
+    reconciler = createReconciler(config.accounts, pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
     broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, clock });
     internalControl = inProcessControl({ pool, reconciler });
   }

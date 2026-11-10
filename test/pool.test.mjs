@@ -310,17 +310,19 @@ test('Admin changes validate their input', async () => {
   assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('disabled')), null);
 });
 
-test('Balance checks are stored report-only; skips store nothing; unknown ids throw', async () => {
+test('Balance checks are recorded report-only; an error keeps the last good balance; unknown ids throw', () => {
   const pool = poolOf(config(tavily('t', 'tvly-aaaaaaaa'), tavily('u', 'tvly-bbbbbbbb')));
-  const results = await pool.checkBalances(undefined, async (a) => (a.id === 't' ? { remaining: 12.3456789, details: { plan: 'x' } } : { skipped: 'too-soon' }));
-  assert.deepEqual(results, [{ id: 't', remaining: 12.3456789 }, { id: 'u', skipped: 'too-soon' }]);
-  assert.deepEqual(await pool.checkBalances('t', async () => { throw new Error('HTTP 429'); }), [{ id: 't', error: 'HTTP 429' }]);
+  pool.recordBalanceCheck('t', { remaining: 12.3456789, details: { plan: 'x' } });
+  pool.recordBalanceCheck('t', new Error('HTTP 429'));
   const [t, u] = pool.snapshot().accounts;
   assert.equal(t.providerBalance.remaining, 12.345679, 'an error keeps the last good balance');
+  assert.deepEqual(t.providerBalance.details, { plan: 'x' });
   assert.equal(t.reconcileError.message, 'HTTP 429');
   assert.equal(t.available, 1000, 'local accounting is untouched');
   assert.equal(u.providerBalance, null);
-  await assert.rejects(pool.checkBalances('nope', async () => ({ remaining: 1 })), /Unknown account id/);
+  assert.throws(() => pool.recordBalanceCheck('nope', { remaining: 1 }), /Unknown account id/);
+  pool.recordBalanceCheck('t', { remaining: 3 });
+  assert.equal(account(pool).reconcileError, null, 'a good check clears the last error');
 });
 
 const unsaved = (ending) => (err) => err instanceof StateNotSaved && err.ending === ending;
