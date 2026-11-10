@@ -9,6 +9,7 @@ import { createBroker, CLIENT_CLOSED } from './broker.mjs';
 import { inProcessControl, serveAdmin } from './control.mjs';
 import { quietLogger } from './log.mjs';
 import { createPendingWork } from './pending-work.mjs';
+import { realClock } from './clock.mjs';
 
 function suppliedToken(req) {
   const headerKey = req.headers['x-api-key'];
@@ -59,10 +60,12 @@ async function readBody(req, maxBytes = 1024 * 1024) {
 /**
  * @param store           account pool state store (default: in memory; the host and CLI pass a fileStore)
  * @param reconcileFetch  fetch for provider balance endpoints (default: the real fetch)
+ * @param clock           { now, sleep, timeout } (see clock.mjs) for everything the Gateway builds
  */
 export function createGateway(config, {
-  store = memoryStore(), fetchImpl = fetch, now = () => Date.now(), sleep, logger = null, reconcileFetch = fetch
+  store = memoryStore(), fetchImpl = fetch, clock = realClock, logger = null, reconcileFetch = fetch
 } = {}) {
+  const now = () => clock.now();
   const log = quietLogger(logger);
   let pool;
   let reconciler;
@@ -77,7 +80,7 @@ export function createGateway(config, {
     if (pool) return;
     pool = createAccountPool(config.accounts, { store, now, logger });
     reconciler = createReconciler(pool, { fetchImpl: reconcileFetch, now, intervalMs: config.reconcileIntervalMs });
-    broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, now, sleep });
+    broker = createBroker({ pool, limits: config, secrets: secretsOf(config), fetchImpl, clock });
     internalControl = inProcessControl({ pool, reconciler });
   }
 

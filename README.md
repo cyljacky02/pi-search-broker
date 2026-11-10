@@ -245,6 +245,7 @@ Layout:
 | `src/log.mjs` | `quietLogger`: an optional logger that never throws |
 | `src/pending-work.mjs` | Tracks pending work and drains the current batch; admission and cancellation stay with the caller |
 | `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |
+| `src/clock.mjs` | Time for everything that waits on it (`now`, `sleep`, `timeout`): `realClock`; tests pass a fake clock that fires timeouts on demand |
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with in-process, HTTP and offline (read-only) adapters; `connectControl` picks one |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
 | `src/host.mjs` | Process singleton, port ownership, takeover and environment wiring, used by the extension |

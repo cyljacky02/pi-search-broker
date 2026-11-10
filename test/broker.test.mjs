@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
-import { broker, config, exa, tavily, json, keyOf, secret, flakyStore, DATE } from './helpers.mjs';
+import { broker, config, exa, tavily, json, keyOf, secret, flakyStore, fakeClock } from './helpers.mjs';
 import { EFFECT, ROUTES } from '../src/providers.mjs';
 import { CLIENT_CLOSED, createBroker } from '../src/broker.mjs';
 import { createAccountPool } from '../src/pool.mjs';
@@ -213,16 +213,18 @@ test('A client closing during a 429 error-body read still applies the provider r
   assert.equal(b.status().recent.at(-1).status, 429);
 });
 
-test('An Exa 403 whose error body times out remains a refusal and is never retried', async (t) => {
-  const keepAlive = setTimeout(() => {}, 2000);
-  t.after(() => clearTimeout(keepAlive));
+test('An Exa 403 whose error body times out remains a refusal and is never retried', async () => {
+  let reading;
+  const bodyReadStarted = new Promise((resolve) => { reading = resolve; });
   let calls = 0;
-  const cfg = { ...config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb')), attemptTimeoutMs: 50 };
-  const b = broker(cfg, async (_u, opts) => {
+  const b = broker(config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb')), async (_u, opts) => {
     calls++;
-    return partialResponseUntilAbort(opts.signal, { status: 403, chunk: '{"tag":' });
+    return partialResponseUntilAbort(opts.signal, { status: 403, chunk: '{"tag":', read: { method: 'text', started: reading } });
   });
-  const res = await b.call('/exa/search', { query: 'q' });
+  const pending = b.call('/exa/search', { query: 'q' });
+  await bodyReadStarted;
+  b.clock.advance(ROUTES['/exa/search'].timeoutMs);
+  const res = await pending;
   assert.equal(res.status, 403);
   assert.equal(calls, 1);
   assert.equal(b.account(0).possiblyBilled, 0);
@@ -248,11 +250,12 @@ test('A client closing during transient backoff returns promptly without a secon
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   const cfg = config(exa('a', 'exa-key-aaaa'), exa('b', 'exa-key-bbbb'));
-  const pool = createAccountPool(cfg.accounts, { store: memoryStore(), now: () => DATE });
+  // This clock's sleep ignores the abort signal, like a careless adapter: the request must still end promptly.
+  const clock = { ...fakeClock(), sleep: () => { sleeping(); return gate; } };
+  const pool = createAccountPool(cfg.accounts, { store: memoryStore(), now: clock.now });
   let calls = 0;
-  const b = createBroker({ pool, limits: cfg, now: () => DATE,
-    fetchImpl: async () => { calls++; return json({ error: 'overloaded', tag: 'SERVICE_OVERLOADED' }, 503); },
-    sleep: () => { sleeping(); return gate; }
+  const b = createBroker({ pool, limits: cfg, clock,
+    fetchImpl: async () => { calls++; return json({ error: 'overloaded', tag: 'SERVICE_OVERLOADED' }, 503); }
   });
   const pending = b.execute(ROUTES['/exa/search'], { query: 'q' }, { signal: client.signal });
   await sleepStarted;
@@ -443,16 +446,19 @@ test('Attempt timeout is possibly billed, never cools down, and is never retried
   assert.equal(a.requests, 0);
 });
 
-test('An attempt deadline reported by fetch as AbortError remains a 504 timeout', async (t) => {
-  const keepAlive = setTimeout(() => {}, 2000);
-  t.after(() => clearTimeout(keepAlive));
+test('An attempt deadline reported by fetch as AbortError remains a 504 timeout', async () => {
+  let fetching;
+  const fetchStarted = new Promise((resolve) => { fetching = resolve; });
   let calls = 0;
-  const cfg = { ...config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), attemptTimeoutMs: 50 };
-  const b = broker(cfg, (_u, opts) => new Promise((_resolve, reject) => {
+  const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), (_u, opts) => new Promise((_resolve, reject) => {
     calls++;
     opts.signal.addEventListener('abort', () => reject(new DOMException('request aborted', 'AbortError')), { once: true });
+    fetching();
   }));
-  const res = await b.call('/tavily/search', { query: 'q' });
+  const pending = b.call('/tavily/search', { query: 'q' });
+  await fetchStarted;
+  b.clock.advance(ROUTES['/tavily/search'].timeoutMs);
+  const res = await pending;
   assert.equal(res.status, 504);
   assert.match(res.body.detail.error, /not retried to avoid double billing/);
   assert.equal(calls, 1);
@@ -501,16 +507,18 @@ test('A client closing while reading a 2xx body is client-closed and possibly bi
   assert.equal(b.status().recent.at(-1).status, 'client-closed');
 });
 
-test('A timeout while reading a 2xx body is a timeout and possibly billed even if the stream throws AbortError', async (t) => {
-  const keepAlive = setTimeout(() => {}, 2000); // AbortSignal.timeout uses an unref'ed timer.
-  t.after(() => clearTimeout(keepAlive));
+test('A timeout while reading a 2xx body is a timeout and possibly billed even if the stream throws AbortError', async () => {
+  let reading;
+  const bodyReadStarted = new Promise((resolve) => { reading = resolve; });
   let calls = 0;
-  const cfg = { ...config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), attemptTimeoutMs: 50 };
-  const b = broker(cfg, async (_u, opts) => {
+  const b = broker(config(tavily('t-a', 'tvly-aaaaaaaa'), tavily('t-b', 'tvly-bbbbbbbb')), async (_u, opts) => {
     calls++;
-    return partialResponseUntilAbort(opts.signal, { status: 200, chunk: '{"results":' });
+    return partialResponseUntilAbort(opts.signal, { status: 200, chunk: '{"results":', read: { method: 'json', started: reading } });
   });
-  const res = await b.call('/tavily/search', { query: 'q' });
+  const pending = b.call('/tavily/search', { query: 'q' });
+  await bodyReadStarted;
+  b.clock.advance(ROUTES['/tavily/search'].timeoutMs);
+  const res = await pending;
   assert.equal(res.status, 504);
   assert.match(res.body.detail.error, /not retried to avoid double billing/);
   assert.equal(calls, 1);

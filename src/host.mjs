@@ -11,6 +11,7 @@ import { fileStore } from './pool/store.mjs';
 import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig } from './config.mjs';
 import { baseUrl, probeHealth, connectControl } from './control.mjs';
 import { piWebSearchConfigPath, readPiWebSearchConfig, piWiringIssues } from './doctor.mjs';
+import { realClock } from './clock.mjs';
 
 const HOST_KEY = Symbol.for('pi-search-broker.host');
 const PROBE_CACHE_MS = 3000;
@@ -130,7 +131,7 @@ export class BrokerHost {
   listen(config) {
     const gateway = createGateway(config, {
       store: this.store ?? fileStore(this.statePath), fetchImpl: this.fetchImpl, reconcileFetch: this.fetchImpl,
-      now: this.now, logger: this.logger
+      clock: { ...realClock, now: this.now }, logger: this.logger
     });
     return new Promise((resolve, reject) => {
       const onError = (err) => { gateway.shutdown().catch(() => {}); reject(err); };

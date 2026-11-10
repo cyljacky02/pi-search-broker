@@ -7,6 +7,7 @@
 //  - an Attempt whose ending cannot be saved stops the request: aborted if it may have cost money, else paused.
 import { PROVIDERS, ACTION, EFFECT, EXHAUST } from './providers.mjs';
 import { POSSIBLY_BILLED, ENDING, StateNotSaved } from './pool.mjs';
+import { realClock } from './clock.mjs';
 
 /** Status returned when the caller aborted: nobody is listening, so there is nothing to send. */
 export const CLIENT_CLOSED = 499;
@@ -14,13 +15,8 @@ export const CLIENT_CLOSED = 499;
 const MAX_ERROR_BODY = 64 * 1024;
 const STREAM_REJECTED = 'Streaming responses (stream: true) are not supported by the local search broker';
 const PRE_DELIVERY_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
-const defaultSleep = (ms, signal) => new Promise((resolve) => {
-  if (signal.aborted) return resolve();
-  const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
-  const timer = setTimeout(done, ms);
-  signal.addEventListener('abort', done, { once: true });
-});
 
+// A clock adapter's sleep may ignore the signal; never let a backoff outlive the client or the deadline.
 async function sleepUnlessAborted(sleep, ms, signal) {
   if (signal.aborted) return;
   let onAbort;
@@ -59,8 +55,10 @@ async function readErrorJson(response) {
  * @param pool      account pool (see pool.mjs): attempt(route, estimate, excludedIds, use) runs `use` on a Reservation
  * @param limits    { totalTimeoutMs, attemptTimeoutMs?, maxTransientRetries }
  * @param secrets   strings to redact from anything returned to the client
+ * @param clock     { now, sleep, timeout } (see clock.mjs): the attempt timeout, the deadline and backoff all run on it
  */
-export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, now = () => Date.now(), sleep = defaultSleep }) {
+export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, clock = realClock }) {
+  const now = () => clock.now();
   /** Run one request. Never throws for upstream behaviour or unsaved account state; always returns { status, body }. */
   async function execute(route, body, { headers = {}, signal } = {}) {
     const policy = PROVIDERS[route.provider];
@@ -78,7 +76,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
     async function attemptOn(reservation) {
       const prepared = policy.prepare(body, reservation.account, headers);
       const attemptMs = Math.max(1, Math.min(limits.attemptTimeoutMs ?? route.timeoutMs, deadline - now()));
-      const timeoutSignal = AbortSignal.timeout(attemptMs);
+      const timeoutSignal = clock.timeout(attemptMs);
 
       // Fetch and successful-body reads share this settlement; client closure takes precedence over timeout.
       function settleInterruption(err) {
@@ -168,7 +166,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
     }
 
     const maxWaitMs = Math.max(0, deadline - now());
-    const deadlineSignal = AbortSignal.timeout(maxWaitMs);
+    const deadlineSignal = clock.timeout(maxWaitMs);
     while (now() < deadline && !clientGone.aborted && !deadlineSignal.aborted) {
       let step;
       try {
@@ -184,7 +182,7 @@ export function createBroker({ pool, limits, secrets = [], fetchImpl = fetch, no
       // ACTION.RETRY (Exa 503 SERVICE_OVERLOADED, not billed): back off and retry without penalising the account.
       if (transientRetries >= limits.maxTransientRetries) break;
       transientRetries++;
-      await sleepUnlessAborted(sleep, Math.min(250 * 2 ** (transientRetries - 1), Math.max(0, deadline - now())), AbortSignal.any([clientGone, deadlineSignal]));
+      await sleepUnlessAborted((ms, s) => clock.sleep(ms, s), Math.min(250 * 2 ** (transientRetries - 1), Math.max(0, deadline - now())), AbortSignal.any([clientGone, deadlineSignal]));
     }
 
     if (clientGone.aborted) return { status: CLIENT_CLOSED, body: null };
