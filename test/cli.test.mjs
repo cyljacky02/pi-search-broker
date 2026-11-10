@@ -1,30 +1,29 @@
 // CLI and the shared account-command parser, through main() with an in-process control and a loopback Gateway.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { main } from '../src/cli.mjs';
 import { parseCommand, runCommand, usage } from '../src/commands.mjs';
 import { createGateway } from '../src/gateway.mjs';
-import { offlineControl } from '../src/control.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { tavily, secret, freePort, assertPortAvailable } from './helpers.mjs';
-import { memoryStore } from '../src/pool/store.mjs';
+import { memoryStore, fileStore } from '../src/pool/store.mjs';
 
-async function setup({ store } = {}) {
+async function setup({ store, reconcileFetch } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-cli-'));
   const configPath = join(dir, 'config.json');
   writeFileSync(configPath, JSON.stringify({ gateway: { host: '127.0.0.1', port: 19473, token: secret }, accounts: [tavily('t', 'tvly-aaaaaaaa')] }));
-  const gateway = createGateway(loadConfig(configPath), { store });
-  await gateway.start({ port: 0 });
+  const gateway = createGateway(loadConfig(configPath), { store: store ?? fileStore(join(dir, 'pool-state.json')), reconcileFetch });
+  const { url } = await gateway.start({ port: 0 });
   const lines = { out: [], err: [] };
   const run = (...argv) => main([...argv, '--config', configPath], {
     out: (l) => lines.out.push(l), err: (l) => lines.err.push(l), env: {}, connect: async () => gateway.control
   });
   const cleanup = async () => { await gateway.stop(); rmSync(dir, { recursive: true, force: true }); };
-  return { dir, configPath, gateway, lines, run, cleanup };
+  return { dir, configPath, gateway, url, lines, run, cleanup };
 }
 
 test('The command parser validates arguments the same way for the CLI and /broker', () => {
@@ -51,6 +50,41 @@ test('CLI account commands run against the control and report results', async ()
     assert.equal(await run('status'), 0);
     assert.match(lines.out.at(-1), /^Search broker \(live @ http:\/\/127\.0\.0\.1:19473\)/);
     assert.match(lines.out.at(-1), /t \[tavily\] active/);
+  } finally { await cleanup(); }
+});
+
+test('CLI inspection and remote Broker control need no Account credentials or credential commands', async () => {
+  const { dir, configPath, url, cleanup } = await setup({
+    reconcileFetch: async () => Response.json({ account: { plan_usage: 0, plan_limit: 1000 } })
+  });
+  const marker = join(dir, 'credentials-used');
+  const script = join(dir, 'credential.cjs');
+  writeFileSync(script, `require('node:fs').writeFileSync(process.argv[2], 'used'); process.stdout.write('provider-key-from-command');`);
+  writeFileSync(join(dir, 'web-search.json'), JSON.stringify({
+    exaApiKey: '$PI_SEARCH_BROKER_TOKEN', tavilyApiKey: '$PI_SEARCH_BROKER_TOKEN',
+    exaBaseUrl: `${url}/exa`, tavilyBaseUrl: `${url}/tavily`
+  }));
+  const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+  cfg.gateway.port = Number(new URL(url).port);
+  try {
+    for (const source of ['$MISSING_ACCOUNT_CREDENTIAL', `!"${process.execPath}" "${script}" "${marker}"`]) {
+      cfg.accounts[0].apiKey = source;
+      writeFileSync(configPath, JSON.stringify(cfg));
+      for (const words of [['status'], ['fragment'], ['doctor'], ['disable', 't'], ['enable', 't'], ['set-spent', 't', 'free', '230'], ['reconcile']]) {
+        const [command] = words;
+        const out = [];
+        const err = [];
+        const code = await main([...words, '--config', configPath], {
+          out: (line) => out.push(line), err: (line) => err.push(line),
+          env: { PI_CODING_AGENT_DIR: dir, PI_SEARCH_BROKER_TOKEN: secret }
+        });
+        assert.equal(code, 0, `${command}: ${err.join('\n')} ${out.join('\n')}`);
+        if (command === 'status') assert.match(out.join('\n'), /t \[tavily\] active/);
+        if (command === 'fragment') assert.equal(JSON.parse(out[0]).tavilyBaseUrl, `${url}/tavily`);
+        if (command === 'doctor') assert.match(out.join('\n'), /Gateway is running/);
+        assert.equal(existsSync(marker), false, `${command} must not execute the credential command`);
+      }
+    }
   } finally { await cleanup(); }
 });
 
@@ -118,18 +152,48 @@ test('serve drains on the first Ctrl+C: an in-flight search finishes and is save
   }
 });
 
-test('Offline: status reads state.json, changes are refused so only a running gateway writes state', async () => {
-  const { dir, configPath, cleanup } = await setup();
-  const config = loadConfig(configPath);
-  const offline = offlineControl(config, { statePath: join(dir, 'pool-state.json') });
+test('Offline CLI inspection needs no Account credentials and never writes the saved state', async () => {
+  const { dir, configPath, gateway, url, cleanup } = await setup();
   const lines = { out: [], err: [] };
   const run = (...argv) => main([...argv, '--config', configPath], {
-    out: (l) => lines.out.push(l), err: (l) => lines.err.push(l), env: {}, connect: async () => offline
+    out: (l) => lines.out.push(l), err: (l) => lines.err.push(l), env: {}
   });
   try {
+    await gateway.control.setSpent('t', 'free', 230);
+    await gateway.stop();
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+    cfg.gateway.port = Number(new URL(url).port);
+    cfg.accounts[0].apiKey = '$MISSING_ACCOUNT_CREDENTIAL';
+    writeFileSync(configPath, JSON.stringify(cfg));
+    const statePath = join(dir, 'pool-state.json');
+    const before = readFileSync(statePath, 'utf8');
     assert.equal(await run('status'), 0);
     assert.match(lines.out.at(-1), /^Search broker \(offline, from the state file/);
+    assert.match(lines.out.at(-1), /770cr/);
     assert.equal(await run('enable', 't'), 1);
     assert.match(lines.err.at(-1), /gateway is not running/);
+    assert.equal(readFileSync(statePath, 'utf8'), before, 'offline control never saves');
+
+    assert.equal(await run('serve'), 1, 'local startup still requires all Account credentials');
+    assert.match(lines.err.at(-1), /ACCOUNT_CREDENTIAL.*empty or unset/);
+    await assertPortAvailable(cfg.gateway.port, 'a credential failure releases the Port');
+    assert.equal(readFileSync(statePath, 'utf8'), before, 'failed startup leaves saved spend unchanged');
+  } finally { await cleanup(); }
+});
+
+test('CLI inspection still rejects malformed Account metadata', async () => {
+  const { configPath, cleanup } = await setup();
+  const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+  cfg.accounts[0].apiKey = '$MISSING_ACCOUNT_CREDENTIAL';
+  cfg.accounts[0].allocations[0].limit = -1;
+  writeFileSync(configPath, JSON.stringify(cfg));
+  try {
+    for (const command of ['status', 'fragment', 'doctor']) {
+      const lines = [];
+      const code = await main([command, '--config', configPath], { out: (s) => lines.push(s), err: (s) => lines.push(s), env: {} });
+      assert.equal(code, 1);
+      assert.match(lines.join('\n'), /Invalid allocation limit/);
+      assert.doesNotMatch(lines.join('\n'), /empty or unset/);
+    }
   } finally { await cleanup(); }
 });

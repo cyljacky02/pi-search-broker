@@ -103,7 +103,8 @@ export async function runDoctor({ config, configError, control, env = process.en
     return checks;
   }
   const byProvider = (p) => config.accounts.filter((a) => a.provider === p).length;
-  add('ok', `Broker config valid: ${byProvider('exa')} Exa and ${byProvider('tavily')} Tavily account(s)`);
+  add('ok', `Broker config structure valid: ${byProvider('exa')} Exa and ${byProvider('tavily')} Tavily account(s)`);
+  add('info', 'Provider credentials are checked only at local Gateway startup; doctor does not resolve them.');
   if (config.attemptTimeoutMs !== undefined && config.attemptTimeoutMs < 20000) {
     add('warn', `attemptTimeoutMs is ${config.attemptTimeoutMs} ms; slow searches will time out. Remove it to use the 30 s per-route default.`);
   }

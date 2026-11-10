@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
@@ -86,6 +86,100 @@ test('First host owns the port, a second process is a client, and takes over whe
   } finally {
     await a.release(); await b.release();
     cleanup();
+  }
+});
+
+test('A client can control the Port owner without credentials but must resolve them before takeover', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const owner = new BrokerHost({ configPath, env: {}, store: memoryStore() });
+  const env = { PI_CODING_AGENT_DIR: agentDir };
+  const time = { ms: Date.now() };
+  const store = memoryStore();
+  const seen = [];
+  const client = new BrokerHost({ configPath, env, store, now: () => time.ms, fetchImpl: async (url, options) => {
+    if (String(url).startsWith('http://127.0.0.1')) return fetch(url, options);
+    seen.push(options.headers.Authorization);
+    return Response.json({ results: [], usage: { credits: 1 } });
+  } });
+  try {
+    assert.equal((await owner.acquire()).role, 'owner');
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+    cfg.accounts[0].apiKey = '$ACCOUNT_CREDENTIAL';
+    writeFileSync(configPath, JSON.stringify(cfg));
+    const joined = await client.acquire();
+    assert.equal(joined.role, 'client');
+    await joined.control.disable('tavily-1');
+    assert.equal((await owner.view.control.status()).accounts[0].status, 'manual');
+    await joined.control.enable('tavily-1');
+    assert.equal(store.load(), null, 'a client never constructs a writing Account pool');
+
+    await owner.release();
+    time.ms += 5000;
+    const failed = await client.ensure();
+    assert.equal(failed.role, 'offline');
+    assert.match(failed.issue.message, /ACCOUNT_CREDENTIAL.*empty or unset/);
+    assert.equal(store.load(), null, 'failed credential resolution writes no Account pool state');
+    assert.equal((await failed.control.status()).accounts[0].id, 'tavily-1', 'offline inspection still works');
+    await assertPortAvailable(port, 'failed takeover releases the Port');
+
+    env.ACCOUNT_CREDENTIAL = 'account-secret-without-prefix';
+    assert.equal((await client.ensure()).role, 'owner', 'a later takeover retries the current credential source');
+    const response = await fetch(`http://127.0.0.1:${port}/tavily/search`, {
+      method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify({ query: 'q' })
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(seen, ['Bearer account-secret-without-prefix']);
+    assert.equal((await client.view.control.status()).accounts[0].allocations[0].spent, 1);
+  } finally {
+    await client.release(); await owner.release(); cleanup();
+  }
+});
+
+test('Doctor on an idle process neither starts a Gateway nor caches configuration for the next session', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const host = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: agentDir }, store: memoryStore() });
+  try {
+    const checks = await host.doctor();
+    assert.ok(checks.some((c) => /Gateway is not running/.test(c.message)));
+    assert.equal(host.view.role, 'idle');
+    await assertPortAvailable(port);
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+    cfg.accounts[0].id = 'replacement-account';
+    writeFileSync(configPath, JSON.stringify(cfg));
+    const view = await host.acquire();
+    assert.equal(view.role, 'owner');
+    assert.equal((await view.control.status()).accounts[0].id, 'replacement-account');
+  } finally { await host.release(); cleanup(); }
+});
+
+test('A client doctor inspects the Gateway without running credentials or taking over', async () => {
+  const { configPath, port, dir, agentDir, cleanup } = await setup();
+  writeFileSync(join(agentDir, 'web-search.json'), JSON.stringify({
+    exaApiKey: '$PI_SEARCH_BROKER_TOKEN', tavilyApiKey: '$PI_SEARCH_BROKER_TOKEN'
+  }));
+  const owner = new BrokerHost({ configPath, env: {}, store: memoryStore() });
+  const time = { ms: Date.now() };
+  const client = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: agentDir }, now: () => time.ms });
+  const marker = join(dir, 'credentials-used');
+  const script = join(dir, 'credential.cjs');
+  writeFileSync(script, `require('node:fs').writeFileSync(process.argv[2], 'used'); process.stdout.write('provider-key-from-command');`);
+  try {
+    assert.equal((await owner.acquire()).role, 'owner');
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+    cfg.accounts[0].apiKey = `!"${process.execPath}" "${script}" "${marker}"`;
+    writeFileSync(configPath, JSON.stringify(cfg));
+    assert.equal((await client.acquire()).role, 'client');
+    assert.equal(existsSync(marker), false, 'joining does not unlock Account credentials');
+    assert.ok((await client.doctor()).some((c) => c.level === 'ok' && /Gateway is running/.test(c.message)));
+    await owner.release();
+    time.ms += 5000;
+    const checks = await client.doctor();
+    assert.ok(checks.some((c) => /Gateway is not running/.test(c.message)));
+    assert.equal(existsSync(marker), false, 'doctor must not execute a credential command');
+    assert.equal(client.view.role, 'client', 'inspection must not change the Port owner decision');
+    await assertPortAvailable(port, 'doctor must not start a local Gateway');
+  } finally {
+    await client.release(); await owner.release(); cleanup();
   }
 });
 

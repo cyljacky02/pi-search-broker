@@ -10,7 +10,7 @@ export const SERVICE_NAME = 'pi-search-broker';
 export const LEGACY_SERVICE_NAMES = Object.freeze(['pi-dual-key-manager']);
 /** Config folder name, kept from before the product rename so existing configs and account state are still found. */
 export const CONFIG_DIR_NAME = 'pi-dual-key-manager';
-export const VERSION = '0.4.0';
+export const VERSION = '0.4.1';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
 export const TOKEN_ENV = 'PI_SEARCH_BROKER_TOKEN';
 /** Optional override for the broker config path (used by the CLI default and the pi extension). */
@@ -54,6 +54,16 @@ function defaultRunCommand(command) {
   });
 }
 
+function secretSource(value, label) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`Missing ${label}`);
+  const source = value.trim();
+  if (source.startsWith('!') && !source.slice(1).trim()) throw new Error(`Empty command source for ${label}`);
+  if (source.startsWith('$') && !source.startsWith('$$') && !source.startsWith('$!') && !parseEnvSource(source)) {
+    throw new Error(`Malformed environment source for ${label}`);
+  }
+  return source;
+}
+
 /**
  * Resolve a secret using the same source syntax as pi and pi-web-access:
  * "$NAME" / "${NAME}" reads an environment variable, "!command" runs a trusted local command,
@@ -61,12 +71,10 @@ function defaultRunCommand(command) {
  * Errors never include the secret value or the command text.
  */
 export function resolveSecret(value, label, { env = process.env, runCommand = defaultRunCommand } = {}) {
-  if (typeof value !== 'string' || !value.trim()) throw new Error(`Missing ${label}`);
-  const source = value.trim();
+  const source = secretSource(value, label);
   if (source.startsWith('$$') || source.startsWith('$!')) return source.slice(1);
   if (source.startsWith('!')) {
     const command = source.slice(1).trim();
-    if (!command) throw new Error(`Empty command source for ${label}`);
     let out;
     try { out = runCommand(command); } catch { throw new Error(`Command source for ${label} failed`); }
     const resolved = String(out ?? '').trim();
@@ -75,7 +83,6 @@ export function resolveSecret(value, label, { env = process.env, runCommand = de
   }
   if (source.startsWith('$')) {
     const name = parseEnvSource(source);
-    if (!name) throw new Error(`Malformed environment source for ${label}`);
     const resolved = env[name]?.trim();
     if (!resolved) throw new Error(`Environment variable ${name} for ${label} is empty or unset`);
     return resolved;
@@ -92,7 +99,8 @@ function intInRange(value, name, min, max, fallback, { allowZero = false } = {})
   return value;
 }
 
-export function validateConfig(input, secretOptions = {}) {
+/** Validate and normalize metadata and credential source syntax, without reading secrets or running commands. */
+export function validateConfig(input) {
   if (!isObj(input)) throw new Error('Config must be an object');
   const gateway = input.gateway;
   if (!isObj(gateway)) throw new Error('Missing gateway settings');
@@ -107,7 +115,6 @@ export function validateConfig(input, secretOptions = {}) {
   }
   if (!Array.isArray(input.accounts) || input.accounts.length === 0) throw new Error('Add at least one account');
   const ids = new Set();
-  const keys = new Set();
   const accounts = [];
   for (const account of input.accounts) {
     if (!isObj(account)) throw new Error('Each account must be an object');
@@ -117,15 +124,11 @@ export function validateConfig(input, secretOptions = {}) {
     if (ids.has(account.id)) throw new Error(`Duplicate account id: ${account.id}`);
     ids.add(account.id);
     if (!['exa', 'tavily'].includes(account.provider)) throw new Error(`Invalid provider on ${account.id}`);
-    const apiKey = resolveSecret(account.apiKey, `apiKey of ${account.id}`, secretOptions);
-    if (apiKey.length < 8 || PLACEHOLDER.test(apiKey)) throw new Error(`Missing real apiKey for ${account.id}`);
-    if (keys.has(apiKey)) throw new Error(`Duplicate apiKey (possible shared quota) for ${account.id}`);
-    keys.add(apiKey);
+    const apiKey = secretSource(account.apiKey, `apiKey of ${account.id}`);
     let adminKey;
     if (account.adminKey !== undefined) {
       if (account.provider !== 'exa') throw new Error(`adminKey is only supported for Exa accounts (${account.id})`);
-      adminKey = resolveSecret(account.adminKey, `adminKey of ${account.id}`, secretOptions);
-      if (PLACEHOLDER.test(adminKey)) throw new Error(`Missing real adminKey for ${account.id}`);
+      adminKey = secretSource(account.adminKey, `adminKey of ${account.id}`);
     }
     if (account.projectId !== undefined) {
       if (account.provider !== 'tavily') throw new Error(`projectId is only supported for Tavily accounts (${account.id})`);
@@ -176,14 +179,31 @@ export function validateConfig(input, secretOptions = {}) {
   return { ...input, gateway: { ...gateway, host }, accounts, attemptTimeoutMs, totalTimeoutMs, maxTransientRetries, reconcileIntervalMs, pi };
 }
 
-export function loadConfig(path = defaultConfigPath(), secretOptions = {}) {
+/** Resolve and validate all Account credentials for local Gateway startup; inspection never calls this. */
+export function resolveAccountCredentials(config, secretOptions = {}) {
+  const keys = new Set();
+  const accounts = config.accounts.map((account) => {
+    const apiKey = resolveSecret(account.apiKey, `apiKey of ${account.id}`, secretOptions);
+    if (apiKey.length < 8 || PLACEHOLDER.test(apiKey)) throw new Error(`Missing real apiKey for ${account.id}`);
+    if (keys.has(apiKey)) throw new Error(`Duplicate apiKey (possible shared quota) for ${account.id}`);
+    keys.add(apiKey);
+    if (account.adminKey === undefined) return { ...account, apiKey };
+    const adminKey = resolveSecret(account.adminKey, `adminKey of ${account.id}`, secretOptions);
+    if (PLACEHOLDER.test(adminKey)) throw new Error(`Missing real adminKey for ${account.id}`);
+    return { ...account, apiKey, adminKey };
+  });
+  return { ...config, accounts };
+}
+
+/** Read validated metadata. Provider credentials remain sources until a local Gateway starts. */
+export function loadConfig(path = defaultConfigPath()) {
   let config;
   try { config = JSON.parse(readFileSync(path, 'utf8')); }
   catch (err) {
     if (err.code === 'ENOENT') throw Object.assign(new Error(`Missing config; run npm run init first: ${path}`), { code: 'ENOCONFIG' });
     throw new Error('Unable to read/parse private config; check path, permissions and JSON syntax');
   }
-  return validateConfig(config, secretOptions);
+  return validateConfig(config);
 }
 
 export function webSearchFragment(gateway) {

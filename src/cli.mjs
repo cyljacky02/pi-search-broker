@@ -62,19 +62,19 @@ export async function main(argv, {
     if (cmd === 'doctor') {
       let config;
       let configError;
-      try { config = loadConfig(configPath, { env }); } catch (e) { configError = e.message; }
+      try { config = loadConfig(configPath); secrets = secretsOf(config); } catch (e) { configError = e.message; }
       const control = config ? await connect({ config, statePath: defaultStatePath(configPath), fetchImpl }) : null;
       const checks = await runDoctor({ config, configError, control, env });
       out(formatChecks(checks));
       return checks.some((c) => c.level === 'error') ? 1 : 0;
     }
 
-    const config = loadConfig(configPath, { env });
+    const config = loadConfig(configPath);
     secrets = secretsOf(config);
     if (cmd === 'fragment') { out(JSON.stringify(webSearchFragment(config.gateway), null, 2)); return 0; }
     if (cmd === 'serve') {
       const gateway = createGateway(config, {
-        store: fileStore(defaultStatePath(configPath)), fetchImpl, reconcileFetch: fetchImpl,
+        store: fileStore(defaultStatePath(configPath)), fetchImpl, reconcileFetch: fetchImpl, secretOptions: { env },
         logger: (line) => out(`${new Date().toISOString()} ${line}`)
       });
       try {
