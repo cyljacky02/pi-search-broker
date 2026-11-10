@@ -7,11 +7,9 @@ import { execSync } from 'node:child_process';
 
 /** Product name, reported as the gateway's /health service id. */
 export const SERVICE_NAME = 'pi-search-broker';
-/** Service ids of earlier releases that a health probe still accepts, so mixed-version pi processes share one gateway. */
-export const LEGACY_SERVICE_NAMES = Object.freeze(['pi-dual-key-manager']);
-/** Config folder name, kept from before the product rename so existing configs and account state are still found. */
-export const CONFIG_DIR_NAME = 'pi-dual-key-manager';
-export const VERSION = '0.5.0';
+/** Config folder name under ~/.config. */
+export const CONFIG_DIR_NAME = SERVICE_NAME;
+export const VERSION = '0.6.0';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
 export const TOKEN_ENV = 'PI_SEARCH_BROKER_TOKEN';
 /** Optional override for the broker config path (used by the CLI default and the pi extension). */
@@ -64,7 +62,7 @@ export function literalKeyOf(source) {
 /** The literal source for a key, escaping a leading $ or ! so it is never read as an env or command source. */
 export const literalSourceOf = (key) => (/^[$!]/.test(key) ? `$${key}` : key);
 
-/** Whether a credential source is still an unedited example value, such as the ones `init` writes. */
+/** Whether a credential source is still an unedited example value, such as the REPLACE_… keys older `init`s wrote. */
 export function isPlaceholderSource(source) {
   const key = literalKeyOf(source);
   return key !== null && PLACEHOLDER.test(key);
@@ -131,7 +129,7 @@ function intInRange(value, name, min, max, fallback, { allowZero = false } = {})
 
 /**
  * Validate one Allocation's limit, period and dates (not its id). `where` names it in errors:
- * "exa-1/promo", or "the imported Allocation" before its Account exists.
+ * "exa-1/promo" in config.json, or "allocation promo" on a key file's settings line.
  */
 export function validateAllocation(bucket, where) {
   if (typeof bucket.limit !== 'number' || !Number.isFinite(bucket.limit) || bucket.limit <= 0) {
@@ -162,10 +160,11 @@ export function validateConfig(input) {
   if (typeof gateway.token !== 'string' || gateway.token.length < 24 || /REPLACE|CHANGE_ME/i.test(gateway.token) || /[^\x21-\x7e]/.test(gateway.token)) {
     throw new Error('gateway.token must be a secure random secret of 24+ printable characters');
   }
-  if (!Array.isArray(input.accounts) || input.accounts.length === 0) throw new Error('Add at least one account');
+  // Accounts may also come from key files (keys.mjs), so config.json may list none.
+  if (input.accounts !== undefined && !Array.isArray(input.accounts)) throw new Error('accounts must be a list');
   const ids = new Set();
   const accounts = [];
-  for (const account of input.accounts) {
+  for (const account of input.accounts ?? []) {
     if (!isObj(account)) throw new Error('Each account must be an object');
     if (typeof account.id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(account.id)) {
       throw new Error('Invalid account id: use letters, digits, _, - (max 64)');
@@ -249,6 +248,12 @@ export function saveConfig(path, config) {
   atomicWriteJson(path, config);
 }
 
+/** Remove the given Accounts from the config file, keeping everything else as written. */
+export function removeAccounts(path, ids) {
+  const config = readConfigFile(path);
+  saveConfig(path, { ...config, accounts: (config.accounts ?? []).filter((a) => !ids.includes(a?.id)) });
+}
+
 export function webSearchFragment(gateway) {
   const base = `http://${gateway.host === '::1' ? '[::1]' : gateway.host}:${gateway.port}`;
   return {
@@ -261,29 +266,31 @@ export function webSearchFragment(gateway) {
   };
 }
 
+/** The loopback port a new config uses. */
+export const DEFAULT_PORT = 19473;
+
+/**
+ * Create a private config (mode 0600) with a fresh Gateway token and no Accounts: Accounts come from key files.
+ * Never overwrites. `port` is for tests that must not use the real one. Returns the new config.
+ */
+export function createConfig(path = defaultConfigPath(), { port = DEFAULT_PORT } = {}) {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const config = { gateway: { host: '127.0.0.1', port, token: randomBytes(32).toString('hex') }, accounts: [] };
+  try { writeFileSync(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' }); }
+  catch (err) { throw err.code === 'EEXIST' ? new Error(`Config already exists: ${path}. Refusing to overwrite.`) : err; }
+  chmodSync(path, 0o600);
+  return config;
+}
+
+/** `init`: create the config and the standalone-mode web-search fragment that matches its token. Never overwrites. */
 export function writeFirstConfig(path = defaultConfigPath()) {
   if (existsSync(path)) throw new Error(`Config already exists: ${path}. Refusing to overwrite.`);
-  if (existsSync(join(dirname(path), 'web-search.fragment.json'))) {
+  const out = join(dirname(path), 'web-search.fragment.json');
+  if (existsSync(out)) {
     throw new Error('Existing web-search.fragment.json found; refusing to generate mismatched token. Move it safely first.');
   }
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const token = randomBytes(32).toString('hex');
-  const example = {
-    gateway: { host: '127.0.0.1', port: 19473, token },
-    accounts: [
-      { id: 'exa-promo-01', provider: 'exa', apiKey: 'REPLACE_EXA_KEY', allocations: [
-        { id: 'promo', limit: 60, period: 'once', expiresAt: '2026-12-01T00:00:00Z' },
-        { id: 'free', limit: 10, period: 'monthly', startsAt: '2026-12-01T00:00:00Z' }
-      ] },
-      { id: 'tavily-free-01', provider: 'tavily', apiKey: 'REPLACE_TAVILY_KEY', allocations: [
-        { id: 'free', limit: 1000, period: 'monthly' }
-      ] }
-    ]
-  };
-  writeFileSync(path, JSON.stringify(example, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
-  chmodSync(path, 0o600);
-  const out = join(dirname(path), 'web-search.fragment.json');
-  writeFileSync(out, JSON.stringify(webSearchFragment(example.gateway), null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+  const config = createConfig(path);
+  writeFileSync(out, JSON.stringify(webSearchFragment(config.gateway), null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   chmodSync(out, 0o600);
   return { configPath: path, fragmentPath: out };
 }

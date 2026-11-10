@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
-import { BrokerHost } from '../src/host.mjs';
+import { TestHost as BrokerHost } from './helpers.mjs';
 import { createExtension } from '../extension/index.js';
 import { runDoctor, describeKey, piWebSearchConfigPath } from '../src/doctor.mjs';
 import { loadConfig } from '../src/config.mjs';
@@ -48,6 +48,8 @@ async function setup(avoidPort = null) {
 
 test('First host owns the port, a second process is a client, and takes over when the owner leaves', async () => {
   const { configPath, port, agentDir, cleanup } = await setup();
+  // Key settings that are set are never changed by the host, so their problems surface as warnings.
+  writeFileSync(join(agentDir, 'web-search.json'), JSON.stringify({ exaApiKey: '$EXA_API_KEY', tavilyApiKey: '$TAVILY_UNSET' }));
   const envA = { PI_CODING_AGENT_DIR: agentDir, TAVILY_API_KEY_1: 'tvly-real-pool-key', EXA_API_KEY: 'exa-real' };
   const envB = { PI_CODING_AGENT_DIR: agentDir };
   const time = { ms: Date.now() };
@@ -64,7 +66,7 @@ test('First host owns the port, a second process is a client, and takes over whe
     assert.equal(envA.EXA_API_KEY, 'exa-real');
     assert.equal(envA.TAVILY_API_KEY_1, 'tvly-real-pool-key');
     const notes = a.takeNotes().join('\n');
-    assert.match(notes, /exa: key from EXA_API_KEY is NOT the broker token.*"exaApiKey": "\$PI_SEARCH_BROKER_TOKEN"/);
+    assert.match(notes, /exa: key from environment variable EXA_API_KEY is NOT the broker token.*"exaApiKey": "\$PI_SEARCH_BROKER_TOKEN"/);
     assert.match(notes, /tavily: no key resolves/);
     assert.match(notes, /TAVILY_API_KEY_n/);
     assert.ok(!notes.includes('exa-real') && !notes.includes(TOKEN));
@@ -804,16 +806,65 @@ test('Final release during a client takeover probe leaves the Gateway port free'
   }
 });
 
-test('Missing config leaves the host unconfigured with an actionable message and no env changes', async () => {
-  const env = {};
-  const h = new BrokerHost({ configPath: join(tmpdir(), 'definitely-missing-broker', 'config.json'), env });
-  const view = await h.acquire();
-  assert.equal(view.role, 'unconfigured');
-  assert.equal(view.control, null, 'nothing to control without a config');
-  assert.equal(view.issue.level, 'warning');
-  assert.match(view.issue.message, /npm run init/);
-  assert.deepEqual(env, {});
-  await h.release();
+test('First start without a config creates a private config and key file templates, wires pi-web-access, and asks for keys', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-first-run-'));
+  const brokerDir = join(dir, 'pi-search-broker');
+  const configPath = join(brokerDir, 'config.json');
+  const agentDir = join(dir, 'agent');
+  mkdirSync(agentDir);
+  const port = await freePort();
+  const env = { PI_CODING_AGENT_DIR: agentDir };
+  const h = new BrokerHost({ configPath, env, store: memoryStore(), newConfig: { port } });
+  try {
+    const first = await h.acquire();
+    assert.equal(first.role, 'offline');
+    assert.equal(first.issue.level, 'warning');
+    assert.match(first.issue.message, /No search Accounts yet: put your API keys in .*keys \(exa\.txt, tavily\.txt\)/);
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    assert.match(config.gateway.token, /^[0-9a-f]{64}$/);
+    assert.deepEqual(config.accounts, [], 'no placeholder Accounts');
+    for (const name of ['exa.txt', 'tavily.txt']) {
+      const lines = readFileSync(join(brokerDir, 'keys', name), 'utf8').split(/\r?\n/).filter(Boolean);
+      assert.ok(lines.length > 0 && lines.every((l) => l.startsWith('#')), `${name} holds instructions only`);
+    }
+    assert.deepEqual(JSON.parse(readFileSync(join(agentDir, 'web-search.json'), 'utf8')),
+      { exaApiKey: '$PI_SEARCH_BROKER_TOKEN', tavilyApiKey: '$PI_SEARCH_BROKER_TOKEN' });
+    const notes = h.takeNotes().join('\n');
+    assert.match(notes, /Created the search broker config/);
+    assert.match(notes, /Added exaApiKey and tavilyApiKey/);
+    assert.ok(!notes.includes(config.gateway.token));
+    // The user pastes a key. Key files are read again only at /reload (or a takeover), not on every search.
+    writeFileSync(join(brokerDir, 'keys', 'tavily.txt'), 'tvly-fake-key-aaaa\n');
+    assert.equal((await h.ensure()).role, 'offline');
+    await h.release();
+    const second = await h.acquire();
+    assert.equal(second.role, 'owner');
+    assert.equal(second.issue, null);
+    assert.deepEqual((await second.control.status()).accounts.map((a) => a.id), ['tavily-78809fd3']);
+  } finally {
+    await h.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('The host fills in missing pi-web-access key settings but never changes ones that are set', async () => {
+  const { configPath, agentDir, cleanup } = await setup();
+  const path = join(agentDir, 'web-search.json');
+  writeFileSync(path, JSON.stringify({ exaApiKey: 'exa-plain-value', tavilyApiKey: null, searchRouting: { providers: ['exa', 'tavily'] } }));
+  const h = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: agentDir }, store: memoryStore() });
+  try {
+    await h.acquire();
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), {
+      exaApiKey: 'exa-plain-value', tavilyApiKey: '$PI_SEARCH_BROKER_TOKEN', searchRouting: { providers: ['exa', 'tavily'] }
+    });
+    const notes = h.takeNotes().join('\n');
+    assert.match(notes, /Added tavilyApiKey/);
+    assert.match(notes, /exa: key from plain value in web-search.json is NOT the broker token/);
+    assert.ok(!notes.includes('exa-plain-value'));
+  } finally {
+    await h.release();
+    cleanup();
+  }
 });
 
 test('pi extension: registers /broker, shows a footer status, re-reads config on /reload, and releases on shutdown', async () => {

@@ -197,3 +197,40 @@ test('CLI inspection still rejects malformed Account metadata', async () => {
     }
   } finally { await cleanup(); }
 });
+
+test('Offline status lists key-file Accounts from the key-free index, without reading key files', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-cli-offline-'));
+  const configPath = join(dir, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ gateway: { host: '127.0.0.1', port: await freePort(), token: secret }, accounts: [] }));
+  writeFileSync(join(dir, 'keys.index.json'), JSON.stringify({ version: 1, accounts: [
+    { id: 'tavily-78809fd3', provider: 'tavily', allocations: [{ id: 'free', limit: 1000, period: 'monthly', resetDay: 1 }] }
+  ] }));
+  // A file where the key folder should be: anything that tried to read key files would fail.
+  writeFileSync(join(dir, 'keys'), 'not a folder');
+  const out = [];
+  try {
+    const code = await main(['status', '--config', configPath], {
+      out: (l) => out.push(l), err: (l) => out.push(l), env: {}, fetchImpl: async () => { throw new TypeError('fetch failed'); }
+    });
+    assert.equal(code, 0, out.join('\n'));
+    assert.match(out.join('\n'), /offline, from the state file/);
+    assert.match(out.join('\n'), /tavily-78809fd3 \[tavily\]/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('init creates the config and key file templates; there is no import command any more', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-cli-init-'));
+  const configPath = join(dir, 'config.json');
+  const out = [];
+  const run = (...argv) => main([...argv, '--config', configPath], { out: (l) => out.push(l), err: (l) => out.push(l), env: {} });
+  try {
+    assert.equal(await run('init'), 0, out.join('\n'));
+    assert.deepEqual(JSON.parse(readFileSync(configPath, 'utf8')).accounts, []);
+    for (const name of ['exa.txt', 'tavily.txt']) assert.ok(existsSync(join(dir, 'keys', name)), name);
+    assert.match(out.join('\n'), /Put your API keys in .*keys/);
+    out.length = 0;
+    assert.equal(await run('import', 'tavily', join(dir, 'keys', 'tavily.txt')), 0);
+    assert.doesNotMatch(out.join('\n'), /import/, 'import is not a command; help is shown');
+    assert.match(out.join('\n'), /^Pi Search Broker/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -2,7 +2,8 @@ import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { createAccountPool, StateNotSaved } from './pool.mjs';
 import { memoryStore } from './pool/store.mjs';
-import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf, resolveAccountCredentials } from './config.mjs';
+import { SERVICE_NAME, VERSION, TOKEN_ENV, secretsOf, resolveAccountCredentials, isPlaceholderSource } from './config.mjs';
+import { noKeyFolder } from './keys.mjs';
 import { ROUTES, redact } from './providers.mjs';
 import { createBalanceChecks } from './reconcile.mjs';
 import { createBroker, CLIENT_CLOSED } from './broker.mjs';
@@ -56,6 +57,39 @@ async function readBody(req, maxBytes = 1024 * 1024) {
   }
 }
 
+/**
+ * Every Account a starting Gateway serves: config.json Accounts with resolved credentials, then key-file Accounts.
+ * A key-file key already used in config.json is skipped. Once key files add an Account, placeholder Accounts in
+ * config.json are left out (`placeholders`); otherwise they still fail credential checks. Records the key-file Accounts
+ * in the key index, and throws ENOACCOUNTS when there is nothing to serve.
+ * Returns { accounts, placeholders, notes } (notes are key-free).
+ */
+function accountsToServe(config, keyFolder, secretOptions) {
+  const files = keyFolder.read();
+  const candidates = files.accounts.length ? config.accounts.filter((a) => isPlaceholderSource(a.apiKey)).map((a) => a.id) : [];
+  const fromConfig = resolveAccountCredentials({ ...config, accounts: config.accounts.filter((a) => !candidates.includes(a.id)) }, secretOptions).accounts;
+  const owners = new Map(fromConfig.map((a) => [a.apiKey, a.id]));
+  const ids = new Set(fromConfig.map((a) => a.id));
+  const notes = [...files.warnings];
+  const fromKeyFiles = [];
+  for (const account of files.accounts) {
+    const origin = files.origins.get(account.id);
+    if (owners.has(account.apiKey)) notes.push(`${origin} skipped: its key is already used by ${owners.get(account.apiKey)} in config.json`);
+    else if (ids.has(account.id)) notes.push(`${origin} skipped: config.json already has an Account named ${account.id}`);
+    else fromKeyFiles.push(account);
+  }
+  // Placeholders are only replaced by key-file Accounts that are actually served; else they fail as before.
+  if (candidates.length && !fromKeyFiles.length) resolveAccountCredentials(config, secretOptions);
+  const accounts = [...fromConfig, ...fromKeyFiles];
+  if (!accounts.length) {
+    notes.push(...keyFolder.saveIndex([]));
+    const where = keyFolder.dir ? ` in ${keyFolder.dir} (exa.txt, tavily.txt)` : ' to config.json';
+    throw Object.assign(new Error(`No search Accounts yet: put your API keys${where}, one per line, then /reload in pi (or restart the standalone gateway)`), { code: 'ENOACCOUNTS' });
+  }
+  notes.push(...keyFolder.saveIndex(fromKeyFiles));
+  return { accounts, placeholders: candidates, notes };
+}
+
 const SHUTTING_DOWN = 'Gateway is shutting down';
 const shuttingDown = () => Object.assign(new Error(SHUTTING_DOWN), { statusCode: 503 });
 
@@ -85,7 +119,9 @@ function createGate() {
 
 /**
  * The loopback HTTP endpoint pi-web-access sends Exa and Tavily requests to. A Gateway serves once:
- *   start({ port?, host?, unref? }) -> { port, url }   bind the Port, resolve credentials, load the Account pool and serve
+ *   start({ port?, host?, unref? }) -> { port, url, notes }
+ *                                                    bind the Port, read key files and resolve credentials, load the
+ *                                                    Account pool and serve; notes are key-free messages for the user
  *   stop()                                           refuse new work, cancel balance checks, let in-flight work
  *                                                    settle, release the Port
  *   control                                          broker control for this process (see control.mjs)
@@ -94,10 +130,11 @@ function createGate() {
  * @param reconcileFetch  fetch for provider balance endpoints (default: the real fetch)
  * @param clock           { now, sleep, timeout } (see clock.mjs) for everything the Gateway builds
  * @param secretOptions   environment and command runner for Account credentials, resolved only after binding the Port
+ * @param keyFolder       key files to read after binding the Port (keys.mjs keyFolderAt; default: none)
  * @param logger          optional (line) => void
  */
 export function createGateway(config, {
-  store = memoryStore(), fetchImpl = fetch, reconcileFetch = fetch, clock = realClock, secretOptions = {}, logger = null
+  store = memoryStore(), fetchImpl = fetch, reconcileFetch = fetch, clock = realClock, secretOptions = {}, keyFolder = noKeyFolder, logger = null
 } = {}) {
   const log = quietLogger(logger);
   const now = () => clock.now(); // called through the clock, so an adapter's methods may rely on `this`
@@ -108,15 +145,17 @@ export function createGateway(config, {
   let starting = null;
   let stopping = null;
 
-  // Resolve credentials and construct the writing Account pool only after the Port is bound.
+  // Read key files, resolve credentials and construct the writing Account pool only after the Port is bound.
   function assemble() {
-    const active = resolveAccountCredentials(config, secretOptions);
-    const secrets = secretsOf(active);
+    const { accounts, placeholders, notes } = accountsToServe(config, keyFolder, secretOptions);
+    const secrets = secretsOf({ ...config, accounts });
     try {
-      const pool = createAccountPool(active.accounts, { store, now, logger });
-      const balanceChecks = createBalanceChecks({ accounts: active.accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
+      const pool = createAccountPool(accounts, { store, now, logger });
+      const balanceChecks = createBalanceChecks({ accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
       const broker = createBroker({ pool, limits: config, secrets, fetchImpl, clock });
-      return { pool, broker, balanceChecks };
+      // The Account pool loaded and saved: only now do placeholders leave config.json for good.
+      notes.push(...keyFolder.removePlaceholders(placeholders));
+      return { pool, broker, balanceChecks, notes };
     } catch (err) {
       // Only the Gateway holds resolved credentials; callers cannot redact them after a startup failure.
       if (err instanceof Error) {
@@ -218,9 +257,10 @@ export function createGateway(config, {
   }
 
   /**
-   * Bind the Port, resolve all Account credentials, load the Account pool, and serve. Resolves with the bound
-   * { port, url }. Rejects with the Port released and nothing written when the Port is taken, credentials cannot
-   * resolve or validate, the Account pool cannot load or save, or stop() began.
+   * Bind the Port, read key files and resolve all Account credentials, load the Account pool, and serve. Resolves with
+   * the bound { port, url, notes }. Rejects with the Port released when the Port is taken,
+   * credentials cannot resolve or validate, there are no Accounts at all (ENOACCOUNTS: the key index is then emptied),
+   * the Account pool cannot load or save, or stop() began. Account pool state is never written on failure.
    * A Gateway serves once: a second call returns the first call's promise (its options are ignored).
    */
   function start({ port = config.gateway.port, host = config.gateway.host, unref = false } = {}) {
@@ -240,7 +280,7 @@ export function createGateway(config, {
       }
       if (unref) server.unref();
       const bound = { host, port: server.address().port };
-      return { port: bound.port, url: baseUrl({ gateway: bound }) };
+      return { port: bound.port, url: baseUrl({ gateway: bound }), notes: serving.notes };
     })();
     return starting;
   }

@@ -5,7 +5,9 @@
 //  - one host object per process (globalThis singleton survives /reload re-imports), reference-counted
 //    by session_start / session_shutdown;
 //  - one Port owner per machine (the fixed loopback port); other processes are its clients;
-//  - a client takes over the port when the owner exits (ensure() is called before each search tool call).
+//  - a client takes over the port when the owner exits (ensure() is called before each search tool call);
+//  - the first start creates the config and key file templates (keys.mjs); key files are read only when this process
+//    starts a Gateway (pi startup, /reload, takeover), never while it waits for keys.
 //
 // What the host has decided is one view: { role, control, issue, url }
 //   role     'owner' | 'client' | 'offline' (nobody serves and this process could not) | 'unconfigured' | 'idle'
@@ -14,10 +16,13 @@
 //   url      the gateway's base URL, null when unconfigured or idle
 import { createGateway } from './gateway.mjs';
 import { fileStore } from './pool/store.mjs';
-import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig, secretsOf } from './config.mjs';
+import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig, createConfig, secretsOf } from './config.mjs';
+import { keyFolderAt, keyIndexPathOf, writeKeyFileTemplates } from './keys.mjs';
 import { redact } from './providers.mjs';
 import { baseUrl, httpControl, offlineControl } from './control.mjs';
-import { piWebSearchConfigPath, readPiWebSearchConfig, piWiringIssues, gatewayControlIssue, runDoctor } from './doctor.mjs';
+import {
+  piWebSearchConfigPath, readPiWebSearchConfig, addBrokerKeySources, piWiringIssues, gatewayControlIssue, runDoctor
+} from './doctor.mjs';
 import { realClock } from './clock.mjs';
 
 const HOST_KEY = Symbol.for('pi-search-broker.host');
@@ -32,10 +37,13 @@ export class BrokerHost {
   #now;
   #store;
   #logger;
+  #piConfigPath;
+  #newConfig;
   #config = null;
   #view = IDLE;
   #gateway = null;      // this process's Gateway while it is the Port owner
   #checkedAt = 0;       // when a client last saw the Port owner answer
+  #waitingForKeys = false; // no Accounts at the last start: key files are read again at /reload, not per search
   #ensuring = null;
   #releasing = null;    // latest zero-reference cleanup, chained after any earlier cleanup
   #savedEnv = null;
@@ -43,9 +51,14 @@ export class BrokerHost {
 
   /**
    * Everything the host creates (the gateway, its upstream and balance calls, health probes) uses these.
-   * @param store  account pool store for an owned gateway (default: pool-state.json next to the config)
+   * @param store         account pool store for an owned gateway (default: pool-state.json next to the config)
+   * @param piConfigPath  pi-web-access's web-search.json (default: where pi-web-access looks, given `env`)
+   * @param newConfig     settings for a config this host creates on first start, e.g. { port } (tests)
    */
-  constructor({ configPath = defaultConfigPath(), env = process.env, fetchImpl = fetch, now = () => Date.now(), store = null, logger = null } = {}) {
+  constructor({
+    configPath = defaultConfigPath(), env = process.env, fetchImpl = fetch, now = () => Date.now(), store = null, logger = null,
+    piConfigPath = null, newConfig = {}
+  } = {}) {
     // getHost() reads these two on host objects from any module version, so they stay public.
     this.version = VERSION;
     this.refs = 0;
@@ -56,6 +69,8 @@ export class BrokerHost {
     this.#now = now;
     this.#store = store;
     this.#logger = logger;
+    this.#piConfigPath = piConfigPath;
+    this.#newConfig = newConfig;
   }
 
   /** The latest decision, without looking at the port again. */
@@ -85,6 +100,7 @@ export class BrokerHost {
       await this.#stopGateway();
       this.#restoreEnvironment();
       this.#config = null;
+      this.#waitingForKeys = false;
       this.#view = IDLE;
     })();
     this.#releasing = releasing;
@@ -125,11 +141,24 @@ export class BrokerHost {
       this.#config = loadConfig(this.#configPath);
       return this.#config;
     } catch (err) {
+      if (err.code === 'ENOCONFIG' && this.#createConfig()) return this.#loadConfig();
       const message = err.code === 'ENOCONFIG'
-        ? `No broker config at ${this.#configPath}. Run "npm run init" in the pi-search-broker folder and add accounts, then /reload.`
+        ? `Could not create the search broker config at ${this.#configPath}.`
         : `Broker config error: ${err.message}`;
       this.#view = Object.freeze({ role: 'unconfigured', control: null, issue: { level: 'warning', message }, url: null });
       return null;
+    }
+  }
+
+  /** First start: a private config with a fresh Gateway token, and key files waiting for keys. */
+  #createConfig() {
+    try {
+      createConfig(this.#configPath, this.#newConfig);
+      const keys = writeKeyFileTemplates(this.#configPath);
+      this.#notes.push(`Search broker: Created the search broker config. Put your API keys in ${keys} (exa.txt, tavily.txt), then /reload.`);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -145,13 +174,15 @@ export class BrokerHost {
     if (this.#view.role === 'client' && this.#now() - this.#checkedAt < PROBE_CACHE_MS) return;
     const remote = httpControl(config, { fetchImpl: this.#fetchImpl });
     if (await this.#join(remote)) return;
-    if (this.refs === 0) return;
+    if (this.refs === 0 || this.#waitingForKeys) return;
     try {
       await this.#listen(config);
       this.#decide('owner', this.#gateway.control);
     } catch (err) {
       if (err.code === 'EADDRINUSE' && await this.#join(remote)) return;
-      this.#decide('offline', offlineControl(config, { statePath: this.#statePath, fetchImpl: this.#fetchImpl }), {
+      this.#waitingForKeys = err.code === 'ENOACCOUNTS';
+      const offline = offlineControl(config, { statePath: this.#statePath, indexPath: keyIndexPathOf(this.#configPath), fetchImpl: this.#fetchImpl });
+      this.#decide('offline', offline, err.code === 'ENOACCOUNTS' ? { level: 'warning', message: `Search broker: ${err.message}` } : {
         level: 'error',
         message: err.code === 'EADDRINUSE'
           ? `Port ${config.gateway.port} is used by another program (not the broker). Change gateway.port.`
@@ -177,10 +208,12 @@ export class BrokerHost {
   async #listen(config) {
     const gateway = createGateway(config, {
       store: this.#store ?? fileStore(this.#statePath), fetchImpl: this.#fetchImpl, reconcileFetch: this.#fetchImpl,
-      clock: { ...realClock, now: this.#now }, secretOptions: { env: this.#env }, logger: this.#logger
+      clock: { ...realClock, now: this.#now }, secretOptions: { env: this.#env }, keyFolder: keyFolderAt(this.#configPath),
+      logger: this.#logger
     });
-    await gateway.start({ unref: true }); // never keep pi alive
+    const { notes } = await gateway.start({ unref: true }); // never keep pi alive
     this.#gateway = gateway;
+    for (const note of notes) this.#notes.push(`Search broker: ${note}`);
   }
 
   async #stopGateway() {
@@ -204,8 +237,11 @@ export class BrokerHost {
     const overridden = ['EXA_BASE_URL', 'TAVILY_BASE_URL'].filter((n) => this.#savedEnv[n] !== undefined && this.#savedEnv[n] !== wanted[n]);
     Object.assign(this.#env, wanted);
     if (overridden.length) this.#notes.push(`Search broker overrides ${overridden.join(', ')} in this pi process.`);
+    const piPath = this.#piConfigPath ?? piWebSearchConfigPath(this.#env);
     try {
-      const pi = readPiWebSearchConfig(piWebSearchConfigPath(this.#env));
+      const added = addBrokerKeySources(piPath);
+      if (added.length) this.#notes.push(`Search broker: Added ${added.join(' and ')} ("$${TOKEN_ENV}") to ${piPath}.`);
+      const pi = readPiWebSearchConfig(piPath);
       for (const issue of piWiringIssues(pi, this.#env, this.#config.gateway.token)) this.#notes.push(`Search broker: ${issue.message}`);
     } catch {
       this.#notes.push('Search broker: pi-web-access web-search.json is not valid JSON.');
