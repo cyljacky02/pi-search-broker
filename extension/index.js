@@ -4,7 +4,7 @@
 // pi's own /reload re-runs shutdown + start, which re-reads the broker config.
 // The host decides this process's role; the extension only shows what it decided (see host.mjs for the view).
 import { getHost as processHost } from '../src/host.mjs';
-import { statusLine } from '../src/format.mjs';
+import { statusLine, offlineLine } from '../src/format.mjs';
 import { formatChecks } from '../src/doctor.mjs';
 import { COMMAND_NAMES, TAKES_ACCOUNT, usage, parseCommand, runCommand } from '../src/commands.mjs';
 
@@ -24,14 +24,14 @@ export function createExtension({ getHost = processHost } = {}) {
 
     async function refreshFooter(ctx, view) {
       if (!sessionHoldsHost || !ctx?.hasUI) return;
-      let text;
+      let snapshot = null;
       try {
-        const snapshot = await view.control.status();
-        accountIds = snapshot.accounts.map((a) => a.id);
-        text = statusLine(snapshot, { mode: view.control.mode });
-      } catch {
-        text = view?.role === 'unconfigured' ? 'search: broker not configured' : 'search: broker offline';
-      }
+        snapshot = await view.control.status();
+        accountIds = snapshot.accounts.map((a) => a.id); // for /broker completions, offline too
+      } catch { /* no status to show */ }
+      const text = view?.role === 'offline' ? offlineLine(view.issue?.reason)
+        : snapshot ? statusLine(snapshot, { mode: view.control.mode })
+          : view?.role === 'unconfigured' ? 'search: broker not configured' : 'search: broker offline';
       ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme?.fg ? ctx.ui.theme.fg('dim', text) : text);
     }
 

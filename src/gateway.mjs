@@ -59,15 +59,15 @@ async function readBody(req, maxBytes = 1024 * 1024) {
 
 /**
  * Every Account a starting Gateway serves: config.json Accounts with resolved credentials, then key-file Accounts.
- * A key-file key already used in config.json is skipped. Once key files add an Account, placeholder Accounts in
- * config.json are left out (`placeholders`); otherwise they still fail credential checks. Records the key-file Accounts
- * in the key index, and throws ENOACCOUNTS when there is nothing to serve.
- * Returns { accounts, placeholders, notes } (notes are key-free).
+ * Placeholder Accounts (config.json keys that are still example values) never serve; once key files add an Account
+ * they are `replaced` (the caller removes them from config.json). A key-file key already used in config.json is
+ * skipped. Records the key-file Accounts in the key index, and throws ENOACCOUNTS when there is nothing to serve.
+ * Returns { accounts, replaced, notes } (notes are key-free).
  */
 function accountsToServe(config, keyFolder, secretOptions) {
   const files = keyFolder.read();
-  const candidates = files.accounts.length ? config.accounts.filter((a) => isPlaceholderSource(a.apiKey)).map((a) => a.id) : [];
-  const fromConfig = resolveAccountCredentials({ ...config, accounts: config.accounts.filter((a) => !candidates.includes(a.id)) }, secretOptions).accounts;
+  const placeholders = config.accounts.filter((a) => isPlaceholderSource(a.apiKey)).map((a) => a.id);
+  const fromConfig = resolveAccountCredentials({ ...config, accounts: config.accounts.filter((a) => !placeholders.includes(a.id)) }, secretOptions).accounts;
   const owners = new Map(fromConfig.map((a) => [a.apiKey, a.id]));
   const ids = new Set(fromConfig.map((a) => a.id));
   const notes = [...files.warnings];
@@ -78,8 +78,9 @@ function accountsToServe(config, keyFolder, secretOptions) {
     else if (ids.has(account.id)) notes.push(`${origin} skipped: config.json already has an Account named ${account.id}`);
     else fromKeyFiles.push(account);
   }
-  // Placeholders are only replaced by key-file Accounts that are actually served; else they fail as before.
-  if (candidates.length && !fromKeyFiles.length) resolveAccountCredentials(config, secretOptions);
+  // Only key-file Accounts that actually serve replace the placeholders; until then they stay, not set up.
+  const replaced = fromKeyFiles.length ? placeholders : [];
+  if (!replaced.length) for (const id of placeholders) notes.push(`${id} in config.json is not set up: its key is still an example value`);
   const accounts = [...fromConfig, ...fromKeyFiles];
   if (!accounts.length) {
     notes.push(...keyFolder.saveIndex([]));
@@ -87,7 +88,7 @@ function accountsToServe(config, keyFolder, secretOptions) {
     throw Object.assign(new Error(`No search Accounts yet: put your API keys${where}, one per line, then /reload in pi (or restart the standalone gateway)`), { code: 'ENOACCOUNTS' });
   }
   notes.push(...keyFolder.saveIndex(fromKeyFiles));
-  return { accounts, placeholders: candidates, notes };
+  return { accounts, replaced, notes };
 }
 
 const SHUTTING_DOWN = 'Gateway is shutting down';
@@ -147,14 +148,14 @@ export function createGateway(config, {
 
   // Read key files, resolve credentials and construct the writing Account pool only after the Port is bound.
   function assemble() {
-    const { accounts, placeholders, notes } = accountsToServe(config, keyFolder, secretOptions);
+    const { accounts, replaced, notes } = accountsToServe(config, keyFolder, secretOptions);
     const secrets = secretsOf({ ...config, accounts });
     try {
       const pool = createAccountPool(accounts, { store, now, logger });
       const balanceChecks = createBalanceChecks({ accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
       const broker = createBroker({ pool, limits: config, secrets, fetchImpl, clock });
       // The Account pool loaded and saved: only now do placeholders leave config.json for good.
-      notes.push(...keyFolder.removePlaceholders(placeholders));
+      notes.push(...keyFolder.removePlaceholders(replaced));
       return { pool, broker, balanceChecks, notes };
     } catch (err) {
       // Only the Gateway holds resolved credentials; callers cannot redact them after a startup failure.

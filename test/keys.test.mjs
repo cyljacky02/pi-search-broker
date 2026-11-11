@@ -153,14 +153,19 @@ test('Emptied key files also empty the index, so offline status stops listing th
   } finally { await second.stop(); b.cleanup(); }
 });
 
-test('Placeholders stay, and still block startup, when every key-file key is already used in config.json', async () => {
+test('Placeholders never serve or block startup, and stay in config.json until a key file adds an Account', async () => {
   const placeholder = { id: 'exa-promo-01', provider: 'exa', apiKey: 'REPLACE_EXA_KEY', allocations: [{ id: 'free', limit: 10, period: 'monthly' }] };
   const handWritten = { id: 'tavily-main', provider: 'tavily', apiKey: 'tvly-fake-key-aaaa', allocations: [{ id: 'free', limit: 1000, period: 'monthly' }] };
   const b = brokerDir([placeholder, handWritten], { 'tavily.txt': 'tvly-fake-key-aaaa\n' });
   const gateway = createGateway(loadConfig(b.configPath), { store: memoryStore(), keyFolder: keyFolderAt(b.configPath) });
   try {
-    await assert.rejects(gateway.start({ port: 0 }), /Missing real apiKey for exa-promo-01/);
-    assert.deepEqual(b.readJson('config.json').accounts, [placeholder, handWritten]);
+    const { notes } = await gateway.start({ port: 0 });
+    assert.deepEqual(notes, [
+      'keys/tavily.txt line 1 skipped: its key is already used by tavily-main in config.json',
+      'exa-promo-01 in config.json is not set up: its key is still an example value'
+    ]);
+    assert.deepEqual((await gateway.control.status()).accounts.map((a) => a.id), ['tavily-main']);
+    assert.deepEqual(b.readJson('config.json').accounts, [placeholder, handWritten], 'no key-file Account replaced them');
   } finally { await gateway.stop(); b.cleanup(); }
 });
 

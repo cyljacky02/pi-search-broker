@@ -109,8 +109,9 @@ export function gatewayControlIssue(health, base, mode) {
  * Check the broker config, the running gateway and pi-web-access's wiring, as seen from `env`.
  * @param config       the loaded broker config, or undefined when loading failed (then pass configError)
  * @param control      a broker control (control.mjs) used for the gateway health check
+ * @param startFailure the issue from this process's failed Gateway start ({ level, message }), if any
  */
-export async function runDoctor({ config, configError, control, env = process.env, home = homedir() }) {
+export async function runDoctor({ config, configError, control, env = process.env, home = homedir(), startFailure = null }) {
   const checks = [];
   const add = (level, message) => checks.push({ level, message });
 
@@ -131,6 +132,7 @@ export async function runDoctor({ config, configError, control, env = process.en
   if (controlIssue) add('error', controlIssue);
   else if (health.state === 'running') add('ok', `Gateway is running at ${base} (version ${health.version ?? '?'})`);
   else if (health.state === 'other') add('error', `Something else answers on ${base}; change gateway.port`);
+  else if (startFailure) add(startFailure.level === 'error' ? 'error' : 'warn', `This pi process could not start the Gateway: ${startFailure.message}`);
   else add('warn', `Gateway is not running at ${base}. Start pi with the extension installed, or run "npm start".`);
   try {
     const { accounts } = await control.status();

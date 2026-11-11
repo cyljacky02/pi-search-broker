@@ -1,6 +1,6 @@
 {
   "name": "pi-search-broker",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "description": "Local Exa + Tavily account-aware key rotation gateway (search broker) for pi-web-access, with a pi extension",

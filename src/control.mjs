@@ -4,12 +4,14 @@
 //               with the Gateway
 //   http        another process owns it; authenticated loopback HTTP
 //   offline     nobody runs it; status is read from the state file (key-file Accounts from the key-free index the last
-//               Gateway left, never from key files), and changes are refused so only the running gateway writes state
+//               Gateway left, never from key files), and changes are refused so only the running gateway writes state.
+//               Its status also lists `placeholders` ({ id, provider }): config.json Accounts whose key is still an
+//               example value, which no Gateway serves, so they never count as credit
 // Every adapter: { mode, health(), status(), enable(id), disable(id), setSpent(id, allocationId, amount), reconcile(id?) }
 // health() never rejects: { state: 'running', version } | { state: 'other' } (something else owns the port) |
 // { state: 'down' }. The in-process and HTTP adapters add control: 'ready' | 'unauthorized' | 'unavailable' when
 // running ('unavailable' includes a Gateway that is stopping).
-import { SERVICE_NAME } from './config.mjs';
+import { SERVICE_NAME, isPlaceholderSource } from './config.mjs';
 import { readKeyIndex } from './keys.mjs';
 import { createAccountPool } from './pool.mjs';
 import { fileStore } from './pool/store.mjs';
@@ -111,10 +113,15 @@ export function offlineControl(config, { statePath, indexPath = null, fetchImpl 
     mode: 'offline',
     // Re-probe identity; if a Broker appears later, this adapter remains offline until the caller reconnects.
     health: () => probeHealth(config, { fetchImpl }),
+    // Accounts whose key is still an example value could never serve: listed as `placeholders`, never as credit.
     status: async () => {
       const ids = new Set(config.accounts.map((a) => a.id));
+      const placeholders = [];
+      const usable = [];
+      for (const account of config.accounts) (isPlaceholderSource(account.apiKey) ? placeholders : usable).push(account);
       const fromKeyFiles = indexPath ? readKeyIndex(indexPath).filter((a) => !ids.has(a.id)) : [];
-      return createAccountPool([...config.accounts, ...fromKeyFiles], { store: fileStore(statePath, { readOnly: true }) }).snapshot();
+      const snapshot = createAccountPool([...usable, ...fromKeyFiles], { store: fileStore(statePath, { readOnly: true }) }).snapshot();
+      return { ...snapshot, placeholders: placeholders.map(({ id, provider }) => ({ id, provider })) };
     },
     enable: refuse, disable: refuse, setSpent: refuse, reconcile: refuse
   };
