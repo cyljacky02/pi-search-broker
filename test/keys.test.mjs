@@ -19,9 +19,8 @@ function folder(files) {
 }
 
 const tavilyFree = [{ id: 'free', limit: 1000, period: 'monthly', resetDay: 1 }];
-const exaFree = { id: 'free', limit: 10, period: 'monthly', resetDay: 1 };
 
-test('Each key becomes one Account with the free plan by default; promo settings and per-key expiry add to it', () => {
+test('Each key becomes one Account: Tavily keys start from the free plan, Exa keys from an unknown balance; settings lines and per-key expiry add hints', () => {
   const f = folder({
     'tavily.txt': '\uFEFF# my Tavily keys\r\ntvly-fake-key-aaaa\r\n\r\n  tvly-fake-key-bbbb  \r\n',
     'exa-promo.txt': '# promo: 60 once expires=2026-12-01\nexa-fake-key-0001\nexa-fake-key-0002  expires=2026-12-15\n'
@@ -31,9 +30,9 @@ test('Each key becomes one Account with the free plan by default; promo settings
     assert.deepEqual(warnings, []);
     assert.deepEqual(accounts, [
       { id: 'exa-promo-45422472', provider: 'exa', apiKey: 'exa-fake-key-0001', allocations: [
-        { id: 'promo', limit: 60, period: 'once', expiresAt: '2026-12-01T00:00:00Z' }, exaFree] },
+        { id: 'promo', limit: 60, period: 'once', expiresAt: '2026-12-01T00:00:00Z' }] },
       { id: 'exa-promo-1978b537', provider: 'exa', apiKey: 'exa-fake-key-0002', allocations: [
-        { id: 'promo', limit: 60, period: 'once', expiresAt: '2026-12-15T00:00:00Z' }, exaFree] },
+        { id: 'promo', limit: 60, period: 'once', expiresAt: '2026-12-15T00:00:00Z' }] },
       { id: 'tavily-78809fd3', provider: 'tavily', apiKey: 'tvly-fake-key-aaaa', allocations: tavilyFree },
       { id: 'tavily-310f38f5', provider: 'tavily', apiKey: 'tvly-fake-key-bbbb', allocations: tavilyFree }
     ]);
@@ -56,7 +55,7 @@ test('Unusable lines and files are skipped with key-free warnings; the rest stil
     assert.deepEqual(accounts.map((a) => a.id), ['exa-dup-45422472']);
     assert.deepEqual(warnings, [
       'keys/exa-bad.txt skipped: line 1 is a settings line (# <name>: <limit> <monthly|once> ...), but limit must be a positive number',
-      'keys/exa.txt: lines 2, 3, 4, 5 skipped (not a usable key, or a bad expires=)',
+      'keys/exa.txt: lines 2, 3, 4, 5 skipped (not a usable key, or a bad expires= or admin=)',
       'keys/exa.txt: line 1 skipped (key already listed)',
       'keys/notes.txt skipped: name it exa*.txt or tavily*.txt',
       'keys/tavily paid.txt skipped: use only letters, digits, - and _ in the file name (at most 55 characters)',
@@ -67,7 +66,7 @@ test('Unusable lines and files are skipped with key-free warnings; the rest stil
   } finally { f.cleanup(); }
 });
 
-test('The free plan can be changed or turned off per file; a missing key folder has no Accounts', () => {
+test('The Tavily free plan can be changed or turned off per file; a missing key folder has no Accounts', () => {
   const f = folder({
     'tavily-paid.txt': '# free: none\n# plan: 4000 monthly reset-day=15\ntvly-fake-key-aaaa\n',
     'tavily-team.txt': '# free: 500 monthly\ntvly-fake-key-bbbb\n',
@@ -77,11 +76,30 @@ test('The free plan can be changed or turned off per file; a missing key folder 
     const { accounts, warnings } = readKeyFolder(f.keys);
     assert.deepEqual(accounts.map((a) => [a.id, a.allocations]), [
       ['tavily-paid-78809fd3', [{ id: 'plan', limit: 4000, period: 'monthly', resetDay: 15 }]],
-      ['tavily-team-310f38f5', [{ id: 'free', limit: 500, period: 'monthly', resetDay: 1 }]]
+      ['tavily-team-310f38f5', [{ id: 'free', limit: 500, period: 'monthly', resetDay: 1 }]],
+      ['tavily-zero-a17541e6', []]
     ]);
-    assert.deepEqual(warnings, ['keys/tavily-zero.txt skipped: no Allocation left (free is none and nothing else is set)']);
+    assert.deepEqual(warnings, [], 'no hint at all is fine: Tavily reports the balance');
     const missing = readKeyFolder(join(f.keys, 'missing'));
     assert.deepEqual([missing.accounts, missing.warnings], [[], []]);
+  } finally { f.cleanup(); }
+});
+
+test('An Exa key line can carry its service key (admin=) for exact balances; it is checked like a key and never shown', () => {
+  const f = folder({
+    'exa.txt': 'exa-fake-key-0001  admin=exa-fake-admin-0001\nexa-fake-key-0002  admin=short\nexa-fake-key-0003  admin=exa-fake-admin-0003  expires=2026-12-01\n',
+    'tavily.txt': 'tvly-fake-key-aaaa  admin=tvly-fake-admin-aaaa\n'
+  });
+  try {
+    const { accounts, warnings } = readKeyFolder(f.keys);
+    assert.deepEqual(accounts, [
+      { id: 'exa-45422472', provider: 'exa', apiKey: 'exa-fake-key-0001', adminKey: 'exa-fake-admin-0001', allocations: [] }
+    ]);
+    assert.deepEqual(warnings, [
+      'keys/exa.txt: lines 2, 3 skipped (not a usable key, or a bad expires= or admin=)',
+      'keys/tavily.txt: line 1 skipped (not a usable key, or a bad expires= or admin=)'
+    ]);
+    assert.doesNotMatch(warnings.join('\n'), /fake/);
   } finally { f.cleanup(); }
 });
 
@@ -111,7 +129,7 @@ test('A Gateway serves the Accounts in key files, reports skipped lines and leav
   });
   try {
     const { url, notes } = await gateway.start({ port: 0 });
-    assert.deepEqual(notes, ['keys/tavily.txt: line 2 skipped (not a usable key, or a bad expires=)']);
+    assert.deepEqual(notes, ['keys/tavily.txt: line 2 skipped (not a usable key, or a bad expires= or admin=)']);
     assert.equal((await tavilyRequest(url)).status, 200);
     assert.deepEqual(sent, ['Bearer tvly-fake-key-aaaa']);
     assert.deepEqual((await gateway.control.status()).accounts.map((a) => a.id), ['tavily-78809fd3']);

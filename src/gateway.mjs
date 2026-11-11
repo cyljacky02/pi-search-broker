@@ -140,7 +140,8 @@ export function createGateway(config, {
   const log = quietLogger(logger);
   const now = () => clock.now(); // called through the clock, so an adapter's methods may rely on `this`
   const gate = createGate();
-  const cancelChecks = new AbortController(); // balance checks are report-only, so stopping cancels them
+  const cancelChecks = new AbortController(); // balance syncs are cancelled when the Gateway stops; the last report stays
+  let syncBalances = () => {}; // (accountId?) => void once serving with syncing on (reconcileIntervalMs)
   let serving = null; // what the Gateway runs once it owns the Port: { pool, broker, balanceChecks }
   let timer = null;
   let starting = null;
@@ -151,7 +152,7 @@ export function createGateway(config, {
     const { accounts, replaced, notes } = accountsToServe(config, keyFolder, secretOptions);
     const secrets = secretsOf({ ...config, accounts });
     try {
-      const pool = createAccountPool(accounts, { store, now, logger });
+      const pool = createAccountPool(accounts, { store, now, logger, requestBalanceSync: (id) => syncBalances(id) });
       const balanceChecks = createBalanceChecks({ accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
       const broker = createBroker({ pool, limits: config, secrets, fetchImpl, clock });
       // The Account pool loaded and saved: only now do placeholders leave config.json for good.
@@ -276,7 +277,10 @@ export function createGateway(config, {
         throw err;
       }
       if (config.reconcileIntervalMs) {
-        timer = setInterval(() => { gate.run(() => serving.balanceChecks.run()).catch(() => {}); }, config.reconcileIntervalMs);
+        // Provider balances are the Account credit (ADR 0002): sync now, then on a timer and when Accounts run out.
+        syncBalances = (accountId) => { gate.run(() => serving.balanceChecks.run(accountId)).catch(() => {}); };
+        syncBalances();
+        timer = setInterval(() => syncBalances(), config.reconcileIntervalMs);
         timer.unref();
       }
       if (unref) server.unref();
@@ -287,7 +291,7 @@ export function createGateway(config, {
   }
 
   /**
-   * Stop for good, in this order: refuse new work, cancel balance checks (report-only), let in-flight work settle
+   * Stop for good, in this order: refuse new work, cancel balance syncs, let in-flight work settle
    * (Brokered requests must end their Reservations), release the Port. Calling it again returns the same promise.
    */
   function stop() {

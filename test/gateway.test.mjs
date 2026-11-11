@@ -391,3 +391,40 @@ test('/health reports the pi-search-broker service; probes accept only that id',
   assert.equal((await probeHealth(cfg, { fetchImpl: answering({ service: 'something-else' }) })).state, 'other');
   assert.equal((await probeHealth(cfg, { fetchImpl: async () => { throw new TypeError('fetch failed'); } })).state, 'down');
 });
+
+// ---------- balance syncing ----------
+
+test('With syncing on, a starting Gateway asks the Providers for balances, and running out of credit asks again', async () => {
+  const cfg = config(tavily('t', 'tvly-aaaaaaaa'), tavily('u', 'tvly-bbbbbbbb'));
+  cfg.reconcileIntervalMs = 3600000;
+  const checked = [];
+  let synced;
+  const allSynced = new Promise((resolve) => { synced = resolve; });
+  const reconcileFetch = async (_url, opts) => {
+    checked.push(opts.headers.Authorization);
+    if (checked.length === 2) synced();
+    return json({ key: { usage: 0, limit: null }, account: { plan_usage: checked.length >= 3 ? 1000 : 900, plan_limit: 1000 } });
+  };
+  const fetchImpl = async () => json({ detail: { error: 'usage limit exceeded' } }, 432);
+  await serve(cfg, fetchImpl, async ({ post, status, time }) => {
+    await synced;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual((await status()).accounts.map((a) => [a.id, a.balance.source, a.available]), [['t', 'provider', 100], ['u', 'provider', 100]]);
+    time.ms += 60000; // each Account's minimum gap between checks
+    assert.equal((await post('/tavily/search', { query: 'q' })).status, 429);
+    for (let i = 0; i < 20 && checked.length < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(checked, ['Bearer tvly-aaaaaaaa', 'Bearer tvly-bbbbbbbb', 'Bearer tvly-aaaaaaaa', 'Bearer tvly-bbbbbbbb'],
+      'each Account that ran out was checked again');
+    assert.deepEqual((await status()).accounts.map((a) => [a.status, a.available]), [['quota', 0], ['quota', 0]]);
+  }, { reconcileFetch });
+});
+
+test('With syncing off (reconcileIntervalMs 0), a Gateway never asks the Providers for balances by itself', async () => {
+  let checks = 0;
+  await serve(config(tavily('t', 'tvly-aaaaaaaa')), async () => json({ detail: { error: 'usage limit exceeded' } }, 432), async ({ post, status }) => {
+    assert.equal((await post('/tavily/search', { query: 'q' })).status, 429);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(checks, 0);
+    assert.equal((await status()).accounts[0].balance.source, 'hint');
+  }, { reconcileFetch: async () => { checks++; return json({}); } });
+});

@@ -6,8 +6,8 @@ const COMMANDS = Object.freeze([
   { name: 'status', args: '', help: 'accounts and remaining credits' },
   { name: 'enable', args: '<account>', help: 're-enable an account' },
   { name: 'disable', args: '<account>', help: 'park an account' },
-  { name: 'set-spent', args: '<account> <allocation> <amount>', help: 'correct local spend to the provider dashboard value' },
-  { name: 'reconcile', args: '[account]', help: 'show provider-reported balances (report-only)' },
+  { name: 'set-spent', args: '<account> <allocation|month> <amount>', help: 'correct local spend to the provider dashboard value' },
+  { name: 'reconcile', args: '[account]', help: 'sync balances from the Providers now' },
   { name: 'doctor', args: '', help: 'check that pi-web-access really goes through the broker' }
 ]);
 export const COMMAND_NAMES = Object.freeze(COMMANDS.map((c) => c.name));
@@ -58,10 +58,12 @@ export async function runCommand(control, command, { url, label = control.mode }
       return `Disabled ${command.id}`;
     case 'set-spent':
       await control.setSpent(command.id, command.allocationId, command.amount);
-      return `Set ${command.id}/${command.allocationId} spent to ${command.amount}`;
+      const synced = (await control.status()).accounts.find((a) => a.id === command.id)?.balance?.source === 'provider';
+      return `Set ${command.id}/${command.allocationId} spent to ${command.amount}${synced ? ' (this Account uses a Provider-reported balance; the next sync replaces local figures)' : ''}`;
     case 'reconcile': {
       const results = await control.reconcile(command.id);
-      return results.map((r) => `${r.id}: ${r.error ?? r.skipped ?? `provider reports ~${r.remaining} remaining`}`).join('\n') || 'No accounts';
+      const said = { 'not-supported': 'balance unknown (no balance API for this key)', 'too-soon': 'synced less than a minute ago' };
+      return results.map((r) => `${r.id}: ${r.error ? `sync failed: ${r.error}` : r.skipped ? said[r.skipped] ?? r.skipped : `synced, ${r.remaining} left`}`).join('\n') || 'No accounts';
     }
     default:
       throw new Error(`Not an account command: ${command.name}`);

@@ -738,3 +738,51 @@ test('If preparing the upstream request throws, nothing is sent and the reserved
   assert.equal(a.available, 70, 'all 60 promo + 10 free is available again');
   assert.deepEqual([a.failures, a.possiblyBilled, a.status], [0, 0, 'active']);
 });
+
+// ---------- where credit comes from: unknown balances and spending order ----------
+
+/** Exa Accounts as key files make them without settings lines: no Allocations, so the balance is unknown. */
+const unknownExa = (...pairs) => {
+  const cfg = config(...pairs.map(([id, key]) => exa(id, key)));
+  for (const account of cfg.accounts) account.allocations = [];
+  return cfg;
+};
+const SEARCH = { query: 'q', type: 'auto', numResults: 5 };
+
+test('Unknown-balance Exa keys are used until Exa says 402; then they are parked until the 1st and the request moves on', async () => {
+  const sent = [];
+  const b = broker(unknownExa(['e1', 'exa-real-aaa'], ['e2', 'exa-real-bbb']), async (_url, opts) => {
+    sent.push(keyOf(opts));
+    return keyOf(opts) === 'exa-real-aaa' ? json({ error: 'no credits', tag: 'NO_MORE_CREDITS' }, 402) : ok(0.007);
+  });
+  const res = await b.call('/exa/search', SEARCH);
+  assert.equal(res.status, 200);
+  assert.deepEqual(sent, ['exa-real-aaa', 'exa-real-bbb']);
+  assert.deepEqual([b.account(0).status, b.account(0).retryAt], ['quota', '2026-12-01T00:00:00.000Z']);
+  assert.deepEqual([b.account(1).status, b.account(1).available, b.account(1).balance.source, b.account(1).balance.spentThisMonth],
+    ['active', null, 'unknown', 0.007]);
+  b.time.ms = Date.parse('2026-12-01T00:00:00Z');
+  assert.equal(b.account(0).status, 'active', 'free credit resets on the 1st');
+});
+
+test('Spending order: expiring credit first, then the most known credit, then unknown-balance keys least recently used first', async () => {
+  const pick = async (cfg) => {
+    const sent = [];
+    const b = broker(cfg, async (_url, opts) => { sent.push(keyOf(opts)); return ok(0.007); });
+    for (let i = 0; i < 3; i++) assert.equal((await b.call('/exa/search', SEARCH)).status, 200);
+    return sent;
+  };
+  const monthly = (id, key, limit) => ({ id, provider: 'exa', apiKey: key, allocations: [{ id: 'free', limit, period: 'monthly' }] });
+  const promo = { id: 'promo', provider: 'exa', apiKey: 'exa-promo', allocations: [{ id: 'p', limit: 5, period: 'once', expiresAt: '2026-11-20T00:00:00Z' }] };
+  const withUnknown = (...accounts) => {
+    const cfg = config(...accounts, exa('u1', 'exa-unknown-1'), exa('u2', 'exa-unknown-2'));
+    for (const a of cfg.accounts) if (a.id.startsWith('u')) a.allocations = [];
+    return cfg;
+  };
+  assert.deepEqual(await pick(withUnknown(monthly('small', 'exa-small', 5), monthly('big', 'exa-big', 50), promo)),
+    ['exa-promo', 'exa-promo', 'exa-promo'], 'credit that expires goes first');
+  assert.deepEqual(await pick(withUnknown(monthly('small', 'exa-small', 5), monthly('big', 'exa-big', 50))),
+    ['exa-big', 'exa-big', 'exa-big'], 'then the most known credit');
+  assert.deepEqual(await pick(withUnknown(monthly('tiny', 'exa-tiny', 0.0001))),
+    ['exa-unknown-1', 'exa-unknown-2', 'exa-unknown-1'], 'then unknown balances take turns');
+});

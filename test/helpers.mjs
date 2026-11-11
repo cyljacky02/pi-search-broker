@@ -12,6 +12,14 @@ import { ROUTES } from '../src/providers.mjs';
 import { validateConfig, secretsOf } from '../src/config.mjs';
 import { BrokerHost } from '../src/host.mjs';
 
+// Tests never reach a real Provider: any fetch beyond loopback fails (a Gateway syncs balances by default).
+const loopbackFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+  const { hostname } = new URL(input instanceof Request ? input.url : String(input));
+  if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(hostname)) return Promise.reject(new TypeError('fetch failed (tests stay on loopback)'));
+  return loopbackFetch(input, init);
+};
+
 export const DATE = Date.parse('2026-11-09T06:00:00Z');
 export const secret = 'local-only-secret-with-32-chars-12345';
 
@@ -20,9 +28,10 @@ export const exa = (id, key, promoExpiration = '2026-12-03T00:00:00Z') => ({
   allocations: [{ id: 'promo', limit: 60, period: 'once', expiresAt: promoExpiration }, { id: 'free', limit: 10, period: 'monthly' }]
 });
 export const tavily = (id, key) => ({ id, provider: 'tavily', apiKey: key, allocations: [{ id: 'free', limit: 1000, period: 'monthly' }] });
+/** A validated config. Balance syncing is off unless a test turns it on (it is hourly by default). */
 export const config = (...accounts) => validateConfig({
   gateway: { host: '127.0.0.1', port: 19473, token: secret },
-  totalTimeoutMs: 50000, accounts
+  totalTimeoutMs: 50000, reconcileIntervalMs: 0, accounts
 });
 
 export const json = (data, status = 200, headers = {}) => Response.json(data, { status, headers });

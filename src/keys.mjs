@@ -21,6 +21,7 @@ const FINGERPRINT_LENGTH = 8;
 const SETTING = /^#\s*([A-Za-z0-9_-]+)\s*:\s*((?:\d|\.\d|none\b).*)$/i;
 const SETTING_FORMAT = '# <name>: <limit> <monthly|once> ...';
 const OPTION = /^(expires|reset-day)=(.+)$/;
+const KEY_OPTION = /^(expires|admin)=(.+)$/;
 /** Settings-line syntax for a limit; validateAllocation then checks its value. */
 const DECIMAL = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
 
@@ -28,7 +29,10 @@ const DECIMAL = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
 const toExpiresAt = (value) => (/^\d{4}-\d\d-\d\d$/.test(value) ? `${value}T00:00:00Z` : value);
 const fingerprint = (key) => createHash('sha256').update(key).digest('hex').slice(0, FINGERPRINT_LENGTH);
 const lineList = (numbers) => `${numbers.length === 1 ? 'line' : 'lines'} ${numbers.join(', ')}`;
-const freePlan = (provider) => ({ id: 'free', limit: PROVIDERS[provider].freePlanLimit, period: 'monthly', resetDay: 1 });
+/** The free-plan hint a key file gives each key unless it says otherwise, or null (Exa: unknown balance). */
+const freePlan = (provider) => (PROVIDERS[provider].freePlanLimit
+  ? { id: 'free', limit: PROVIDERS[provider].freePlanLimit, period: 'monthly', resetDay: 1 } : null);
+const usableKey = (key) => isRealKey(key) && !hasControlCharacters(key);
 
 /** Which Provider a key file belongs to: the file name starts with the Provider name ("exa-promo.txt", "tavily2.txt"). */
 const providerOf = (name) => PROVIDER_NAMES.find((p) => name.startsWith(p)) ?? null;
@@ -55,7 +59,10 @@ function parseAllocation(id, text) {
   return allocation;
 }
 
-/** The Allocations a file's settings lines describe, the free plan included unless turned off. Throws with the line. */
+/**
+ * The Allocation hints a file's settings lines describe, the Provider's free plan included unless turned off. May be
+ * empty: then the Provider-reported balance (or none: unknown) is all there is. Throws with the line.
+ */
 function allocationsOf(settings, provider) {
   const allocations = [];
   let free = freePlan(provider);
@@ -75,24 +82,33 @@ function allocationsOf(settings, provider) {
     }
   }
   if (free) allocations.push(free);
-  if (!allocations.length) throw new Error('no Allocation left (free is none and nothing else is set)');
   return allocations;
 }
 
-/** A key line ("<key> [expires=…]") with the file's Allocations; null when the line is unusable. */
+/**
+ * A key line ("<key> [expires=…] [admin=…]") with the file's Allocations; null when the line is unusable.
+ * expires= sets this key's expiry for the file's `once` hints; admin= is an Exa service key for exact balances.
+ */
 function accountOf(line, prefix, provider, allocations) {
   const [key, ...options] = line.split(/\s+/);
-  if (!isRealKey(key) || hasControlCharacters(key)) return null;
+  if (!usableKey(key)) return null;
+  const set = {};
+  for (const option of options) {
+    const [, name, value] = option.match(KEY_OPTION) ?? [];
+    if (!name || name in set) return null;
+    set[name] = value;
+  }
   let own = allocations;
-  if (options.length) {
-    const [, name, value] = options.length === 1 ? options[0].match(OPTION) ?? [] : [];
-    if (name !== 'expires' || !own.some((a) => a.period === 'once')) return null;
-    own = own.map((a) => (a.period !== 'once' ? a : value === 'never'
+  if (set.expires !== undefined) {
+    if (!own.some((a) => a.period === 'once')) return null;
+    own = own.map((a) => (a.period !== 'once' ? a : set.expires === 'never'
       ? { id: a.id, limit: a.limit, period: a.period, expires: 'never' }
-      : { id: a.id, limit: a.limit, period: a.period, expiresAt: toExpiresAt(value) }));
+      : { id: a.id, limit: a.limit, period: a.period, expiresAt: toExpiresAt(set.expires) }));
     try { for (const a of own) validateAllocation(a, a.id); } catch { return null; }
   }
-  return { key, account: { id: `${prefix}-${fingerprint(key)}`, provider, apiKey: key, allocations: structuredClone(own) } };
+  if (set.admin !== undefined && (provider !== 'exa' || !usableKey(set.admin))) return null;
+  const account = { id: `${prefix}-${fingerprint(key)}`, provider, apiKey: key, ...(set.admin ? { adminKey: set.admin } : {}), allocations: structuredClone(own) };
+  return { key, account };
 }
 
 /**
@@ -138,7 +154,7 @@ export function readKeyFolder(dir) {
       accounts.push(parsed.account);
       origins.set(parsed.account.id, `${where} line ${l.number}`);
     }
-    if (bad.length) warnings.push(`${where}: ${lineList(bad)} skipped (not a usable key, or a bad expires=)`);
+    if (bad.length) warnings.push(`${where}: ${lineList(bad)} skipped (not a usable key, or a bad expires= or admin=)`);
     if (repeated.length) warnings.push(`${where}: ${lineList(repeated)} skipped (key already listed)`);
   }
   return { accounts, warnings, origins };
@@ -195,6 +211,25 @@ export function readKeyIndex(indexPath) {
   }
 }
 
+const TEMPLATE_TEXT = Object.freeze({
+  tavily: [
+    '# Tavily API keys for the search broker, one key per line.',
+    '# Then run /reload in pi (or restart the standalone gateway).',
+    '# The broker asks Tavily for each key\'s balance, so nothing else is needed here.',
+    '# More files work too, for example tavily-team.txt. Keep this folder private.'
+  ],
+  exa: [
+    '# Exa API keys for the search broker, one key per line.',
+    '# Then run /reload in pi (or restart the standalone gateway).',
+    '# A normal Exa key cannot read its balance: the broker uses it until Exa says it is out of credit,',
+    '# then waits for the monthly reset. For exact balances and promo expiry dates, add the team\'s service key:',
+    '#     exa-xxxxxxxx  admin=<service key>',
+    '# Without one, you can still tell the broker about promo credit with a settings line such as',
+    '#     # promo: 60 once expires=2026-12-01',
+    '# More files work too, for example exa-promo.txt. Keep this folder private.'
+  ]
+});
+
 /**
  * Create the key folder with one instructions-only key file per Provider. Never overwrites a file.
  * Returns the key folder path.
@@ -203,18 +238,7 @@ export function writeKeyFileTemplates(configPath) {
   const dir = keysDirOf(configPath);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   for (const provider of PROVIDER_NAMES) {
-    const { label, unit, freePlanLimit } = PROVIDERS[provider];
-    const plan = unit === 'USD' ? `$${freePlanLimit}` : `${freePlanLimit.toLocaleString('en-US')} ${unit}`;
-    const text = [
-      `# ${label} API keys for the search broker, one key per line.`,
-      '# Then run /reload in pi (or restart the standalone gateway).',
-      `# Every key gets ${label}'s free plan, ${plan} a month.`,
-      '# For promo or trial credit, add a settings line such as',
-      '#     # promo: 60 once expires=2026-12-01',
-      '# and give a key its own promo expiry by writing  expires=2026-12-15  after it.',
-      `# More files work too, for example ${provider}-promo.txt. Keep this folder private.`,
-      ''
-    ].join('\n');
+    const text = [...TEMPLATE_TEXT[provider], ''].join('\n');
     try { writeFileSync(join(dir, `${provider}.txt`), text, { flag: 'wx', mode: 0o600 }); }
     catch (err) { if (err.code !== 'EEXIST') throw err; }
   }

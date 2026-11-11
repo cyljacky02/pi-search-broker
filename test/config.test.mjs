@@ -24,8 +24,10 @@ test('Config rejects non-loopback listeners, duplicate Account ids and expiry da
   assert.throws(() => config({ ...exa('a', 'exa-secret-1'), allocations: [{ id: 'promo', limit: 60, period: 'once', expiresAt: '2026-11-30' }] }), /ISO expiresAt/);
 });
 
-test('Balance checks are optional: periodic checks are off by default', () => {
-  assert.equal(config(tavily('t', 'tvly-aaaaaaaa')).reconcileIntervalMs, 0);
+test('Balance syncing is on by default, hourly; 0 turns it off', () => {
+  const gateway = { host: '127.0.0.1', port: 19473, token: secret };
+  assert.equal(validateConfig({ gateway }).reconcileIntervalMs, 3600000);
+  assert.equal(validateConfig({ gateway, reconcileIntervalMs: 0 }).reconcileIntervalMs, 0);
 });
 
 test('Credential sources retain their syntax until local Gateway startup', () => {

@@ -27,7 +27,7 @@ Whether an account is eligible for new attempts, including accounts paused by a 
 _Avoid_: Status
 
 **Allocation**:
-A slice of an account's credit with a limit and a period: either `monthly` (it resets on a set day of the month) or `once` (a promo grant that may expire).
+A configured slice of an account's credit with a limit and a period: either `monthly` (it resets on a set day of the month) or `once` (a promo grant that may expire). It is a hint, used only while the provider reports no balance for the account.
 _Avoid_: Bucket, grant, quota
 
 **Reservation**:
@@ -47,7 +47,7 @@ The state of an attempt that may have reached the provider but whose outcome is 
 _Avoid_: Uncertain, lost
 
 **Provider balance**:
-The remaining credit as reported by the provider's own balance endpoint. It is shown next to the local figures and never applied to them automatically.
+The remaining credit as reported by the provider's own balance endpoint. When an account has one, it is the account's credit, less what the broker has spent through it since the report. An account with neither a provider balance nor allocations has an unknown balance: it is used until the provider says it is out of credit.
 _Avoid_: Reconciled balance, remote balance
 
 ### Running the broker

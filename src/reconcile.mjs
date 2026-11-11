@@ -1,19 +1,15 @@
-// Optional, report-only provider balance checks (docs/research/tavily.md §5, docs/research/exa.md §5).
-// Results are shown next to the local estimate in /status; they never change local accounting.
-// Correct local spend with `set-spent` if the two drift apart.
+// Provider balance syncs (docs/research/tavily.md §5, docs/research/exa.md §5): Tavily /usage for every key, Exa
+// /credits with a service key. Each result becomes the Account's credit in the Account pool
+// (docs/adr/0002-provider-balances-are-the-source-of-truth.md); the Gateway decides when to sync.
 import { PROVIDERS } from './providers.mjs';
+import { canSyncBalance } from './pool/credit.mjs';
 
 const SHUTDOWN = Object.freeze({ skipped: 'shutdown' });
 const throwUnknownAccount = () => { throw new Error('Unknown account id'); };
 
-/** Whether this account can be checked against the provider at all. */
-export function canReconcile(account) {
-  return account.reconcile !== false && PROVIDERS[account.provider].balance.supports(account);
-}
-
 /** Fetch one account's balance. Throws an Error with a key-free message on failure. */
 export async function fetchBalance(account, { fetchImpl = fetch, timeoutMs = 10000, signal } = {}) {
-  if (!canReconcile(account)) throw new Error('Balance check not available for this account');
+  if (!canSyncBalance(account)) throw new Error('Balance check not available for this account');
   const balance = PROVIDERS[account.provider].balance;
   const timeout = AbortSignal.timeout(timeoutMs);
   let res;
@@ -42,7 +38,7 @@ export function createBalanceChecks({
   /** One account's balance: { remaining, details }, an Error with a key-free message, or { skipped: reason }. */
   async function check(account) {
     if (signal.aborted) return SHUTDOWN;
-    if (!canReconcile(account)) return { skipped: 'not-supported' };
+    if (!canSyncBalance(account)) return { skipped: 'not-supported' };
     if (now() - (lastAttempt.get(account.id) ?? -Infinity) < minGapMs) return { skipped: 'too-soon' };
     lastAttempt.set(account.id, now());
     let cancel;
@@ -62,8 +58,8 @@ export function createBalanceChecks({
   }
 
   /**
-   * Check one account (`accountId`) or all of them, one at a time (gentle on rate limits), and record every balance
-   * or error; a skipped check records nothing. Results: { id, remaining } | { id, skipped } | { id, error }.
+   * Check one account (`accountId`) or all of them, one at a time (gentle on rate limits), and apply every balance or
+   * record every error; a skipped check records nothing. Results: { id, remaining } | { id, skipped } | { id, error }.
    */
   async function run(accountId) {
     // The account itself (with its keys) is needed before any request, and the pool hands out no accounts.

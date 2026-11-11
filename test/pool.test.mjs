@@ -310,7 +310,7 @@ test('Admin changes validate their input', async () => {
   assert.equal(await pool.attempt(TAVILY, 1, NONE, () => assert.fail('disabled')), null);
 });
 
-test('Balance checks are recorded report-only; an error keeps the last good balance; unknown ids throw', () => {
+test('Balance checks become the Account credit; an error keeps the last good balance; unknown ids throw', () => {
   const pool = poolOf(config(tavily('t', 'tvly-aaaaaaaa'), tavily('u', 'tvly-bbbbbbbb')));
   pool.recordBalanceCheck('t', { remaining: 12.3456789, details: { plan: 'x' } });
   pool.recordBalanceCheck('t', new Error('HTTP 429'));
@@ -318,7 +318,8 @@ test('Balance checks are recorded report-only; an error keeps the last good bala
   assert.equal(t.providerBalance.remaining, 12.345679, 'an error keeps the last good balance');
   assert.deepEqual(t.providerBalance.details, { plan: 'x' });
   assert.equal(t.reconcileError.message, 'HTTP 429');
-  assert.equal(t.available, 1000, 'local accounting is untouched');
+  assert.equal(t.available, 12.345679, 'the Provider-reported balance is the credit');
+  assert.equal(t.balance.source, 'provider');
   assert.equal(u.providerBalance, null);
   assert.throws(() => pool.recordBalanceCheck('nope', { remaining: 1 }), /Unknown account id/);
   pool.recordBalanceCheck('t', { remaining: 3 });
@@ -461,10 +462,20 @@ test('An out-of-credit account is retried at the earliest monthly reset or upcom
     [[monthly(1), monthly(15)], '2026-11-15T00:00:00.000Z'],
     [[monthly(1), promo('2026-11-20T00:00:00Z')], '2026-11-20T00:00:00.000Z'],
     [[monthly(1), promo('2026-11-01T00:00:00Z')], '2026-12-01T00:00:00.000Z', 'an already-expired promo changes nothing'],
-    [[{ id: 'bonus', period: 'once', limit: 10, expires: 'never' }], null]
+    [[{ id: 'bonus', period: 'once', limit: 10, expires: 'never' }], '2026-12-01T00:00:00.000Z', 'Provider free credit resets on the 1st anyway']
   ];
   for (const [allocations, expected, why] of cases) {
     const at = nextCreditChange(allocations, now);
     assert.equal(at ? new Date(at).toISOString() : null, expected, why);
   }
+});
+
+test('set-spent "month" corrects this month\'s spend on any Account, including unknown-balance ones', () => {
+  const cfg = config(exa('e', 'exa-real-aaa'));
+  cfg.accounts[0].allocations = [];
+  const pool = poolOf(cfg);
+  pool.setSpent('e', 'month', 1.25);
+  const e = pool.snapshot().accounts[0];
+  assert.deepEqual([e.balance.source, e.balance.spentThisMonth], ['unknown', 1.25]);
+  assert.throws(() => pool.setSpent('e', 'free', 1), /Unknown allocation/);
 });

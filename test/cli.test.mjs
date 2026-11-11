@@ -106,7 +106,7 @@ test('CLI rejects a non-numeric set-spent before contacting the gateway, and unk
   const { run, lines, gateway, cleanup } = await setup();
   try {
     assert.equal(await run('set-spent', 't', 'free', 'lots'), 1);
-    assert.equal(lines.err.at(-1), 'Usage: node src/cli.mjs set-spent <account> <allocation> <amount>');
+    assert.equal(lines.err.at(-1), 'Usage: node src/cli.mjs set-spent <account> <allocation|month> <amount>');
     assert.equal((await gateway.control.status()).accounts[0].allocations[0].spent, 0);
     assert.equal(await run('explode'), 0);
     assert.match(lines.out.at(-1), /^Pi Search Broker/);
@@ -117,7 +117,7 @@ test('serve drains on the first Ctrl+C: an in-flight search finishes and is save
   const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-cli-'));
   const configPath = join(dir, 'config.json');
   const port = await freePort();
-  writeFileSync(configPath, JSON.stringify({ gateway: { host: '127.0.0.1', port, token: secret }, accounts: [tavily('t', 'tvly-aaaaaaaa')] }));
+  writeFileSync(configPath, JSON.stringify({ gateway: { host: '127.0.0.1', port, token: secret }, reconcileIntervalMs: 0, accounts: [tavily('t', 'tvly-aaaaaaaa')] }));
   let startSearch;
   let finishSearch;
   const started = new Promise((resolve) => { startSearch = resolve; });
