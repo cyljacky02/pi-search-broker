@@ -12,14 +12,6 @@ import { ROUTES } from '../src/providers.mjs';
 import { validateConfig, secretsOf } from '../src/config.mjs';
 import { BrokerHost } from '../src/host.mjs';
 
-// Tests never reach a real Provider: any fetch beyond loopback fails (a Gateway syncs balances by default).
-const loopbackFetch = globalThis.fetch;
-globalThis.fetch = (input, init) => {
-  const { hostname } = new URL(input instanceof Request ? input.url : String(input));
-  if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(hostname)) return Promise.reject(new TypeError('fetch failed (tests stay on loopback)'));
-  return loopbackFetch(input, init);
-};
-
 export const DATE = Date.parse('2026-11-09T06:00:00Z');
 export const secret = 'local-only-secret-with-32-chars-12345';
 

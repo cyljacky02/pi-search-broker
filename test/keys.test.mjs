@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { readKeyFolder, keyFolderAt } from '../src/keys.mjs';
 import { createGateway } from '../src/gateway.mjs';
 import { loadConfig } from '../src/config.mjs';
-import { memoryStore } from '../src/pool/store.mjs';
+import { memoryStore, fileStore } from '../src/pool/store.mjs';
+import { offlineControl } from '../src/control.mjs';
 import { secret, json, keyOf, freePort, assertPortAvailable } from './helpers.mjs';
 
 function folder(files) {
@@ -105,11 +106,11 @@ test('An Exa key line can carry its service key (admin=) for exact balances; it 
 
 // ---------- a Gateway starting with key files ----------
 
-/** A private config dir with config.json (given Accounts) and keys/ (given files). */
-function brokerDir(accounts, files) {
+/** A private config dir with config.json (given Accounts, balance syncing off unless `settings` say so) and keys/. */
+function brokerDir(accounts, files, settings = { reconcileIntervalMs: 0 }) {
   const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-keys-gw-'));
   const configPath = join(dir, 'config.json');
-  writeFileSync(configPath, JSON.stringify({ gateway: { host: '127.0.0.1', port: 19473, token: secret }, accounts }));
+  writeFileSync(configPath, JSON.stringify({ gateway: { host: '127.0.0.1', port: 19473, token: secret }, ...settings, accounts }));
   mkdirSync(join(dir, 'keys'));
   for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, 'keys', name), text);
   const readJson = (name) => JSON.parse(readFileSync(join(dir, name), 'utf8'));
@@ -134,7 +135,7 @@ test('A Gateway serves the Accounts in key files, reports skipped lines and leav
     assert.deepEqual(sent, ['Bearer tvly-fake-key-aaaa']);
     assert.deepEqual((await gateway.control.status()).accounts.map((a) => a.id), ['tavily-78809fd3']);
     assert.deepEqual(b.readJson('keys.index.json'), { version: 1, accounts: [
-      { id: 'tavily-78809fd3', provider: 'tavily', allocations: [{ id: 'free', limit: 1000, period: 'monthly', resetDay: 1 }] }
+      { id: 'tavily-78809fd3', provider: 'tavily', allocations: [{ id: 'free', limit: 1000, period: 'monthly', resetDay: 1 }], balanceSyncable: true }
     ] });
     assert.doesNotMatch(readFileSync(join(b.dir, 'keys.index.json'), 'utf8'), /fake-key/);
     assert.deepEqual(b.readJson('config.json').accounts, [], 'keys are never copied into config.json');
@@ -206,4 +207,23 @@ test('Key files replace the placeholder Accounts init used to write; config.json
     assert.deepEqual(saved.accounts, [handWritten]);
     assert.equal(saved.gateway.token, secret);
   } finally { await gateway.stop(); b.cleanup(); }
+});
+
+test('Offline status keeps the Exa-reported balance of a key with a service key; the index never holds the service key', async () => {
+  const b = brokerDir([], { 'exa.txt': 'exa-fake-key-0001  admin=exa-fake-admin-0001\n' });
+  const statePath = join(b.dir, 'pool-state.json');
+  const gateway = createGateway(loadConfig(b.configPath), {
+    store: fileStore(statePath), keyFolder: keyFolderAt(b.configPath), reconcileFetch: async () => json({ credits_usd: 42 })
+  });
+  try {
+    await gateway.start({ port: 0 });
+    await gateway.control.reconcile('exa-45422472');
+  } finally { await gateway.stop(); }
+  try {
+    const index = readFileSync(join(b.dir, 'keys.index.json'), 'utf8');
+    assert.doesNotMatch(index, /fake-admin|fake-key/);
+    assert.equal(JSON.parse(index).accounts[0].balanceSyncable, true);
+    const status = await offlineControl(loadConfig(b.configPath), { statePath, indexPath: join(b.dir, 'keys.index.json') }).status();
+    assert.deepEqual([status.accounts[0].balance.source, status.accounts[0].available], ['provider', 42]);
+  } finally { b.cleanup(); }
 });

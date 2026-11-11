@@ -22,7 +22,7 @@
     "status": "node src/cli.mjs status",
     "doctor": "node src/cli.mjs doctor",
     "reconcile": "node src/cli.mjs reconcile",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --import ./test/setup.mjs --test test/*.test.mjs",
     "check": "node scripts/check.mjs"
   }
 }

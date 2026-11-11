@@ -398,21 +398,20 @@ test('With syncing on, a starting Gateway asks the Providers for balances, and r
   const cfg = config(tavily('t', 'tvly-aaaaaaaa'), tavily('u', 'tvly-bbbbbbbb'));
   cfg.reconcileIntervalMs = 3600000;
   const checked = [];
-  let synced;
-  const allSynced = new Promise((resolve) => { synced = resolve; });
   const reconcileFetch = async (_url, opts) => {
     checked.push(opts.headers.Authorization);
-    if (checked.length === 2) synced();
     return json({ key: { usage: 0, limit: null }, account: { plan_usage: checked.length >= 3 ? 1000 : 900, plan_limit: 1000 } });
   };
   const fetchImpl = async () => json({ detail: { error: 'usage limit exceeded' } }, 432);
+  /** Wait (real time, at most 2 s) until `done()` holds: syncs run in the background, spaced out. */
+  const until = async (done) => { for (let i = 0; i < 200 && !(await done()); i++) await new Promise((resolve) => setTimeout(resolve, 10)); };
   await serve(cfg, fetchImpl, async ({ post, status, time }) => {
-    await synced;
-    await new Promise((resolve) => setImmediate(resolve));
+    await until(async () => (await status()).accounts.every((a) => a.balance.source === 'provider'));
     assert.deepEqual((await status()).accounts.map((a) => [a.id, a.balance.source, a.available]), [['t', 'provider', 100], ['u', 'provider', 100]]);
     time.ms += 60000; // each Account's minimum gap between checks
     assert.equal((await post('/tavily/search', { query: 'q' })).status, 429);
-    for (let i = 0; i < 20 && checked.length < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+    await until(() => checked.length >= 4 && Promise.resolve(true));
+    await until(async () => (await status()).accounts.every((a) => a.available === 0));
     assert.deepEqual(checked, ['Bearer tvly-aaaaaaaa', 'Bearer tvly-bbbbbbbb', 'Bearer tvly-aaaaaaaa', 'Bearer tvly-bbbbbbbb'],
       'each Account that ran out was checked again');
     assert.deepEqual((await status()).accounts.map((a) => [a.status, a.available]), [['quota', 0], ['quota', 0]]);

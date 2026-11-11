@@ -730,7 +730,8 @@ test('A failed Attempt that cannot be saved reports paused Attempts, never a pos
 
 test('If preparing the upstream request throws, nothing is sent and the reserved credit comes back', async () => {
   let calls = 0;
-  const b = broker(config(exa('a', 'exa-key-aaaa')), async () => { calls++; return ok(0.007); });
+  // With a service key the Allocations bound the credit, so the returned Reservation shows in `available`.
+  const b = broker(config({ ...exa('a', 'exa-key-aaaa'), adminKey: 'exa-admin-aaaa' }), async () => { calls++; return ok(0.007); });
   const headers = { get 'x-exa-integration'() { throw new Error('unreadable header'); } };
   await assert.rejects(b.call('/exa/search', { query: 'q' }, { headers }), /unreadable header/);
   assert.equal(calls, 0);
@@ -779,10 +780,22 @@ test('Spending order: expiring credit first, then the most known credit, then un
     for (const a of cfg.accounts) if (a.id.startsWith('u')) a.allocations = [];
     return cfg;
   };
-  assert.deepEqual(await pick(withUnknown(monthly('small', 'exa-small', 5), monthly('big', 'exa-big', 50), promo)),
-    ['exa-promo', 'exa-promo', 'exa-promo'], 'credit that expires goes first');
-  assert.deepEqual(await pick(withUnknown(monthly('small', 'exa-small', 5), monthly('big', 'exa-big', 50))),
-    ['exa-big', 'exa-big', 'exa-big'], 'then the most known credit');
-  assert.deepEqual(await pick(withUnknown(monthly('tiny', 'exa-tiny', 0.0001))),
-    ['exa-unknown-1', 'exa-unknown-2', 'exa-unknown-1'], 'then unknown balances take turns');
+  assert.deepEqual(await pick(withUnknown(promo)), ['exa-promo', 'exa-promo', 'exa-promo'], 'credit that expires goes first');
+  assert.deepEqual(await pick(withUnknown()), ['exa-unknown-1', 'exa-unknown-2', 'exa-unknown-1'], 'unknown balances take turns');
+  // Known credit: Tavily hints before the first report (Exa hints without a service key are open-ended, below).
+  const sent = [];
+  const b = broker(config(tavily('small', 'tvly-small'), { ...tavily('big', 'tvly-big'), allocations: [{ id: 'free', limit: 5000, period: 'monthly' }] }),
+    async (_url, opts) => { sent.push(keyOf(opts)); return json({ results: [], usage: { credits: 1 } }); });
+  for (let i = 0; i < 2; i++) await b.call('/tavily/search', { query: 'q' });
+  assert.deepEqual(sent, ['Bearer tvly-big', 'Bearer tvly-big'], 'the most known credit first');
+});
+
+test('An Exa key with a promo hint but no service key keeps an unknown balance beyond the hint', async () => {
+  const cfg = config({ id: 'e', provider: 'exa', apiKey: 'exa-real-aaa', allocations: [{ id: 'promo', limit: 0.001, period: 'once', expiresAt: '2026-11-20T00:00:00Z' }] });
+  const b = broker(cfg, async () => ok(0.007));
+  assert.deepEqual([b.account(0).balance.source, b.account(0).available], ['unknown', null]);
+  assert.deepEqual(b.account(0).balance.expiring, [{ amount: 0.001, expiresAt: '2026-11-20T00:00:00Z' }]);
+  for (let i = 0; i < 3; i++) assert.equal((await b.call('/exa/search', SEARCH)).status, 200, 'still used after the promo hint is spent');
+  b.time.ms = Date.parse('2026-11-21T00:00:00Z');
+  assert.equal((await b.call('/exa/search', SEARCH)).status, 200, 'and after it expires');
 });

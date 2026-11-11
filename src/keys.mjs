@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { PROVIDER_NAMES, validateAllocation, isRealKey, hasControlCharacters, removeAccounts } from './config.mjs';
 import { PROVIDERS } from './providers.mjs';
 import { atomicWriteJson } from './files.mjs';
+import { canSyncBalance } from './pool/credit.mjs';
 
 export const KEY_INDEX_VERSION = 1;
 /** The key folder next to a config file. */
@@ -164,7 +165,8 @@ export function readKeyFolder(dir) {
  * The key folder a Gateway reads when it starts, next to the config at `configPath`. Each write returns key-free notes.
  *   dir                       where key files live
  *   read()                    readKeyFolder(dir)
- *   saveIndex(accounts)       record the key-file Accounts just read (id, provider, allocations) for offline status
+ *   saveIndex(accounts)       record the key-file Accounts just read (id, provider, allocations, balanceSyncable; never
+ *                             keys) for offline status
  *   removePlaceholders(ids)   key files replaced these example Accounts: remove them from config.json
  */
 export function keyFolderAt(configPath) {
@@ -174,8 +176,10 @@ export function keyFolderAt(configPath) {
     read: () => readKeyFolder(dir),
     saveIndex(accounts) {
       try {
+        // balanceSyncable tells offline status which saved Provider balances still describe an Account, without its keys.
         atomicWriteJson(keyIndexPathOf(configPath), {
-          version: KEY_INDEX_VERSION, accounts: accounts.map(({ id, provider, allocations }) => ({ id, provider, allocations }))
+          version: KEY_INDEX_VERSION,
+          accounts: accounts.map((a) => ({ id: a.id, provider: a.provider, allocations: a.allocations, balanceSyncable: canSyncBalance(a) }))
         });
         return [];
       } catch { return ['Could not save keys.index.json; offline status may list outdated key-file Accounts.']; }

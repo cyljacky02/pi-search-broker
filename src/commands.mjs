@@ -59,7 +59,7 @@ export async function runCommand(control, command, { url, label = control.mode }
     case 'set-spent':
       await control.setSpent(command.id, command.allocationId, command.amount);
       const synced = (await control.status()).accounts.find((a) => a.id === command.id)?.balance?.source === 'provider';
-      return `Set ${command.id}/${command.allocationId} spent to ${command.amount}${synced ? ' (this Account uses a Provider-reported balance; the next sync replaces local figures)' : ''}`;
+      return `Set ${command.id}/${command.allocationId} spent to ${command.amount}${synced ? ' (only a local figure: this Account\'s credit comes from its Provider-reported balance)' : ''}`;
     case 'reconcile': {
       const results = await control.reconcile(command.id);
       const said = { 'not-supported': 'balance unknown (no balance API for this key)', 'too-soon': 'synced less than a minute ago' };

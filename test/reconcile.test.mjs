@@ -5,7 +5,7 @@ import { serve, config, exa, tavily, json, DATE } from './helpers.mjs';
 import { createBalanceChecks } from '../src/reconcile.mjs';
 import { createAccountPool } from '../src/pool.mjs';
 import { memoryStore } from '../src/pool/store.mjs';
-import { ROUTES } from '../src/providers.mjs';
+import { ROUTES, EFFECT } from '../src/providers.mjs';
 
 const usage = (remaining) => json({ account: { plan_usage: 1000 - remaining, plan_limit: 1000 } });
 
@@ -103,6 +103,56 @@ test('A report from an earlier month no longer counts: the Account falls back to
   time.ms = Date.parse('2026-12-01T00:00:01Z');
   const a = pool.snapshot().accounts[0];
   assert.deepEqual([a.balance.source, a.available], ['hint', 1000]);
+});
+
+test('Before a parked Account is retried, its balance is asked for first; the report decides, or the park ends after a grace period', async () => {
+  const time = { ms: DATE };
+  const asked = [];
+  const accounts = config(tavily('t', 'tvly-aaaaaaaa')).accounts;
+  const pool = createAccountPool(accounts, { store: memoryStore(), now: () => time.ms, requestBalanceSync: (id) => asked.push(id) });
+  let planUsage = 1000;
+  const checks = createBalanceChecks({ accounts, pool, now: () => time.ms, fetchImpl: async () => usageOf({ planUsage }) });
+  await pool.attempt(tavilyRoute, 1, new Set(), (r) => r.fail({ status: 432, effect: EFFECT.QUOTA }));
+  assert.deepEqual(asked, ['t'], 'running out asks for the balance');
+  time.ms = Date.parse('2026-12-01T00:00:00Z');
+  assert.equal(pool.snapshot().accounts[0].status, 'quota', 'still parked while the balance is asked for');
+  assert.deepEqual(asked, ['t', 't']);
+  await checks.run('t');
+  assert.equal(pool.snapshot().accounts[0].status, 'quota', 'the report says there is still no credit');
+  planUsage = 0;
+  time.ms += 60000;
+  await checks.run('t');
+  assert.equal(pool.snapshot().accounts[0].status, 'active');
+  // No answer at all: the park ends after the grace period.
+  await pool.attempt(tavilyRoute, 1, new Set(), (r) => r.fail({ status: 432, effect: EFFECT.QUOTA }));
+  time.ms = Date.parse('2027-01-01T00:00:00Z');
+  assert.equal(pool.snapshot().accounts[0].status, 'quota');
+  time.ms += 5 * 60000;
+  assert.equal(pool.snapshot().accounts[0].status, 'active');
+});
+
+test('A check asked for too soon after the last one runs once the minimum gap has passed', async () => {
+  let calls = 0;
+  const accounts = config(tavily('t', 'tvly-aaaaaaaa')).accounts;
+  const pool = createAccountPool(accounts, { store: memoryStore(), now: () => DATE });
+  const checks = createBalanceChecks({ accounts, pool, now: () => DATE, minGapMs: 30, fetchImpl: async () => { calls++; return usageOf({ planUsage: 10 }); } });
+  await checks.run('t');
+  assert.deepEqual(await checks.soon('t'), [{ id: 't', skipped: 'too-soon' }]);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(calls, 2, 'the skipped check ran later');
+});
+
+test('Spend inside the Exa report lag is remembered across a restart', async () => {
+  const time = { ms: DATE };
+  const store = memoryStore();
+  const account = { ...exa('e', 'exa-search-key'), adminKey: 'exa-admin-key' };
+  const accounts = config(account).accounts;
+  await spend(createAccountPool(accounts, { store, now: () => time.ms }), exaRoute, 2);
+  time.ms += 60000;
+  const restarted = createAccountPool(accounts, { store, now: () => time.ms });
+  const checks = createBalanceChecks({ accounts, pool: restarted, now: () => time.ms, fetchImpl: async () => json({ credits_usd: 30 }) });
+  await checks.run('e');
+  assert.equal(restarted.snapshot().accounts[0].available, 28);
 });
 
 test('the default minimum gap skips until exactly 60000ms after the last attempt without recording skips', async () => {

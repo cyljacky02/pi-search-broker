@@ -156,6 +156,7 @@ const exa = Object.freeze({
   balance: Object.freeze({
     url: 'https://admin-api.exa.ai/team-management/credits',
     supports: (account) => Boolean(account.adminKey),
+    anyKey: false, // a normal API key cannot read its balance: without a service key it is unknown
     lagMs: 5 * 60 * 1000, // "Can lag usage by up to 5 minutes": recent local spend counts against a fresh report
     headers: (account) => ({ 'x-api-key': account.adminKey }),
     parse(data) {
@@ -232,6 +233,7 @@ const tavily = Object.freeze({
   balance: Object.freeze({
     url: 'https://api.tavily.com/usage',
     supports: () => true,
+    anyKey: true,
     lagMs: 0,
     headers: (account) => ({ Authorization: `Bearer ${account.apiKey}` }),
     parse(data) {

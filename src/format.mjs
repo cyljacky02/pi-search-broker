@@ -41,15 +41,18 @@ const day = (iso) => iso.slice(0, 10);
 function balanceText(a, now) {
   const b = a.balance;
   if (!b || b.source === 'hint') return `~${amount(a.provider, a.available ?? 0)} left (estimate from Allocations)`;
-  if (b.source === 'unknown') return `balance unknown; ${amount(a.provider, b.spentThisMonth ?? 0)} spent this month`;
+  const expiring = b.expiring.map((e) => `${amount(a.provider, e.amount)} expires ${day(e.expiresAt)}`);
+  if (b.source === 'unknown') {
+    const hint = expiring.length ? ` (hint: ${expiring.join(', ')})` : '';
+    return `balance unknown${hint}; ${amount(a.provider, b.spentThisMonth ?? 0)} spent this month`;
+  }
   // "688 of 1,000cr left": the unit once, after the limit ("$8.00 of $10.00" keeps its leading $).
-  const used = PROVIDERS[a.provider].unit === 'credits' ? Math.round(b.remaining).toLocaleString('en-US') : amount(a.provider, b.remaining);
-  const left = b.limit !== null ? `${used} of ${amount(a.provider, b.limit)} left` : `${amount(a.provider, b.remaining)} left`;
-  const expiring = b.expiring.map((e) => `, ${amount(a.provider, e.amount)} expires ${day(e.expiresAt)}`).join('');
-  return `${left}${expiring} (${PROVIDERS[a.provider].label}-reported ${ago(b.reportedAt, now)})`;
+  const remaining = PROVIDERS[a.provider].unit === 'credits' ? Math.round(b.remaining).toLocaleString('en-US') : amount(a.provider, b.remaining);
+  const text = b.limit !== null ? `${remaining} of ${amount(a.provider, b.limit)} left` : `${amount(a.provider, b.remaining)} left`;
+  return `${text}${expiring.map((e) => `, ${e}`).join('')} (${PROVIDERS[a.provider].label}-reported ${ago(b.reportedAt, now)})`;
 }
 
-/** An Account's health, e.g. "active", "cooldown (rate-limit) until …", "parked until 2026-12-01 (out of credit)". */
+/** An Account's health, e.g. "active", "cooldown (rate-limit) until …", or "parked until 2026-12-01 (out of credit)" for quota. */
 function healthText(a) {
   if (a.status === 'quota') return `parked${a.retryAt ? ` until ${day(a.retryAt)}` : ''} (out of credit)`;
   const why = a.cooldownReason ? ` (${a.cooldownReason})` : a.lastErrorTag && a.status !== 'active' ? ` (${a.lastErrorTag})` : '';
@@ -93,8 +96,7 @@ export function statusReport(snapshot, { mode, url } = {}) {
         lines.push(`  ${b.id}: ~${amount(a.provider, b.remainingEstimate)} of ${amount(a.provider, b.limit)} left (${b.period}${b.window && b.window !== 'once' ? ` from ${b.window}` : ''}${b.expiresAt ? `, expires ${b.expiresAt}` : ''}${b.active ? '' : ', inactive'})`);
       }
     }
-    const syncError = a.balance?.syncError ?? a.reconcileError;
-    if (syncError) lines.push(`  balance sync failed at ${syncError.at}: ${syncError.message}`);
+    if (a.balance?.syncError) lines.push(`  balance sync failed at ${a.balance.syncError.at}: ${a.balance.syncError.message}`);
     if (a.lastRequestId) lines.push(`  last request id: ${a.lastRequestId}`);
   }
   for (const p of snapshot.placeholders ?? []) {

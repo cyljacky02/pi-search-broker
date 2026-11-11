@@ -34,6 +34,7 @@ test('The status report says where each balance comes from and how old it is', (
     } }),
     account('e2', 'exa', { requests: 2, balance: { source: 'unknown', remaining: null, spentThisMonth: 0.42 } }),
     account('e3', 'exa', { status: 'quota', retryAt: '2026-12-01T00:00:00.000Z', failures: 1, balance: { source: 'unknown', remaining: null } }),
+    account('e4', 'exa', { balance: { source: 'unknown', remaining: null, expiring: [{ amount: 5, expiresAt: '2026-11-20T00:00:00Z' }] } }),
     account('t2', 'tavily', {
       balance: { source: 'hint', remaining: 1000, syncError: { at: minutesAgo(1), message: 'Balance request failed: HTTP 429' } },
       allocations: [{ id: 'free', period: 'monthly', limit: 1000, spent: 0, remainingEstimate: 1000, window: '2026-11-01', active: true, expiresAt: null }]
@@ -46,6 +47,7 @@ test('The status report says where each balance comes from and how old it is', (
     'e1 [exa] active | ok 1, failed 0 | $58.10 left, $50.00 expires 2026-12-01 (Exa-reported 3 min ago)',
     'e2 [exa] active | ok 2, failed 0 | balance unknown; $0.420 spent this month',
     'e3 [exa] parked until 2026-12-01 (out of credit) | ok 0, failed 1 | balance unknown; $0.000 spent this month',
+    'e4 [exa] active | ok 0, failed 0 | balance unknown (hint: $5.000 expires 2026-11-20); $0.000 spent this month',
     't2 [tavily] active | ok 0, failed 0 | ~1,000cr left (estimate from Allocations)',
     '  free: ~1,000cr of 1,000cr left (monthly from 2026-11-01)',
     `  balance sync failed at ${minutesAgo(1)}: Balance request failed: HTTP 429`

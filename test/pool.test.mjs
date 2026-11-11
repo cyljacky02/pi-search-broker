@@ -462,7 +462,7 @@ test('An out-of-credit account is retried at the earliest monthly reset or upcom
     [[monthly(1), monthly(15)], '2026-11-15T00:00:00.000Z'],
     [[monthly(1), promo('2026-11-20T00:00:00Z')], '2026-11-20T00:00:00.000Z'],
     [[monthly(1), promo('2026-11-01T00:00:00Z')], '2026-12-01T00:00:00.000Z', 'an already-expired promo changes nothing'],
-    [[{ id: 'bonus', period: 'once', limit: 10, expires: 'never' }], '2026-12-01T00:00:00.000Z', 'Provider free credit resets on the 1st anyway']
+    [[{ id: 'bonus', period: 'once', limit: 10, expires: 'never' }], null]
   ];
   for (const [allocations, expected, why] of cases) {
     const at = nextCreditChange(allocations, now);

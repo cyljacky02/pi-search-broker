@@ -3,16 +3,17 @@
 // else (credit sources, spending order, reserved credit, cooldowns, quota re-opening, persistence, the attempt log)
 // stays behind this interface.
 // Never exposes key material in persisted state or user-facing status.
-import { PROVIDERS } from './providers.mjs';
+import { PROVIDERS, EFFECT } from './providers.mjs';
 import { round6, isNonNegativeNumber } from './numbers.mjs';
 import { quietLogger } from './log.mjs';
 import { STATE_VERSION } from './pool/store.mjs';
 import { windowOf, isActive, remainingOf, spendingOrder } from './pool/allocation.mjs';
 import {
-  SOURCE, sourceOf, creditSlices, drawDown, spendAgainstReport, addMonthSpend, monthSpentOf, canSyncBalance, nextMonthlyReset
+  SOURCE, sourceOf, creditSlices, drawDown, recordReportSpend, spendInReportLag, recordMonthSpend, monthSpentOf, canSyncBalance
 } from './pool/credit.mjs';
-import { PROVIDERS as PROVIDER_POLICIES } from './providers.mjs';
-import { applyFailure, recover, isUsable, healthStatus, enable as enableHealth, disable as disableHealth } from './pool/health.mjs';
+import {
+  applyFailure, applyReportedCredit, recover, isUsable, healthStatus, enable as enableHealth, disable as disableHealth
+} from './pool/health.mjs';
 
 /** Why an attempt is possibly billed: it may have reached the provider, but whether it was billed is unknown. */
 export const POSSIBLY_BILLED = Object.freeze({
@@ -63,10 +64,11 @@ function spread(amount, ordered, capacityOf) {
  * @param accounts  validated config accounts (with resolved keys; the keys never leave this process)
  * @param store     { load() -> state | null, save(state) } (see pool/store.mjs)
  * @param logger    optional (line) => void for one line per attempt
- * @param requestBalanceSync  optional (accountId) => void, called when an Account runs out of credit or its out-of-credit
- *                            park ends, so the Gateway can ask the Provider for its balance
+ * @param requestBalanceSync  optional (accountId) => void, called when a syncable Account runs out of credit or its park
+ *                            would end, so the Gateway can ask the Provider for its balance; without it (syncing off)
+ *                            parks end on their own schedule
  */
-export function createAccountPool(accounts, { store, now = () => Date.now(), logger = null, requestBalanceSync = () => {} }) {
+export function createAccountPool(accounts, { store, now = () => Date.now(), logger = null, requestBalanceSync = null }) {
   const state = store.load() ?? { version: STATE_VERSION, accounts: {} };
   const reserved = new Set(); // open reservations: { accountId, amount }
   const recent = [];
@@ -103,10 +105,10 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
           newWindow = true;
         }
       }
-      const parked = entry.disabled === 'quota';
-      recover(entry, now(), { newWindow });
+      const balanceFirst = Boolean(requestBalanceSync) && canSyncBalance(account);
+      const askForBalance = recover(entry, now(), { newWindow, balanceFirst });
       state.accounts[account.id] = entry;
-      if (parked && !entry.disabled && canSyncBalance(account)) requestBalanceSync(account.id);
+      if (askForBalance) requestBalanceSync(account.id);
     }
   }
 
@@ -145,8 +147,8 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
   function charge(account, amount, exact, { possiblyBilled = false, requestId = null } = {}) {
     const entry = state.accounts[account.id];
     const at = now();
-    spendAgainstReport(account, entry, at, amount);
-    addMonthSpend(entry, at, amount);
+    recordReportSpend(account, entry, at, amount);
+    recordMonthSpend(entry, at, amount);
     if (account.allocations.length) chargeAllocations(account, entry, amount, exact, possiblyBilled);
     if (possiblyBilled) {
       entry.possiblyBilled++;
@@ -234,7 +236,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
         end(ENDING.FAILED, status, defined({ tag, requestId }), () => {
           const entry = state.accounts[account.id];
           applyFailure(entry, account, { status, effect, tag, retryAfterMs }, now());
-          if (entry.disabled === 'quota' && canSyncBalance(account)) requestBalanceSync(account.id);
+          if (entry.disabled === EFFECT.QUOTA && requestBalanceSync && canSyncBalance(account)) requestBalanceSync(account.id);
         });
       }
     };
@@ -252,12 +254,6 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     save();
   }
 
-  /** Local spend on an Account in recent Attempts at or after `sinceMs` (the attempt log). */
-  function recentSpend(accountId, sinceMs) {
-    return round6(recent.filter((r) => r.account === accountId && r.cost !== undefined && Date.parse(r.at) >= sinceMs)
-      .reduce((sum, r) => sum + r.cost, 0));
-  }
-
   /**
    * Apply one account's balance check: `{ remaining, details }` as the provider reported it becomes the Account's
    * credit (minus local spend since; spend inside the Provider's reporting lag counts again, erring low). No credit
@@ -268,23 +264,17 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
     const at = now();
     change(accountId, (account, entry) => {
       if (outcome instanceof Error) { entry.reconcileError = { at: new Date(at).toISOString(), message: outcome.message }; return; }
-      const lagMs = PROVIDER_POLICIES[account.provider].balance.lagMs ?? 0;
       entry.providerBalance = {
         at: new Date(at).toISOString(), remaining: round6(outcome.remaining), details: outcome.details ?? {},
-        spentSince: lagMs ? recentSpend(account.id, at - lagMs) : 0
+        spentSince: spendInReportLag(account, entry, at)
       };
       delete entry.reconcileError;
-      const left = totalRemaining(creditSlices(account, entry, at, { spentOf: () => 0 }));
-      if (left > 1e-9 && entry.disabled === 'quota') enableHealth(entry, { clearCooldown: false });
-      if (left <= 1e-9 && (!entry.disabled || entry.disabled === 'quota')) {
-        entry.disabled = 'quota';
-        entry.quotaRetryAt = nextMonthlyReset(at);
-      }
+      applyReportedCredit(entry, totalRemaining(creditSlices(account, entry, at, { spentOf: () => 0 })), at);
     });
   }
 
   /** The Account's balance for status: where it comes from, what is left, and this month's spend. */
-  function balanceOf(account, entry, credit) {
+  function balanceStatus(account, entry, credit) {
     const at = now();
     const source = sourceOf(account, entry, at);
     const total = totalRemaining(credit);
@@ -302,6 +292,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
 
   function snapshot() {
     refresh();
+    const balances = new Map(accounts.map((a) => [a.id, balanceStatus(a, state.accounts[a.id], activeCredit(a))]));
     return {
       updatedAt: new Date(now()).toISOString(),
       persistence: { state: persistenceUnavailable ? 'unavailable' : 'ok' },
@@ -313,11 +304,8 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
           ...healthStatus(entry, now()),
           requests: entry.requests, failures: entry.failures, possiblyBilled: entry.possiblyBilled,
           lastStatus: entry.lastStatus ?? null, lastErrorTag: entry.lastErrorTag ?? null, lastRequestId: entry.lastRequestId ?? null,
-          ...(() => {
-            const credit = activeCredit(account);
-            const balance = balanceOf(account, entry, credit);
-            return { available: balance.remaining, balance };
-          })(),
+          available: balances.get(account.id).remaining,
+          balance: balances.get(account.id),
           providerBalance: entry.providerBalance ?? null,
           reconcileError: entry.reconcileError ?? null,
           allocations: account.allocations.map((a) => {
@@ -351,7 +339,7 @@ export function createAccountPool(accounts, { store, now = () => Date.now(), log
       if (allocationId !== MONTH && !account.allocations.some((a) => a.id === allocationId)) throw new Error('Unknown allocation');
       if (!isNonNegativeNumber(amount)) throw new Error('spent must be nonnegative number');
       if (allocationId === MONTH) {
-        addMonthSpend(entry, now(), 0);
+        recordMonthSpend(entry, now(), 0);
         entry.month.spent = round6(amount);
       } else {
         entry.allocations[allocationId].spent = round6(amount);
