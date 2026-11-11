@@ -32,6 +32,10 @@ export function createExtension({ getHost = processHost } = {}) {
       } catch {
         text = view?.role === 'unconfigured' ? 'search: broker not configured' : 'search: broker offline';
       }
+      // Nobody serves the Gateway, so searches cannot use any credit: say why instead of showing it.
+      if (view?.role === 'offline') {
+        text = `search: broker not running (${view.issue?.reason === 'no-accounts' ? 'no keys yet' : 'see /broker doctor'})`;
+      }
       ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme?.fg ? ctx.ui.theme.fg('dim', text) : text);
     }
 

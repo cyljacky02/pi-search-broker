@@ -12,7 +12,8 @@
 // What the host has decided is one view: { role, control, issue, url }
 //   role     'owner' | 'client' | 'offline' (nobody serves and this process could not) | 'unconfigured' | 'idle'
 //   control  the broker control for that role (in-process / HTTP / offline adapter), null when unconfigured or idle
-//   issue    { level: 'warning' | 'error', message } already worded for the user, or null
+//   issue    { level: 'warning' | 'error', message, reason? } already worded for the user, or null; when offline,
+//            reason says why this process could not start a Gateway: 'no-accounts' | 'port-taken' | 'start-failed'
 //   url      the gateway's base URL, null when unconfigured or idle
 import { createGateway } from './gateway.mjs';
 import { fileStore } from './pool/store.mjs';
@@ -182,12 +183,11 @@ export class BrokerHost {
       if (err.code === 'EADDRINUSE' && await this.#join(remote)) return;
       this.#waitingForKeys = err.code === 'ENOACCOUNTS';
       const offline = offlineControl(config, { statePath: this.#statePath, indexPath: keyIndexPathOf(this.#configPath), fetchImpl: this.#fetchImpl });
-      this.#decide('offline', offline, err.code === 'ENOACCOUNTS' ? { level: 'warning', message: `Search broker: ${err.message}` } : {
-        level: 'error',
-        message: err.code === 'EADDRINUSE'
-          ? `Port ${config.gateway.port} is used by another program (not the broker). Change gateway.port.`
-          : `Could not start the broker gateway: ${redact(err.message, secretsOf(config))}`
-      });
+      this.#decide('offline', offline, err.code === 'ENOACCOUNTS'
+        ? { level: 'warning', reason: 'no-accounts', message: `Search broker: ${err.message}` }
+        : err.code === 'EADDRINUSE'
+          ? { level: 'error', reason: 'port-taken', message: `Port ${config.gateway.port} is used by another program (not the broker). Change gateway.port.` }
+          : { level: 'error', reason: 'start-failed', message: `Could not start the broker gateway: ${redact(err.message, secretsOf(config))}` });
     }
   }
 

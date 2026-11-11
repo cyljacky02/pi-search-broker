@@ -923,6 +923,49 @@ test('pi extension: registers /broker, shows a footer status, re-reads config on
   }
 });
 
+test('pi extension: without a running Gateway the footer says why, and placeholder Accounts never count as credit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-footer-'));
+  const brokerDir = join(dir, 'pi-search-broker');
+  const configPath = join(brokerDir, 'config.json');
+  const agentDir = join(dir, 'agent');
+  mkdirSync(agentDir);
+  const port = await freePort();
+  const host = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: agentDir }, store: memoryStore(), newConfig: { port } });
+  const handlers = {};
+  const commands = {};
+  const statuses = [];
+  const notes = [];
+  const pi = { on: (name, fn) => { handlers[name] = fn; }, registerCommand: (name, opts) => { commands[name] = opts; } };
+  const ctx = { hasUI: true, ui: { setStatus: (k, t) => statuses.push([k, t]), setWidget: () => {}, notify: (m, t) => notes.push([m, t]), theme: null } };
+  try {
+    createExtension({ getHost: () => host })(pi);
+    // First start: no keys yet.
+    await handlers.session_start({ reason: 'startup' }, ctx);
+    assert.equal(host.view.role, 'offline');
+    assert.equal(statuses.at(-1)[1], 'search: broker not running (no keys yet)');
+    // An older config with only the example Accounts init used to write: the Gateway cannot start.
+    await handlers.session_shutdown({ reason: 'reload' }, ctx);
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+    cfg.accounts = [
+      { id: 'exa-promo-01', provider: 'exa', apiKey: 'REPLACE_EXA_KEY', allocations: [{ id: 'promo', limit: 60, period: 'once', expiresAt: '2099-12-01T00:00:00Z' }] },
+      { id: 'tavily-free-01', provider: 'tavily', apiKey: 'REPLACE_TAVILY_KEY', allocations: [{ id: 'free', limit: 1000, period: 'monthly' }] }
+    ];
+    writeFileSync(configPath, JSON.stringify(cfg));
+    await handlers.session_start({ reason: 'reload' }, ctx);
+    assert.equal(host.view.role, 'offline');
+    assert.equal(statuses.at(-1)[1], 'search: broker not running (see /broker doctor)');
+    await commands.broker.handler('status', ctx);
+    const report = notes.at(-1)[0];
+    assert.match(report, /exa-promo-01 \[exa\] not set up: its key in config\.json is still an example value/);
+    assert.match(report, /tavily-free-01 \[tavily\] not set up/);
+    assert.doesNotMatch(report, /\$60|1,000cr/, 'example Accounts never show credit');
+  } finally {
+    await handlers.session_shutdown?.({ reason: 'quit' }, ctx);
+    await host.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('doctor: explains the EXA_API_KEY override trap and the keyless Exa MCP bypass without printing secrets', async () => {
   const { configPath, port, dir, cleanup } = await setup();
   const home = join(dir, 'home');

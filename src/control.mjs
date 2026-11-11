@@ -9,7 +9,7 @@
 // health() never rejects: { state: 'running', version } | { state: 'other' } (something else owns the port) |
 // { state: 'down' }. The in-process and HTTP adapters add control: 'ready' | 'unauthorized' | 'unavailable' when
 // running ('unavailable' includes a Gateway that is stopping).
-import { SERVICE_NAME } from './config.mjs';
+import { SERVICE_NAME, isPlaceholderSource } from './config.mjs';
 import { readKeyIndex } from './keys.mjs';
 import { createAccountPool } from './pool.mjs';
 import { fileStore } from './pool/store.mjs';
@@ -111,10 +111,14 @@ export function offlineControl(config, { statePath, indexPath = null, fetchImpl 
     mode: 'offline',
     // Re-probe identity; if a Broker appears later, this adapter remains offline until the caller reconnects.
     health: () => probeHealth(config, { fetchImpl }),
+    // Accounts whose key is still an example value could never serve: listed as `placeholders`, never as credit.
     status: async () => {
       const ids = new Set(config.accounts.map((a) => a.id));
+      const placeholders = config.accounts.filter((a) => isPlaceholderSource(a.apiKey));
+      const real = config.accounts.filter((a) => !placeholders.includes(a));
       const fromKeyFiles = indexPath ? readKeyIndex(indexPath).filter((a) => !ids.has(a.id)) : [];
-      return createAccountPool([...config.accounts, ...fromKeyFiles], { store: fileStore(statePath, { readOnly: true }) }).snapshot();
+      const snapshot = createAccountPool([...real, ...fromKeyFiles], { store: fileStore(statePath, { readOnly: true }) }).snapshot();
+      return { ...snapshot, placeholders: placeholders.map(({ id, provider }) => ({ id, provider })) };
     },
     enable: refuse, disable: refuse, setSpent: refuse, reconcile: refuse
   };

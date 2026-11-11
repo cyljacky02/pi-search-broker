@@ -17,8 +17,9 @@ export function providerTotals(snapshot) {
   return totals;
 }
 
-// Footer suffix by broker control mode: another process owns the gateway, or nobody runs it.
-const FOOTER_MODE = Object.freeze({ http: ' [shared]', offline: ' [offline]' });
+// Footer suffix by broker control mode: another process owns the gateway. (When nobody runs it, the extension shows
+// why instead of any credit.)
+const FOOTER_MODE = Object.freeze({ http: ' [shared]' });
 
 /** One-line footer text, e.g. "search: exa $41.20 (2/3) · tavily 1,840cr (2/2)". */
 export function statusLine(snapshot, { mode } = {}) {
@@ -43,6 +44,9 @@ export function statusReport(snapshot, { mode, url } = {}) {
     if (a.providerBalance) lines.push(`  provider-reported balance @ ${a.providerBalance.at}: ${amount(a.provider, a.providerBalance.remaining)}`);
     if (a.reconcileError) lines.push(`  balance check failed @ ${a.reconcileError.at}: ${a.reconcileError.message}`);
     if (a.lastRequestId) lines.push(`  last request id: ${a.lastRequestId}`);
+  }
+  for (const p of snapshot.placeholders ?? []) {
+    lines.push(`${p.id} [${p.provider}] not set up: its key in config.json is still an example value. Put real keys in key files, or remove it.`);
   }
   return lines.join('\n');
 }

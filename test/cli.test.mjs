@@ -234,3 +234,23 @@ test('init creates the config and key file templates; there is no import command
     assert.match(out.join('\n'), /^Pi Search Broker/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('Offline status lists placeholder Accounts as not set up and counts no credit for them', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-search-broker-cli-placeholder-'));
+  const configPath = join(dir, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ gateway: { host: '127.0.0.1', port: await freePort(), token: secret }, accounts: [
+    { id: 'exa-promo-01', provider: 'exa', apiKey: 'REPLACE_EXA_KEY', allocations: [{ id: 'promo', limit: 60, period: 'once', expiresAt: '2099-12-01T00:00:00Z' }] },
+    tavily('tavily-real', 'tvly-aaaaaaaa')
+  ] }));
+  const out = [];
+  try {
+    const code = await main(['status', '--config', configPath], {
+      out: (l) => out.push(l), err: (l) => out.push(l), env: {}, fetchImpl: async () => { throw new TypeError('fetch failed'); }
+    });
+    assert.equal(code, 0, out.join('\n'));
+    const text = out.join('\n');
+    assert.match(text, /tavily-real \[tavily\] active/);
+    assert.match(text, /exa-promo-01 \[exa\] not set up: its key in config\.json is still an example value/);
+    assert.doesNotMatch(text, /\$60/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
