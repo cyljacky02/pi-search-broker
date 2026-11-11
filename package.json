@@ -1,6 +1,6 @@
 {
   "name": "pi-search-broker",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "Local Exa + Tavily account-aware key rotation gateway (search broker) for pi-web-access, with a pi extension",
@@ -22,7 +22,7 @@
     "status": "node src/cli.mjs status",
     "doctor": "node src/cli.mjs doctor",
     "reconcile": "node src/cli.mjs reconcile",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --import ./test/setup.mjs --test test/*.test.mjs",
     "check": "node scripts/check.mjs"
   }
 }

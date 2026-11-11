@@ -898,7 +898,7 @@ test('pi extension: registers /broker, shows a footer status, re-reads config on
     assert.match(statuses.at(-1)[1], /\(0\/1\)/);
     await commands.broker.handler('enable tavily-1', ctx);
     await commands.broker.handler('set-spent tavily-1 free lots', ctx);
-    assert.deepEqual(notes.at(-1), ['Usage: /broker set-spent <account> <allocation> <amount>', 'warning']);
+    assert.deepEqual(notes.at(-1), ['Usage: /broker set-spent <account> <allocation|month> <amount>', 'warning']);
     await commands.broker.handler('doctor', ctx);
     assert.match(notes.at(-1)[0], /\[ok\] {3}Gateway is running/);
     assert.match(notes.at(-1)[0], /tavily: base URL points at the broker \(TAVILY_BASE_URL\)/, 'doctor sees the env the host wired');

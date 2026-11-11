@@ -23,11 +23,11 @@ All accounts for one provider that the broker rotates through.
 _Avoid_: Key pool, manager
 
 **Account health**:
-Whether an account is eligible for new attempts, including accounts paused by a human or restricted by a provider.
+Whether an account is eligible for new attempts, including accounts paused by a human or restricted by a provider. An account that is out of credit is *parked* until its credit resets or a balance sync shows credit again.
 _Avoid_: Status
 
 **Allocation**:
-A slice of an account's credit with a limit and a period: either `monthly` (it resets on a set day of the month) or `once` (a promo grant that may expire).
+A configured slice of an account's credit with a limit and a period: either `monthly` (it resets on a set day of the month) or `once` (a promo grant that may expire). It is a hint, used only while the provider reports no balance for the account.
 _Avoid_: Bucket, grant, quota
 
 **Reservation**:
@@ -46,8 +46,12 @@ _Avoid_: Try, call
 The state of an attempt that may have reached the provider but whose outcome is unknown (a timeout, the client went away, an unreadable reply, or an ambiguous connection failure). It is charged at the estimate and never retried on another account.
 _Avoid_: Uncertain, lost
 
+**Balance sync**:
+Asking a provider for an account's provider balance and applying the answer to the account. The command and setting keep the older name "reconcile".
+_Avoid_: Balance check, reconciliation
+
 **Provider balance**:
-The remaining credit as reported by the provider's own balance endpoint. It is shown next to the local figures and never applied to them automatically.
+The remaining credit as reported by the provider's own balance endpoint. When an account has one, it is the account's credit, less what the broker has spent through it since the report. An account with neither a provider balance nor allocations has an unknown balance: it is used until the provider says it is out of credit.
 _Avoid_: Reconciled balance, remote balance
 
 ### Running the broker

@@ -1,19 +1,15 @@
-// Optional, report-only provider balance checks (docs/research/tavily.md §5, docs/research/exa.md §5).
-// Results are shown next to the local estimate in /status; they never change local accounting.
-// Correct local spend with `set-spent` if the two drift apart.
+// Provider balance syncs (docs/research/tavily.md §5, docs/research/exa.md §5): Tavily /usage for every key, Exa
+// /credits with a service key. Each result becomes the Account's credit in the Account pool
+// (docs/adr/0002-provider-balances-are-the-source-of-truth.md); the Gateway decides when to sync.
 import { PROVIDERS } from './providers.mjs';
+import { canSyncBalance } from './pool/credit.mjs';
 
 const SHUTDOWN = Object.freeze({ skipped: 'shutdown' });
 const throwUnknownAccount = () => { throw new Error('Unknown account id'); };
 
-/** Whether this account can be checked against the provider at all. */
-export function canReconcile(account) {
-  return account.reconcile !== false && PROVIDERS[account.provider].balance.supports(account);
-}
-
 /** Fetch one account's balance. Throws an Error with a key-free message on failure. */
 export async function fetchBalance(account, { fetchImpl = fetch, timeoutMs = 10000, signal } = {}) {
-  if (!canReconcile(account)) throw new Error('Balance check not available for this account');
+  if (!canSyncBalance(account)) throw new Error('Balance sync not available for this account');
   const balance = PROVIDERS[account.provider].balance;
   const timeout = AbortSignal.timeout(timeoutMs);
   let res;
@@ -29,21 +25,24 @@ export async function fetchBalance(account, { fetchImpl = fetch, timeoutMs = 100
 }
 
 /**
- * Balance checks for the configured `accounts`, each result recorded in the Account `pool`. A minimum gap per account
- * keeps repeated requests within Tavily's /usage rate limit. Once `signal` aborts (the Gateway is stopping), checks
- * stop: one in flight is abandoned, since an adapter may ignore the signal, and nothing more is recorded.
+ * Balance syncs for the configured `accounts`, each result applied to the Account `pool`. A minimum gap per account
+ * keeps repeated requests within Tavily's /usage rate limit; a sync asked for too soon (soon) runs once the gap has
+ * passed. Once `signal` aborts (the Gateway is stopping), syncs stop: one in flight is abandoned, since an adapter may
+ * ignore the signal, nothing more is recorded, and pending ones are dropped.
  * fetchImpl defaults to the real fetch: balance endpoints are different hosts from the search routes.
+ * @param spacingMs  pause between accounts when syncing all of them, to spread the requests out
  */
 export function createBalanceChecks({
-  accounts, pool, fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, signal = new AbortController().signal
+  accounts, pool, fetchImpl = fetch, now = () => Date.now(), minGapMs = 60000, spacingMs = 0, signal = new AbortController().signal
 }) {
   const lastAttempt = new Map();
+  const pending = new Map(); // accountId -> timer for a sync asked for too soon
 
-  /** One account's balance: { remaining, details }, an Error with a key-free message, or { skipped: reason }. */
-  async function check(account) {
+  /** One account's balance sync: { remaining, details }, an Error with a key-free message, or { skipped: reason }. */
+  async function check(account, { force = false } = {}) {
     if (signal.aborted) return SHUTDOWN;
-    if (!canReconcile(account)) return { skipped: 'not-supported' };
-    if (now() - (lastAttempt.get(account.id) ?? -Infinity) < minGapMs) return { skipped: 'too-soon' };
+    if (!canSyncBalance(account)) return { skipped: 'not-supported' };
+    if (!force && now() - (lastAttempt.get(account.id) ?? -Infinity) < minGapMs) return { skipped: 'too-soon' };
     lastAttempt.set(account.id, now());
     let cancel;
     const cancelled = new Promise((resolve) => {
@@ -62,15 +61,16 @@ export function createBalanceChecks({
   }
 
   /**
-   * Check one account (`accountId`) or all of them, one at a time (gentle on rate limits), and record every balance
-   * or error; a skipped check records nothing. Results: { id, remaining } | { id, skipped } | { id, error }.
+   * Check one account (`accountId`) or all of them, one at a time (gentle on rate limits), and apply every balance or
+   * record every error; a skipped check records nothing. Results: { id, remaining } | { id, skipped } | { id, error }.
    */
-  async function run(accountId) {
+  async function run(accountId, { force = false } = {}) {
     // The account itself (with its keys) is needed before any request, and the pool hands out no accounts.
     const targets = accountId ? [accounts.find((a) => a.id === accountId) ?? throwUnknownAccount()] : accounts;
     const results = [];
-    for (const account of targets) {
-      const outcome = await check(account);
+    for (const [i, account] of targets.entries()) {
+      if (i && spacingMs && !signal.aborted) await new Promise((resolve) => setTimeout(resolve, spacingMs).unref?.());
+      const outcome = await check(account, { force });
       if (outcome.skipped) { results.push({ id: account.id, skipped: outcome.skipped }); continue; }
       pool.recordBalanceCheck(account.id, outcome);
       results.push(outcome instanceof Error ? { id: account.id, error: outcome.message } : { id: account.id, remaining: outcome.remaining });
@@ -78,5 +78,24 @@ export function createBalanceChecks({
     return results;
   }
 
-  return { run };
+  /**
+   * Sync one account as soon as its rate gap allows: now, or once the minimum gap has passed (one pending sync per
+   * account). Resolves with the immediate results.
+   */
+  async function soon(accountId) {
+    const results = await run(accountId);
+    if (results[0]?.skipped === 'too-soon' && !pending.has(accountId) && !signal.aborted) {
+      const wait = Math.max(0, (lastAttempt.get(accountId) ?? 0) + minGapMs - now());
+      const timer = setTimeout(() => {
+        pending.delete(accountId);
+        run(accountId, { force: true }).catch(() => {});
+      }, wait);
+      timer.unref?.();
+      pending.set(accountId, timer);
+    }
+    return results;
+  }
+  signal.addEventListener('abort', () => { for (const timer of pending.values()) clearTimeout(timer); pending.clear(); }, { once: true });
+
+  return { run, soon };
 }

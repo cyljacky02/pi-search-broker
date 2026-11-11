@@ -92,6 +92,8 @@ function accountsToServe(config, keyFolder, secretOptions) {
 }
 
 const SHUTTING_DOWN = 'Gateway is shutting down';
+/** Pause between Accounts when syncing all balances, so a pool of keys does not ask a Provider all at once. */
+const BALANCE_SYNC_SPACING_MS = 250;
 const shuttingDown = () => Object.assign(new Error(SHUTTING_DOWN), { statusCode: 503 });
 
 /**
@@ -140,7 +142,8 @@ export function createGateway(config, {
   const log = quietLogger(logger);
   const now = () => clock.now(); // called through the clock, so an adapter's methods may rely on `this`
   const gate = createGate();
-  const cancelChecks = new AbortController(); // balance checks are report-only, so stopping cancels them
+  const cancelChecks = new AbortController(); // balance syncs are cancelled when the Gateway stops; the last report stays
+  let syncBalances = () => {}; // (accountId?) => void once serving with syncing on (reconcileIntervalMs)
   let serving = null; // what the Gateway runs once it owns the Port: { pool, broker, balanceChecks }
   let timer = null;
   let starting = null;
@@ -151,8 +154,11 @@ export function createGateway(config, {
     const { accounts, replaced, notes } = accountsToServe(config, keyFolder, secretOptions);
     const secrets = secretsOf({ ...config, accounts });
     try {
-      const pool = createAccountPool(accounts, { store, now, logger });
-      const balanceChecks = createBalanceChecks({ accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal });
+      const requestBalanceSync = config.reconcileIntervalMs ? (id) => syncBalances(id) : null;
+      const pool = createAccountPool(accounts, { store, now, logger, requestBalanceSync });
+      const balanceChecks = createBalanceChecks({
+        accounts, pool, fetchImpl: reconcileFetch, now, signal: cancelChecks.signal, spacingMs: BALANCE_SYNC_SPACING_MS
+      });
       const broker = createBroker({ pool, limits: config, secrets, fetchImpl, clock });
       // The Account pool loaded and saved: only now do placeholders leave config.json for good.
       notes.push(...keyFolder.removePlaceholders(replaced));
@@ -276,7 +282,12 @@ export function createGateway(config, {
         throw err;
       }
       if (config.reconcileIntervalMs) {
-        timer = setInterval(() => { gate.run(() => serving.balanceChecks.run()).catch(() => {}); }, config.reconcileIntervalMs);
+        // Provider balances are the Account credit (ADR 0002): sync now, then on a timer and when Accounts run out.
+        syncBalances = (accountId) => {
+          gate.run(() => (accountId ? serving.balanceChecks.soon(accountId) : serving.balanceChecks.run())).catch(() => {});
+        };
+        syncBalances();
+        timer = setInterval(() => syncBalances(), config.reconcileIntervalMs);
         timer.unref();
       }
       if (unref) server.unref();
@@ -287,7 +298,7 @@ export function createGateway(config, {
   }
 
   /**
-   * Stop for good, in this order: refuse new work, cancel balance checks (report-only), let in-flight work settle
+   * Stop for good, in this order: refuse new work, cancel balance syncs, let in-flight work settle
    * (Brokered requests must end their Reservations), release the Port. Calling it again returns the same promise.
    */
   function stop() {

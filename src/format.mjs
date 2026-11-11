@@ -7,14 +7,56 @@ const formatters = Object.freeze({
 });
 const amount = (provider, n) => formatters[PROVIDERS[provider].unit](n);
 
+/** Per Provider: usable/total Accounts, the known credit of usable ones, and how many usable ones have an unknown balance. */
 export function providerTotals(snapshot) {
   const totals = {};
   for (const a of snapshot.accounts) {
-    const t = (totals[a.provider] ??= { available: 0, usable: 0, total: 0 });
+    const t = (totals[a.provider] ??= { available: 0, usable: 0, total: 0, unknown: 0 });
     t.total++;
-    if (a.status === 'active') { t.usable++; t.available += a.available ?? 0; }
+    if (a.status !== 'active') continue;
+    t.usable++;
+    if (a.available === null || a.available === undefined) t.unknown++;
+    else t.available += a.available;
   }
   return totals;
+}
+
+/** "$41.20", "$41.20+?" when some usable Accounts have an unknown balance, or "?" when all of them do. */
+function creditText(provider, t) {
+  if (t.unknown && t.unknown === t.usable) return '?';
+  return `${amount(provider, t.available)}${t.unknown ? '+?' : ''}`;
+}
+
+/** How long before `now` an ISO time was, roughly. */
+function ago(at, now) {
+  const minutes = Math.max(0, Math.round((Date.parse(now) - Date.parse(at)) / 60000));
+  if (minutes < 120) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} d ago`;
+}
+
+const day = (iso) => iso.slice(0, 10);
+
+/** Where an Account's credit comes from, what is left, and how fresh that is. */
+function balanceText(a, now) {
+  const b = a.balance;
+  if (!b || b.source === 'hint') return `~${amount(a.provider, a.available ?? 0)} left (estimate from Allocations)`;
+  const expiring = b.expiring.map((e) => `${amount(a.provider, e.amount)} expires ${day(e.expiresAt)}`);
+  if (b.source === 'unknown') {
+    const hint = expiring.length ? ` (hint: ${expiring.join(', ')})` : '';
+    return `balance unknown${hint}; ${amount(a.provider, b.spentThisMonth ?? 0)} spent this month`;
+  }
+  // "688 of 1,000cr left": the unit once, after the limit ("$8.00 of $10.00" keeps its leading $).
+  const remaining = PROVIDERS[a.provider].unit === 'credits' ? Math.round(b.remaining).toLocaleString('en-US') : amount(a.provider, b.remaining);
+  const text = b.limit !== null ? `${remaining} of ${amount(a.provider, b.limit)} left` : `${amount(a.provider, b.remaining)} left`;
+  return `${text}${expiring.map((e) => `, ${e}`).join('')} (${PROVIDERS[a.provider].label}-reported ${ago(b.reportedAt, now)})`;
+}
+
+/** An Account's health, e.g. "active", "cooldown (rate-limit) until …", or "parked until 2026-12-01 (out of credit)" for quota. */
+function healthText(a) {
+  if (a.status === 'quota') return `parked${a.retryAt ? ` until ${day(a.retryAt)}` : ''} (out of credit)`;
+  const why = a.cooldownReason ? ` (${a.cooldownReason})` : a.lastErrorTag && a.status !== 'active' ? ` (${a.lastErrorTag})` : '';
+  return `${a.status}${why}${a.retryAt ? ` until ${a.retryAt}` : ''}`;
 }
 
 // Footer suffix by broker control mode: another process owns the gateway.
@@ -33,28 +75,28 @@ export function offlineLine(reason) {
   return `search: broker not running (${OFFLINE_FOOTER[reason] ?? OFFLINE_FOOTER[OFFLINE_REASON.START_FAILED]})`;
 }
 
-/** One-line footer text, e.g. "search: exa $41.20 (2/3) · tavily 1,840cr (2/2)". */
+/** One-line footer text, e.g. "search: exa $41.20+? (2/3) · tavily 1,840cr (2/2)". */
 export function statusLine(snapshot, { mode } = {}) {
   const parts = Object.entries(providerTotals(snapshot))
-    .map(([p, t]) => `${p} ${amount(p, t.available)} (${t.usable}/${t.total})`);
+    .map(([p, t]) => `${p} ${creditText(p, t)} (${t.usable}/${t.total})`);
   return `search: ${parts.join(' · ') || 'no accounts'}${snapshot.persistence?.state === 'unavailable' ? ' [storage error; paused]' : ''}${FOOTER_MODE[mode] ?? ''}`;
 }
 
 export function statusReport(snapshot, { mode, url } = {}) {
   const lines = [];
-  lines.push(`Search broker${mode ? ` (${mode}${url ? ` @ ${url}` : ''})` : ''} - local estimates as of ${snapshot.updatedAt}`);
+  lines.push(`Search broker${mode ? ` (${mode}${url ? ` @ ${url}` : ''})` : ''} as of ${snapshot.updatedAt}`);
   if (snapshot.persistence?.state === 'unavailable') {
     lines.push('WARNING: Account pool state could not be saved; new attempts are paused until storage recovers. After a restart or takeover, check provider balances and correct spend.');
   }
   for (const a of snapshot.accounts) {
-    const retry = a.retryAt ? ` until ${a.retryAt}` : '';
-    const why = a.cooldownReason ? ` (${a.cooldownReason})` : a.lastErrorTag && a.status !== 'active' ? ` (${a.lastErrorTag})` : '';
-    lines.push(`${a.id} [${a.provider}] ${a.status}${why}${retry} | ok ${a.requests}, failed ${a.failures}${a.possiblyBilled ? `, possibly billed ${a.possiblyBilled}` : ''} | local estimate ~${amount(a.provider, a.available ?? 0)}`);
-    for (const b of a.allocations) {
-      lines.push(`  ${b.id}: ~${amount(a.provider, b.remainingEstimate)} of ${amount(a.provider, b.limit)} left (${b.period}${b.window && b.window !== 'once' ? ` from ${b.window}` : ''}${b.expiresAt ? `, expires ${b.expiresAt}` : ''}${b.active ? '' : ', inactive'})`);
+    lines.push(`${a.id} [${a.provider}] ${healthText(a)} | ok ${a.requests}, failed ${a.failures}${a.possiblyBilled ? `, possibly billed ${a.possiblyBilled}` : ''} | ${balanceText(a, snapshot.updatedAt)}`);
+    // Allocations matter only while they are the estimate.
+    if (!a.balance || a.balance.source === 'hint') {
+      for (const b of a.allocations) {
+        lines.push(`  ${b.id}: ~${amount(a.provider, b.remainingEstimate)} of ${amount(a.provider, b.limit)} left (${b.period}${b.window && b.window !== 'once' ? ` from ${b.window}` : ''}${b.expiresAt ? `, expires ${b.expiresAt}` : ''}${b.active ? '' : ', inactive'})`);
+      }
     }
-    if (a.providerBalance) lines.push(`  provider-reported balance @ ${a.providerBalance.at}: ${amount(a.provider, a.providerBalance.remaining)}`);
-    if (a.reconcileError) lines.push(`  balance check failed @ ${a.reconcileError.at}: ${a.reconcileError.message}`);
+    if (a.balance?.syncError) lines.push(`  balance sync failed at ${a.balance.syncError.at}: ${a.balance.syncError.message}`);
     if (a.lastRequestId) lines.push(`  last request id: ${a.lastRequestId}`);
   }
   for (const p of snapshot.placeholders ?? []) {

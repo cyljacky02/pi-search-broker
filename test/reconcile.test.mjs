@@ -5,7 +5,7 @@ import { serve, config, exa, tavily, json, DATE } from './helpers.mjs';
 import { createBalanceChecks } from '../src/reconcile.mjs';
 import { createAccountPool } from '../src/pool.mjs';
 import { memoryStore } from '../src/pool/store.mjs';
-import { ROUTES } from '../src/providers.mjs';
+import { ROUTES, EFFECT } from '../src/providers.mjs';
 
 const usage = (remaining) => json({ account: { plan_usage: 1000 - remaining, plan_limit: 1000 } });
 
@@ -48,26 +48,111 @@ test('run checks supported Accounts with the Provider URL and credential, skippi
   ]);
 });
 
-test('Provider balance is report-only: local spend and available credit still allow a subsequent Reservation', async () => {
-  const { checks, pool } = setup(config(tavily('t', 'tvly-aaaaaaaa')).accounts, async () => usage(0));
-  pool.setSpent('t', 'free', 7);
+const tavilyRoute = ROUTES['/tavily/search'];
+const exaRoute = ROUTES['/exa/search'];
+const spend = (pool, route, amount) => pool.attempt(route, amount, new Set(), (r) => r.settle({ amount, exact: true }));
+const usageOf = ({ planUsage, planLimit = 1000, keyUsage = 0, keyLimit = null }) =>
+  json({ key: { usage: keyUsage, limit: keyLimit }, account: { plan_usage: planUsage, plan_limit: planLimit } });
+
+test('A Tavily-reported balance becomes the Account credit; local spend since the report comes off it', async () => {
+  const { checks, pool } = setup(config(tavily('t', 'tvly-aaaaaaaa')).accounts, async () => usageOf({ planUsage: 975 }));
   const before = pool.snapshot().accounts[0];
+  assert.deepEqual([before.balance.source, before.available], ['hint', 1000], 'the free plan until the first report');
 
-  assert.deepEqual(await checks.run('t'), [{ id: 't', remaining: 0 }]);
-  const after = pool.snapshot().accounts[0];
-  assert.equal(after.providerBalance.remaining, 0);
-  assert.equal(after.available, before.available);
-  assert.deepEqual(after.allocations, before.allocations);
+  assert.deepEqual(await checks.run('t'), [{ id: 't', remaining: 25 }]);
+  const synced = pool.snapshot().accounts[0];
+  assert.deepEqual([synced.balance.source, synced.available, synced.balance.limit, synced.balance.reportedAt],
+    ['provider', 25, 1000, new Date(DATE).toISOString()]);
 
-  let reserved = false;
-  await pool.attempt(ROUTES['/tavily/search'], 1, new Set(), (reservation) => {
-    reserved = true;
-    assert.equal(reservation.account.id, 't');
-    reservation.settle({ amount: 1, exact: true });
-  });
-  assert.equal(reserved, true, 'a zero Provider balance does not block a Reservation');
-  assert.equal(pool.snapshot().accounts[0].allocations[0].spent, 8);
-  assert.equal(pool.snapshot().accounts[0].available, 992);
+  await spend(pool, tavilyRoute, 3);
+  assert.equal(pool.snapshot().accounts[0].available, 22);
+  assert.equal(await pool.attempt(tavilyRoute, 30, new Set(), () => assert.fail('no Account has 30 credits')), null);
+});
+
+test('A zero Provider balance parks the Account until the next reset; a later report with credit brings it back', async () => {
+  let planUsage = 1000;
+  const { checks, pool, time } = setup(config(tavily('t', 'tvly-aaaaaaaa')).accounts, async () => usageOf({ planUsage }));
+  await checks.run('t');
+  const parked = pool.snapshot().accounts[0];
+  assert.deepEqual([parked.status, parked.retryAt], ['quota', '2026-12-01T00:00:00.000Z']);
+  assert.equal(await pool.attempt(tavilyRoute, 1, new Set(), () => assert.fail('parked')), null);
+
+  planUsage = 960;
+  time.ms += 60000;
+  await checks.run('t');
+  const back = pool.snapshot().accounts[0];
+  assert.deepEqual([back.status, back.available], ['active', 40]);
+});
+
+test('Exa-reported credit is spent soonest-expiring first, and spend inside the report lag still counts against it', async () => {
+  const account = { ...exa('e', 'exa-search-key'), adminKey: 'exa-admin-key' };
+  const { checks, pool, time } = setup(config(account).accounts, async () => json({
+    credits_usd: 30, expiring_credits: [{ amount_usd: 10, expires_at: '2026-11-20T00:00:00Z' }], metadata: { generated_at: new Date(time.ms).toISOString() }
+  }));
+  await spend(pool, exaRoute, 2); // may not be in a report that lags by up to 5 minutes
+  time.ms += 60000;
+  await checks.run('e');
+  const a = pool.snapshot().accounts[0];
+  assert.deepEqual([a.balance.source, a.available, a.balance.limit], ['provider', 28, null]);
+  assert.deepEqual(a.balance.expiring, [{ amount: 8, expiresAt: '2026-11-20T00:00:00Z' }]);
+});
+
+test('A report from an earlier month no longer counts: the Account falls back to its Allocations until the next report', async () => {
+  const { checks, pool, time } = setup(config(tavily('t', 'tvly-aaaaaaaa')).accounts, async () => usageOf({ planUsage: 975 }));
+  await checks.run('t');
+  time.ms = Date.parse('2026-12-01T00:00:01Z');
+  const a = pool.snapshot().accounts[0];
+  assert.deepEqual([a.balance.source, a.available], ['hint', 1000]);
+});
+
+test('Before a parked Account is retried, its balance is asked for first; the report decides, or the park ends after a grace period', async () => {
+  const time = { ms: DATE };
+  const asked = [];
+  const accounts = config(tavily('t', 'tvly-aaaaaaaa')).accounts;
+  const pool = createAccountPool(accounts, { store: memoryStore(), now: () => time.ms, requestBalanceSync: (id) => asked.push(id) });
+  let planUsage = 1000;
+  const checks = createBalanceChecks({ accounts, pool, now: () => time.ms, fetchImpl: async () => usageOf({ planUsage }) });
+  await pool.attempt(tavilyRoute, 1, new Set(), (r) => r.fail({ status: 432, effect: EFFECT.QUOTA }));
+  assert.deepEqual(asked, ['t'], 'running out asks for the balance');
+  time.ms = Date.parse('2026-12-01T00:00:00Z');
+  assert.equal(pool.snapshot().accounts[0].status, 'quota', 'still parked while the balance is asked for');
+  assert.deepEqual(asked, ['t', 't']);
+  await checks.run('t');
+  assert.equal(pool.snapshot().accounts[0].status, 'quota', 'the report says there is still no credit');
+  planUsage = 0;
+  time.ms += 60000;
+  await checks.run('t');
+  assert.equal(pool.snapshot().accounts[0].status, 'active');
+  // No answer at all: the park ends after the grace period.
+  await pool.attempt(tavilyRoute, 1, new Set(), (r) => r.fail({ status: 432, effect: EFFECT.QUOTA }));
+  time.ms = Date.parse('2027-01-01T00:00:00Z');
+  assert.equal(pool.snapshot().accounts[0].status, 'quota');
+  time.ms += 5 * 60000;
+  assert.equal(pool.snapshot().accounts[0].status, 'active');
+});
+
+test('A check asked for too soon after the last one runs once the minimum gap has passed', async () => {
+  let calls = 0;
+  const accounts = config(tavily('t', 'tvly-aaaaaaaa')).accounts;
+  const pool = createAccountPool(accounts, { store: memoryStore(), now: () => DATE });
+  const checks = createBalanceChecks({ accounts, pool, now: () => DATE, minGapMs: 30, fetchImpl: async () => { calls++; return usageOf({ planUsage: 10 }); } });
+  await checks.run('t');
+  assert.deepEqual(await checks.soon('t'), [{ id: 't', skipped: 'too-soon' }]);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(calls, 2, 'the skipped check ran later');
+});
+
+test('Spend inside the Exa report lag is remembered across a restart', async () => {
+  const time = { ms: DATE };
+  const store = memoryStore();
+  const account = { ...exa('e', 'exa-search-key'), adminKey: 'exa-admin-key' };
+  const accounts = config(account).accounts;
+  await spend(createAccountPool(accounts, { store, now: () => time.ms }), exaRoute, 2);
+  time.ms += 60000;
+  const restarted = createAccountPool(accounts, { store, now: () => time.ms });
+  const checks = createBalanceChecks({ accounts, pool: restarted, now: () => time.ms, fetchImpl: async () => json({ credits_usd: 30 }) });
+  await checks.run('e');
+  assert.equal(restarted.snapshot().accounts[0].available, 28);
 });
 
 test('the default minimum gap skips until exactly 60000ms after the last attempt without recording skips', async () => {

@@ -9,7 +9,7 @@ import { execSync } from 'node:child_process';
 export const SERVICE_NAME = 'pi-search-broker';
 /** The broker's folder inside pi's agent dir: config.json, key files and saved state live there. */
 export const CONFIG_DIR_NAME = SERVICE_NAME;
-export const VERSION = '0.6.2';
+export const VERSION = '0.7.0';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
 export const TOKEN_ENV = 'PI_SEARCH_BROKER_TOKEN';
 /** Optional override for the broker config path (used by the CLI default and the pi extension). */
@@ -26,7 +26,7 @@ export const TAVILY_POOL_VARS = Object.freeze(Array.from({ length: 20 }, (_, i) 
 export const DEFAULTS = Object.freeze({
   totalTimeoutMs: 50000,
   maxTransientRetries: 2,
-  reconcileIntervalMs: 0 // balance checks are optional: off unless configured
+  reconcileIntervalMs: 3600000 // Provider balance sync: at startup, hourly and after running out of credit; 0 turns it off
 });
 
 const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);

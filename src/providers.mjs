@@ -80,8 +80,9 @@ const exa = Object.freeze({
   name: 'exa',
   label: 'Exa',
   unit: 'USD',
-  // The free plan a key file gives each key by default: $10 a month (only for a user's first team).
-  freePlanLimit: 10,
+  // No free plan is assumed for Exa key files: a normal key cannot read its balance (unknown until 402), and the $10
+  // monthly grant only goes to a user's first team.
+  freePlanLimit: null,
   origin: 'https://api.exa.ai',
 
   prepare(body, account, clientHeaders = {}) {
@@ -155,6 +156,8 @@ const exa = Object.freeze({
   balance: Object.freeze({
     url: 'https://admin-api.exa.ai/team-management/credits',
     supports: (account) => Boolean(account.adminKey),
+    anyKey: false, // a normal API key cannot read its balance: without a service key it is unknown
+    lagMs: 5 * 60 * 1000, // "Can lag usage by up to 5 minutes": recent local spend counts against a fresh report
     headers: (account) => ({ 'x-api-key': account.adminKey }),
     parse(data) {
       const credits = num(data?.credits_usd);
@@ -230,6 +233,8 @@ const tavily = Object.freeze({
   balance: Object.freeze({
     url: 'https://api.tavily.com/usage',
     supports: () => true,
+    anyKey: true,
+    lagMs: 0,
     headers: (account) => ({ Authorization: `Bearer ${account.apiKey}` }),
     parse(data) {
       const key = data?.key ?? {};

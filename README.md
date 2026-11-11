@@ -42,15 +42,11 @@ The design decisions below are backed by the research notes in [`docs/research/`
   - Exa uses `costDollars.total`.
   - Tavily uses `usage.credits`; the broker adds `include_usage: true` upstream and removes `usage` from the reply unless you asked for it.
   - Otherwise it reserves a conservative estimate from the current rate cards. Exa: contents are included on `/search` up to 10 results, and all current search types are covered. Tavily: basic, fast and ultra-fast cost 1 credit; advanced and `auto_parameters` cost 2.
-- **Optional, report-only provider balance checks:**
-  - Run on demand with `/broker reconcile` or `npm run reconcile`. Periodic checks are off unless `reconcileIntervalMs` is set.
-  - Tavily `GET /usage` works with any key, at most once a minute per key (Tavily allows 10 calls per 10 minutes).
-  - Exa Team Management `GET /credits` needs a per-account `adminKey`, a service key that Exa support has to enable.
-  - The provider-reported balance is shown next to the local estimate. Local accounting never changes automatically; use `set-spent` if the two differ.
-- **Account model:**
-  - One key per line in a key file is one Account; each key gets the Provider's free plan unless its file says otherwise.
-  - One-time promo credits (`once` + `expiresAt`, or `"expires": "never"` for Exa's onboarding bonus) are spent before monthly allowances, earliest expiry first.
-  - Monthly allowances support `resetDay` (UTC) and `startsAt`.
+- **Balances are observed, not configured** ([ADR 0002](docs/adr/0002-provider-balances-are-the-source-of-truth.md)):
+  - **Tavily:** `GET /usage` works with any key, so every Tavily key's real balance is synced: when the Gateway starts, every hour (`reconcileIntervalMs`), right after Tavily says a key is out of credit, and on `/broker reconcile`. At most one check per key a minute (Tavily allows 10 per 10 minutes).
+  - **Exa:** a normal key cannot read its balance. Such a key is used until Exa answers 402 (not billed); then it is parked until the 1st of next month (UTC), when free credit resets, and the request moves to the next key. With the team's service key (`admin=` in a key file, or `adminKey` in `config.json`), Exa's `GET /credits` gives the exact balance and each promo grant's expiry date.
+  - The Provider-reported balance minus local spend since that report is the key's credit. Until the first report, and for keys that cannot be synced, configured Allocations are the estimate.
+- **Spending order:** credit that will expire goes first (soonest expiry first), then keys with the most known credit, then unknown-balance keys, least recently used first. A promo key that runs out keeps working on its free credit; a key that is fully out is parked until it has credit again.
 - **Safety:**
   - Listens on loopback only, and every request needs the local token.
   - Upstream origins are fixed.
@@ -82,15 +78,16 @@ A **key file** is a plain text file in the `keys` folder. Each line holds one AP
 
 ```text
 ~/.pi/agent/pi-search-broker/keys/
-├── tavily.txt        # Tavily keys on the free plan
-├── exa.txt           # Exa keys on the free plan
-└── exa-promo.txt     # Exa keys that also have promo or trial credit
+├── tavily.txt        # Tavily keys: balances are synced from Tavily
+├── exa.txt           # Exa keys: used until Exa says they are out of credit
+└── exa-team.txt      # Exa keys with their service key (admin=…): exact balances and promo expiry
 ```
 
 - **File names.** `exa*.txt` and `tavily*.txt`, for example `exa.txt` or `exa-promo.txt`. Use only letters, digits, `-` and `_`. The file name becomes the start of each Account id.
 - **Keys.** One key per line. Blank lines and lines starting with `#` are ignored; Windows line endings and a UTF-8 BOM are fine.
-- **Free plan by default.** Every key gets the Provider's free plan as a `monthly` Allocation that resets on the 1st (UTC): Tavily 1,000 credits, Exa $10. Exa grants that only to a user's first team (see below).
-- **Settings lines** describe extra credit for every key in the file, as `# <allocation>: <limit> <monthly|once> [expires=<YYYY-MM-DD|ISO time|never>] [reset-day=<1-28>]`. The limit is in USD for Exa and credits for Tavily; a bare date means midnight UTC. Use `# free: <limit> monthly` to change the free plan, or `# free: none` to drop it. A `#` line whose text after the colon is not a number or `none` is an ordinary comment.
+- **Nothing else is needed.** Tavily keys start from the free plan (1,000 credits a month) until Tavily reports their real balance. Exa keys start with an unknown balance.
+- **Exa service key (optional).** `exa-xxxxxxxx  admin=<service key>` on the key's line turns on exact Exa balances and promo expiry dates for that key. Exa support has to enable service keys for the team. Without one, an Exa key's balance stays unknown even with settings lines: hints only make the broker spend promo credit before it expires.
+- **Settings lines (optional hints)** matter only where the Provider reports nothing, mainly Exa promo credit without a service key, so the broker spends it before it expires: `# <allocation>: <limit> <monthly|once> [expires=<YYYY-MM-DD|ISO time|never>] [reset-day=<1-28>]`. The limit is in USD for Exa and credits for Tavily; a bare date means midnight UTC. For Tavily, `# free: <limit> monthly` changes the starting estimate and `# free: none` drops it. A `#` line whose text after the colon is not a number or `none` is an ordinary comment. A Provider-reported balance always wins over a hint.
 
   ```text
   # promo: 60 once expires=2026-12-01
@@ -98,10 +95,10 @@ A **key file** is a plain text file in the `keys` folder. Each line holds one AP
   exa-yyyyyyyy  expires=2026-12-15
   ```
 
-- **Per-key expiry.** `expires=` after a key replaces the expiry of the file's `once` Allocations for that key. Trial keys usually expire on different days.
-- **Promo first, then free.** Promo (`once`) credit is spent before the monthly allowance, earliest expiry first. When a key's promo credit runs out or expires, the key keeps working on its free plan. Accounts are never deleted automatically.
+- **Per-key expiry.** `expires=` after a key replaces the expiry of the file's `once` hints for that key. Trial keys usually expire on different days.
+- **Running out.** A key that runs out is parked, not deleted: synced keys until a sync shows credit again, others until the 1st of next month (UTC).
 - **Account ids** are the file name plus the first 8 hex characters of the key's SHA-256, for example `exa-promo-3f9a1c2e`. Removing a line removes its Account, but its saved spend stays in `pool-state.json`; put the key back and the Account continues where it was. Moving a key to another file gives it a new id.
-- **Mistakes are skipped, not fatal.** An unusable line (too short, an example value, control characters or a bad `expires=`) is skipped. A file with a bad settings line, or a bad file name, is skipped as a whole. A key that is already listed in an earlier file (by file name), or used by an Account in `config.json`, is skipped too. pi shows each case by file and line number, never the key. The Gateway only refuses to start when there is no Account at all.
+- **Mistakes are skipped, not fatal.** An unusable line (too short, an example value, control characters, a bad `expires=`, or an `admin=` that is unusable or not on an Exa key) is skipped. A file with a bad settings line, or a bad file name, is skipped as a whole. A key that is already listed in an earlier file (by file name), or used by an Account in `config.json`, is skipped too. pi shows each case by file and line number, never the key. The Gateway only refuses to start when there is no Account at all.
 - **When they are read.** Key files are read only when a pi process becomes the Port owner and starts the Gateway: at pi startup, `/reload`, or a takeover. Status, `doctor` and joining another process's Gateway never read them, and when a start finds no Account at all, pi waits for `/reload` instead of re-reading them on every search. A starting Gateway then writes `keys.index.json` next to the config, which lists the ids and Allocations of the key-file Accounts it read but no keys (it is emptied when there are none), so offline `status` can show them.
 - **Placeholders.** Once key files hold a usable key, Accounts in `config.json` whose key is still an example value (such as `REPLACE_…` from older versions of `init`) are removed from `config.json`. Until then, status lists them as "not set up" and never counts their Allocations as credit.
 - Keys stay only in the key files: they are never copied into `config.json`. Keep the folder out of cloud sync and Git.
@@ -118,8 +115,8 @@ A **key file** is a plain text file in the `keys` folder. Each line holds one AP
   /broker status                                     accounts and remaining credits (the default)
   /broker enable <account>                           re-enable an account
   /broker disable <account>                          park an account
-  /broker set-spent <account> <allocation> <amount>  correct local spend to the provider dashboard value
-  /broker reconcile [account]                        show provider-reported balances (report-only)
+  /broker set-spent <account> <allocation|month> <amount>  correct local spend to the provider dashboard value
+  /broker reconcile [account]                        sync balances from the Providers now
   /broker doctor                                     check that pi-web-access really goes through the broker
   ```
 
@@ -164,8 +161,8 @@ Optional settings:
 | `totalTimeoutMs` | 50000 | Total time budget per request (max 55000), kept below pi-web-access's 60 s timeout |
 | `attemptTimeoutMs` | 30 s per route | Global per-attempt override. Remove it if an older config sets it to 10000 |
 | `maxTransientRetries` | 2 | Retries on Exa 503 `SERVICE_OVERLOADED` |
-| `reconcileIntervalMs` | `0` (off) | Optional periodic balance checks (min 120000) |
-| Account `reconcile` | `true` | Set to `false` to skip balance checks for that account |
+| `reconcileIntervalMs` | `3600000` (1 hour) | How often Provider balances are synced (min 120000). Syncing also happens at startup and when a key runs out of credit. `0` turns automatic syncing off |
+| Account `reconcile` | `true` | Set to `false` to keep that account on its configured Allocations and never sync it |
 | Account `projectId` | — | Tavily only: sends `X-Project-ID` |
 | `pi.wireEnvironment` | `true` | Whether the extension sets the base URLs and token variable, and fills in `web-search.json` |
 
@@ -217,7 +214,7 @@ node src/cli.mjs set-spent exa-account-1 promo 12.50
 node src/cli.mjs set-spent tavily-account-1 monthly 230
 ```
 
-`set-spent` corrects **the amount already spent from an allocation** to match the dashboard: USD for Exa, credits for Tavily. It does not set the remaining balance. It also clears the account's disabled state; any separate cooldown remains in effect.
+`set-spent` corrects **the amount already spent** to match the dashboard: USD for Exa, credits for Tavily. Name a hint Allocation, or `month` for this month's spend on any key (what an unknown-balance Exa key shows). It does not set the remaining balance. It also clears the account's disabled state; any separate cooldown remains in effect. On keys whose balance is synced, the next sync replaces local figures anyway.
 
 After changing key files, expiry dates or the account list in `config.json`, run `/reload` in pi, or restart the standalone gateway.
 
@@ -226,12 +223,13 @@ After changing key files, expiry dates or the account list in `config.json`, run
 - Real keys never go into `pool-state.json`, `keys.index.json`, `/status`, logs, error bodies or pi session data. **Key files and `config.json` may contain literal keys**, so keep `~/.pi/agent/pi-search-broker` out of cloud sync and Git, or use `$ENV` / `!command` sources in `config.json`.
 - `gateway.token` is a secret, too. With the extension it lives only in pi's process environment (`PI_SEARCH_BROKER_TOKEN`); in standalone mode protect the shell profile that exports it.
 - Gateway discovery does not authenticate the Port owner: another local process that impersonates the broker's `/health` response can receive the gateway token when a client connects. Health checks and authenticated requests do not follow redirects, but that does not prevent direct local impersonation.
-- Local numbers are estimates unless the provider reported the cost (`costDollars.total`, `usage.credits`). Balance checks are shown alongside them, never applied automatically.
+- Per-request spend is exact when the provider reports the cost (`costDollars.total`, `usage.credits`) and estimated otherwise. Between balance syncs, the last Provider-reported balance minus that local spend is the key's credit.
+  - Tavily: assumes one key per Tavily account. Keys from the same account share one plan, and `/usage` cannot tell which account a key belongs to, so their balances would be counted twice. Promo or bonus credit is not broken out by `/usage`.
   - If saving state fails, a running broker pauses new attempts and retries the save before accepting another one. A restart or Port owner takeover can only load the last successful save and cannot reliably detect missing spend. After a storage failure or crash, check the provider dashboards or `/broker reconcile`, then use `set-spent` to correct local figures.
-  - Exa's `/credits` can lag by up to 5 minutes.
+  - Exa's `/credits` can lag by up to 5 minutes. Local spend from the 5 minutes before a report is subtracted again, so the broker briefly errs on the side of less credit.
   - Tavily may report `0` credits for a single call on threshold-billed endpoints.
   - Whether Tavily bills searches that fail or time out is undocumented. Timed-out attempts are counted as possibly billed.
-- Exa draws soonest-expiring credits first, which matches the local order. The interaction between the monthly free grant and promo credits is undocumented; near a promo expiry, check the dashboard (or `/broker reconcile`) and use `set-spent`.
+- Exa draws soonest-expiring credits first, which matches the local order. The interaction between the monthly free grant and promo credits is undocumented; with a service key the reported balance covers both.
 - **Account rules:**
   - Exa grants the monthly free $10 **only to a user's first team**, so pooled free accounts only work if they belong to different users.
   - Rate limits are per team (Exa) or per key (Tavily, likely).
@@ -239,6 +237,7 @@ After changing key files, expiry dates or the account list in `config.json`, run
 - Months and `resetDay` are UTC.
 - One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config. On graceful shutdown the owner cancels balance checks and waits for in-flight searches to settle before releasing the port; an injected fetch that ignores cancellation and timeouts can delay shutdown indefinitely.
 - Upgrading from 0.2.x: the first gateway of 0.3 or later starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
+- Upgrading from 0.6.x: Provider balances are now synced hourly and applied (`reconcileIntervalMs` defaults to 1 hour; set `0` to keep the old behaviour of never syncing automatically). Exa keys from key files no longer assume $10 a month: without a service key their balance is unknown.
 - Upgrading from 0.5.x or 0.6.0/0.6.1: the broker's folder is now `~/.pi/agent/pi-search-broker` (0.6.0/0.6.1 used `~/.config/pi-search-broker`; earlier releases an older name under `~/.config`). Move your folder there before starting 0.6.2; there is no automatic migration. The `import` command is gone: put keys in key files instead. Accounts already in `config.json` keep working.
 - Upgrading from 0.3.x or 0.4.x: `/reload` switches to the new extension only when no in-process subagent is still using the broker. Otherwise restart pi, so the new extension does not keep running against the older Port owner module.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
@@ -260,18 +259,19 @@ Layout:
 | `src/files.mjs` | `atomicWriteJson`: temp file plus rename, mode 0600, shared by the config and pool state writers |
 | `src/providers.mjs` | One policy object per provider (routes, headers, request preparation, cost rules, error classification, sanitizing, balance endpoint) plus the shared `ACTION` / `EFFECT` / `EXHAUST` constants |
 | `src/broker.mjs` | Brokered request: runs one request across an account pool (attempts, rotation, retries, billing, exhaustion and unsaved-state replies) and returns `{status, body}` |
-| `src/gateway.mjs` | Gateway: `start()` binds the Port, reads key files and resolves `config.json` credentials (skipping key-file duplicates and placeholder Accounts, which never serve), records the key-free key index, then loads the Account pool and removes replaced placeholders from `config.json`; any failure releases the Port without writing Account pool state. `stop()` refuses new work, cancels balance checks, lets in-flight work settle and releases the Port. In between: auth, routing, body parsing and replies around the broker |
-| `src/pool.mjs` | Account pool: accounts, allocations, health and spend. `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends; a save that fails throws `StateNotSaved` with that ending); `recordBalanceCheck()` stores provider balances; keeps the attempt log |
-| `src/pool/health.mjs` | Account health: what each failure effect does to an account (disable, quota, cooldowns) and how it recovers |
+| `src/gateway.mjs` | Gateway: `start()` binds the Port, reads key files and resolves `config.json` credentials (skipping key-file duplicates and placeholder Accounts, which never serve), records the key-free key index, then loads the Account pool, removes replaced placeholders from `config.json` and, with syncing on, syncs balances (at startup, every `reconcileIntervalMs`, and when an account runs out); any failure releases the Port without writing Account pool state. `stop()` refuses new work, cancels balance checks, lets in-flight work settle and releases the Port. In between: auth, routing, body parsing and replies around the broker |
+| `src/pool.mjs` | Account pool: accounts, their credit, health and spend; picks the account for each attempt (expiring credit first, then the most known credit, then unknown balances least recently used). `attempt()` runs one attempt on a Reservation that ends exactly once (`settle`, `settlePossiblyBilled`, `fail`; credit comes back if it never ends; a save that fails throws `StateNotSaved` with that ending); `recordBalanceCheck()` applies a Provider balance as the account's credit (parking or un-parking it); keeps the attempt log |
+| `src/pool/health.mjs` | Account health: what each failure effect does to an account (disable, park when out of credit, cooldowns), what a Provider balance does to a park, and how it recovers (asking for the balance first when it can) |
 | `src/pool/allocation.mjs` | Allocation calendar: windows, reset days, spending order, and when an out-of-credit account is worth retrying |
+| `src/pool/credit.mjs` | Where an account's credit comes from: the last Provider-reported balance minus local spend since (until the next monthly reset), its Allocation hints, or unknown; the credit slices it is spent from |
 | `src/pool/store.mjs` | Where pool state lives: `fileStore` (`pool-state.json`, optionally read-only; started once from a 0.2.x `state.json`, which is never written) or `memoryStore` |
-| `src/reconcile.mjs` | Optional, report-only provider balance checks: one account at a time with a rate gap per account, each result recorded with `pool.recordBalanceCheck`; the Gateway cancels them when it stops |
+| `src/reconcile.mjs` | Balance syncs: Tavily `/usage`, Exa `/credits` with a service key; one account at a time (spaced out) with a minimum gap per account, each result applied with `pool.recordBalanceCheck`; `soon(id)` runs a sync asked for too soon once the gap has passed. The Gateway syncs at startup, every `reconcileIntervalMs` and when an account runs out, and cancels syncs when it stops |
 | `src/format.mjs` | Human-readable status: the footer line (live credit, or why the broker is not running) and the status report |
 | `src/log.mjs` | `quietLogger`: an optional logger that never throws |
 | `src/numbers.mjs` | Number helpers (`round6`, `isNonNegativeNumber`) |
 | `src/clock.mjs` | Time for the brokered request (`now`, `sleep`, `timeout`: attempt timeouts, the deadline, backoff): `realClock`; tests pass a fake clock that fires timeouts on demand |
 | `src/control.mjs` | Broker control: one interface (`health`, `status`, `enable`, `disable`, `setSpent`, `reconcile`) with HTTP and offline (read-only, from the state file plus the key-free `keys.index.json`, never key files) adapters here (offline status also lists placeholder Accounts as not set up) and an in-process adapter built by the Gateway; `connectControl` picks HTTP or offline for the CLI |
-| `src/keys.mjs` | Key files: reads `keys/<provider>*.txt` (one Account per key, Allocations from settings lines, ids from key fingerprints); the key folder a Gateway reads, which saves `keys.index.json` and removes replaced placeholders from `config.json`; reads the index for offline status; creates the key file templates. The only module that reads key files |
+| `src/keys.mjs` | Key files: reads `keys/<provider>*.txt` (one Account per key, an optional Exa service key via `admin=`, optional Allocation hints from settings lines, ids from key fingerprints); the key folder a Gateway reads, which saves `keys.index.json` and removes replaced placeholders from `config.json`; reads the index for offline status; creates the key file templates. The only module that reads key files |
 | `src/commands.mjs` | Account commands shared by the CLI and `/broker`: parser, usage text, result formatting |
 | `src/host.mjs` | Process singleton used by the extension: on first start creates the config and key file templates and fills in missing `web-search.json` key settings; decides with one look at the port whether this process is the Port owner, a client or offline, and hands out one view (`role`, `control`, `issue`, `url`); takeover (not while waiting for keys), environment wiring, and doctor as this process sees it |
 | `src/doctor.mjs` | pi-web-access wiring: checks Gateway access and wiring without resolving Account credentials, reading key files or starting a Gateway, and fills in the key settings `web-search.json` lacks (for the host); words broker-control problems for doctor and the host |

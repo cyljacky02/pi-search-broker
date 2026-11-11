@@ -39,7 +39,7 @@ export function spendingOrder(allocations, now, { spentOf, reservedOf }) {
 
 /**
  * When an out-of-credit account is worth trying again: the next monthly reset or upcoming promo expiry, whichever
- * is first (a promo expiring can activate a free allowance that starts then). 0 when nothing will change.
+ * is first (a promo expiring can activate a free allowance that starts then). 0 when its Allocations never change.
  */
 export function nextCreditChange(allocations, now) {
   const promoExpiries = allocations.filter((a) => a.period === 'once' && a.expiresAt && expiryOf(a) > now).map(expiryOf);

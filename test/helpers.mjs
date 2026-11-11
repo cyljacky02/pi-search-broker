@@ -20,9 +20,10 @@ export const exa = (id, key, promoExpiration = '2026-12-03T00:00:00Z') => ({
   allocations: [{ id: 'promo', limit: 60, period: 'once', expiresAt: promoExpiration }, { id: 'free', limit: 10, period: 'monthly' }]
 });
 export const tavily = (id, key) => ({ id, provider: 'tavily', apiKey: key, allocations: [{ id: 'free', limit: 1000, period: 'monthly' }] });
+/** A validated config. Balance syncing is off unless a test turns it on (it is hourly by default). */
 export const config = (...accounts) => validateConfig({
   gateway: { host: '127.0.0.1', port: 19473, token: secret },
-  totalTimeoutMs: 50000, accounts
+  totalTimeoutMs: 50000, reconcileIntervalMs: 0, accounts
 });
 
 export const json = (data, status = 200, headers = {}) => Response.json(data, { status, headers });
