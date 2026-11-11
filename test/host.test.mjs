@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { request as httpRequest } from 'node:http';
+import { request as httpRequest, createServer } from 'node:http';
 import { TestHost as BrokerHost } from './helpers.mjs';
 import { createExtension } from '../extension/index.js';
 import { runDoctor, describeKey, piWebSearchConfigPath } from '../src/doctor.mjs';
@@ -953,7 +953,10 @@ test('pi extension: without a running Gateway the footer says why, and placehold
     writeFileSync(configPath, JSON.stringify(cfg));
     await handlers.session_start({ reason: 'reload' }, ctx);
     assert.equal(host.view.role, 'offline');
-    assert.equal(statuses.at(-1)[1], 'search: broker not running (see /broker doctor)');
+    assert.equal(statuses.at(-1)[1], 'search: broker not running (no keys yet)', 'example Accounts are no keys');
+    await commands.broker.handler('doctor', ctx);
+    assert.match(notes.at(-1)[0], /\[warn\] This pi process could not start the Gateway: Search broker: No search Accounts yet/);
+    assert.doesNotMatch(notes.at(-1)[0], /Start pi with the extension installed/);
     await commands.broker.handler('status', ctx);
     const report = notes.at(-1)[0];
     assert.match(report, /exa-promo-01 \[exa\] not set up: its key in config\.json is still an example value/);
@@ -963,6 +966,40 @@ test('pi extension: without a running Gateway the footer says why, and placehold
     await handlers.session_shutdown?.({ reason: 'quit' }, ctx);
     await host.release();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pi extension: a client shows the Port owner\'s live credit; a port taken by another program is named in the footer', async () => {
+  const { configPath, port, agentDir, cleanup } = await setup();
+  const handlers = {};
+  const statuses = [];
+  const pi = { on: (name, fn) => { handlers[name] = fn; }, registerCommand: () => {} };
+  const ctx = { hasUI: true, ui: { setStatus: (k, t) => statuses.push([k, t]), setWidget: () => {}, notify: () => {}, theme: null } };
+  const owner = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: agentDir }, store: memoryStore() });
+  const client = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: agentDir }, store: memoryStore() });
+  try {
+    assert.equal((await owner.acquire()).role, 'owner');
+    createExtension({ getHost: () => client })(pi);
+    await handlers.session_start({ reason: 'startup' }, ctx);
+    assert.equal(client.view.role, 'client');
+    assert.equal(statuses.at(-1)[1], 'search: tavily 1,000cr (1/1) [shared]');
+    await handlers.session_shutdown({ reason: 'quit' }, ctx);
+    await owner.release();
+  } finally { await client.release(); await owner.release(); }
+  // Another program answers on the port.
+  const other = createServer((_req, res) => { res.setHeader('content-type', 'application/json'); res.end('{"service":"some-other-app"}'); });
+  await new Promise((resolve) => other.listen(port, '127.0.0.1', resolve));
+  const blocked = new BrokerHost({ configPath, env: { PI_CODING_AGENT_DIR: agentDir }, store: memoryStore() });
+  try {
+    createExtension({ getHost: () => blocked })(pi);
+    await handlers.session_start({ reason: 'startup' }, ctx);
+    assert.equal(blocked.view.role, 'offline');
+    assert.equal(statuses.at(-1)[1], 'search: broker not running (port in use, see /broker doctor)');
+  } finally {
+    await handlers.session_shutdown({ reason: 'quit' }, ctx);
+    await blocked.release();
+    await new Promise((resolve) => other.close(resolve));
+    cleanup();
   }
 });
 

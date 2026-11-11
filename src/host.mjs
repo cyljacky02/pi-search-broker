@@ -13,13 +13,14 @@
 //   role     'owner' | 'client' | 'offline' (nobody serves and this process could not) | 'unconfigured' | 'idle'
 //   control  the broker control for that role (in-process / HTTP / offline adapter), null when unconfigured or idle
 //   issue    { level: 'warning' | 'error', message, reason? } already worded for the user, or null; when offline,
-//            reason says why this process could not start a Gateway: 'no-accounts' | 'port-taken' | 'start-failed'
+//            reason (format.mjs OFFLINE_REASON) says why this process could not start a Gateway
 //   url      the gateway's base URL, null when unconfigured or idle
 import { createGateway } from './gateway.mjs';
 import { fileStore } from './pool/store.mjs';
 import { VERSION, TOKEN_ENV, defaultConfigPath, defaultStatePath, loadConfig, createConfig, secretsOf } from './config.mjs';
 import { keyFolderAt, keyIndexPathOf, writeKeyFileTemplates } from './keys.mjs';
 import { redact } from './providers.mjs';
+import { OFFLINE_REASON } from './format.mjs';
 import { baseUrl, httpControl, offlineControl } from './control.mjs';
 import {
   piWebSearchConfigPath, readPiWebSearchConfig, addBrokerKeySources, piWiringIssues, gatewayControlIssue, runDoctor
@@ -27,6 +28,15 @@ import {
 import { realClock } from './clock.mjs';
 
 const HOST_KEY = Symbol.for('pi-search-broker.host');
+
+/** The offline issue for a Gateway that could not start, worded for the user (never with secrets). */
+function startIssue(err, config) {
+  if (err.code === 'ENOACCOUNTS') return { level: 'warning', reason: OFFLINE_REASON.NO_ACCOUNTS, message: `Search broker: ${err.message}` };
+  if (err.code === 'EADDRINUSE') {
+    return { level: 'error', reason: OFFLINE_REASON.PORT_TAKEN, message: `Port ${config.gateway.port} is used by another program (not the broker). Change gateway.port.` };
+  }
+  return { level: 'error', reason: OFFLINE_REASON.START_FAILED, message: `Could not start the broker gateway: ${redact(err.message, secretsOf(config))}` };
+}
 const PROBE_CACHE_MS = 3000;
 const IDLE = Object.freeze({ role: 'idle', control: null, issue: null, url: null });
 
@@ -133,7 +143,8 @@ export class BrokerHost {
     try { config = this.#config ?? loadConfig(this.#configPath); }
     catch (err) { return runDoctor({ configError: err.message }); }
     const control = this.#gateway?.control ?? httpControl(config, { fetchImpl: this.#fetchImpl });
-    return runDoctor({ config, control, env: this.#env });
+    const startFailure = this.#view.role === 'offline' ? this.#view.issue : null;
+    return runDoctor({ config, control, env: this.#env, startFailure });
   }
 
   #loadConfig() {
@@ -183,11 +194,7 @@ export class BrokerHost {
       if (err.code === 'EADDRINUSE' && await this.#join(remote)) return;
       this.#waitingForKeys = err.code === 'ENOACCOUNTS';
       const offline = offlineControl(config, { statePath: this.#statePath, indexPath: keyIndexPathOf(this.#configPath), fetchImpl: this.#fetchImpl });
-      this.#decide('offline', offline, err.code === 'ENOACCOUNTS'
-        ? { level: 'warning', reason: 'no-accounts', message: `Search broker: ${err.message}` }
-        : err.code === 'EADDRINUSE'
-          ? { level: 'error', reason: 'port-taken', message: `Port ${config.gateway.port} is used by another program (not the broker). Change gateway.port.` }
-          : { level: 'error', reason: 'start-failed', message: `Could not start the broker gateway: ${redact(err.message, secretsOf(config))}` });
+      this.#decide('offline', offline, startIssue(err, config));
     }
   }
 

@@ -17,9 +17,21 @@ export function providerTotals(snapshot) {
   return totals;
 }
 
-// Footer suffix by broker control mode: another process owns the gateway. (When nobody runs it, the extension shows
-// why instead of any credit.)
+// Footer suffix by broker control mode: another process owns the gateway.
 const FOOTER_MODE = Object.freeze({ http: ' [shared]' });
+
+/** Why this process could not start a Gateway (the host's offline view carries one as issue.reason). */
+export const OFFLINE_REASON = Object.freeze({ NO_ACCOUNTS: 'no-accounts', PORT_TAKEN: 'port-taken', START_FAILED: 'start-failed' });
+const OFFLINE_FOOTER = Object.freeze({
+  [OFFLINE_REASON.NO_ACCOUNTS]: 'no keys yet',
+  [OFFLINE_REASON.PORT_TAKEN]: 'port in use, see /broker doctor',
+  [OFFLINE_REASON.START_FAILED]: 'see /broker doctor'
+});
+
+/** Footer when nobody serves the Gateway: searches cannot use any credit, so say why instead of showing it. */
+export function offlineLine(reason) {
+  return `search: broker not running (${OFFLINE_FOOTER[reason] ?? OFFLINE_FOOTER[OFFLINE_REASON.START_FAILED]})`;
+}
 
 /** One-line footer text, e.g. "search: exa $41.20 (2/3) · tavily 1,840cr (2/2)". */
 export function statusLine(snapshot, { mode } = {}) {

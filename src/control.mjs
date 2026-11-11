@@ -4,7 +4,9 @@
 //               with the Gateway
 //   http        another process owns it; authenticated loopback HTTP
 //   offline     nobody runs it; status is read from the state file (key-file Accounts from the key-free index the last
-//               Gateway left, never from key files), and changes are refused so only the running gateway writes state
+//               Gateway left, never from key files), and changes are refused so only the running gateway writes state.
+//               Its status also lists `placeholders` ({ id, provider }): config.json Accounts whose key is still an
+//               example value, which no Gateway serves, so they never count as credit
 // Every adapter: { mode, health(), status(), enable(id), disable(id), setSpent(id, allocationId, amount), reconcile(id?) }
 // health() never rejects: { state: 'running', version } | { state: 'other' } (something else owns the port) |
 // { state: 'down' }. The in-process and HTTP adapters add control: 'ready' | 'unauthorized' | 'unavailable' when
@@ -114,10 +116,11 @@ export function offlineControl(config, { statePath, indexPath = null, fetchImpl 
     // Accounts whose key is still an example value could never serve: listed as `placeholders`, never as credit.
     status: async () => {
       const ids = new Set(config.accounts.map((a) => a.id));
-      const placeholders = config.accounts.filter((a) => isPlaceholderSource(a.apiKey));
-      const real = config.accounts.filter((a) => !placeholders.includes(a));
+      const placeholders = [];
+      const usable = [];
+      for (const account of config.accounts) (isPlaceholderSource(account.apiKey) ? placeholders : usable).push(account);
       const fromKeyFiles = indexPath ? readKeyIndex(indexPath).filter((a) => !ids.has(a.id)) : [];
-      const snapshot = createAccountPool([...real, ...fromKeyFiles], { store: fileStore(statePath, { readOnly: true }) }).snapshot();
+      const snapshot = createAccountPool([...usable, ...fromKeyFiles], { store: fileStore(statePath, { readOnly: true }) }).snapshot();
       return { ...snapshot, placeholders: placeholders.map(({ id, provider }) => ({ id, provider })) };
     },
     enable: refuse, disable: refuse, setSpent: refuse, reconcile: refuse

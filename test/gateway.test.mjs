@@ -39,7 +39,7 @@ test('A Gateway validates every resolved Account credential before writing state
   const cases = [
     { accounts: [tavily('t', '$MISSING')], error: /empty or unset/ },
     { accounts: [tavily('t', 'short')], error: /Missing real apiKey/ },
-    { accounts: [tavily('t', 'REPLACE_TAVILY_KEY')], error: /Missing real apiKey/ },
+    { accounts: [tavily('t', 'REPLACE_TAVILY_KEY')], error: /No search Accounts yet/ },
     { accounts: [tavily('a', '$SHARED'), tavily('b', 'secret-without-provider-prefix')], error: /Duplicate apiKey/ },
     { accounts: [{ ...exa('e', 'exa-aaaaaaaa'), adminKey: '$MISSING_ADMIN' }], error: /empty or unset/ },
     { accounts: [{ ...exa('e', 'exa-aaaaaaaa'), adminKey: 'REPLACE_ADMIN_KEY' }], error: /Missing real adminKey/ },
