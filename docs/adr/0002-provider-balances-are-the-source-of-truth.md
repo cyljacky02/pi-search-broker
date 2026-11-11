@@ -10,6 +10,6 @@ Users should not have to describe each key's credit by hand, so the broker now t
 ## Consequences
 
 - A report is valid until the next monthly reset (the 1st, UTC); after that the account falls back to its hints until the next report.
-- Exa `/credits` can lag up to 5 minutes, so spend in the 5 minutes before a report is subtracted again: the broker errs on the side of less credit.
+- Reports lag behind billed searches: Exa `/credits` by up to 5 minutes (documented), Tavily `/usage` by more than 16 minutes (observed live, undocumented; one hour is assumed). Spend inside that window before a report is subtracted again: the broker errs on the side of less credit.
 - Tavily keys from the same account share one plan, which `/usage` cannot reveal; the broker assumes one key per Tavily account.
 - `reconcileIntervalMs: 0` turns automatic syncing off; `"reconcile": false` keeps one account on its Allocations.

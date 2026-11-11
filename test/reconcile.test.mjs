@@ -249,3 +249,14 @@ test('POST /admin/reconcile translates success and unknown-id errors to HTTP', a
     assert.deepEqual(await unknown.json(), { error: 'Unknown account id' });
   }, { reconcileFetch: async () => usage(25) });
 });
+
+test('Tavily reports lag too: spend in the hour before a report still counts against it', async () => {
+  const { checks, pool, time } = setup(config(tavily('t', 'tvly-aaaaaaaa')).accounts, async () => usageOf({ planUsage: 0 }));
+  await spend(pool, tavilyRoute, 1);
+  time.ms += 20 * 60000; // inside the assumed lag (see the Tavily lagMs in providers.mjs)
+  await checks.run('t');
+  assert.equal(pool.snapshot().accounts[0].available, 999);
+  time.ms += 60 * 60000;
+  await checks.run('t');
+  assert.equal(pool.snapshot().accounts[0].available, 1000, 'after the lag window the report is trusted as is');
+});

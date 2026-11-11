@@ -325,6 +325,7 @@ When `key.limit` is null, ignore the key term.
 
 Caveats:
 
+- **Freshness is undocumented.** Observed (not first-party), 2026-11-11, free "Researcher" plan: after a basic search billed 1 credit (`usage.credits: 1`), `GET /usage` for that key still reported `key.usage: 0` and `plan_usage: 0` about 1, 4 and 17 minutes later. Treat `/usage` as lagging by at least that much; the broker assumes one hour.
 - Promo or bonus credits are not broken out in this response (**undocumented**).
 - Moving a key to another workspace resets the key's own usage to 0 [orgs].
 - If a plan's credits run out but PAYGO is enabled, requests keep succeeding at $0.008 per credit [credits].

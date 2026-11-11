@@ -234,7 +234,9 @@ const tavily = Object.freeze({
     url: 'https://api.tavily.com/usage',
     supports: () => true,
     anyKey: true,
-    lagMs: 0,
+    // Undocumented, observed live (docs/research/tavily.md §5): /usage lags billed searches by more than 16 minutes.
+    // Counting the last hour of local spend again errs on the side of less credit. Re-measure and lower if shorter.
+    lagMs: 60 * 60 * 1000,
     headers: (account) => ({ Authorization: `Bearer ${account.apiKey}` }),
     parse(data) {
       const key = data?.key ?? {};
