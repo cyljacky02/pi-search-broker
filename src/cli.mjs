@@ -21,7 +21,8 @@ const HELP = `Pi Search Broker (Node 20.3+, no dependencies)
 ${usage(PREFIX, CLI_ONLY)}
 
 Every command accepts --config /path/to/config.json. The default is $PI_SEARCH_BROKER_CONFIG or
-~/.config/pi-search-broker/config.json. API keys go in the keys folder next to it (keys/exa.txt, keys/tavily.txt).
+~/.pi/agent/pi-search-broker/config.json (inside $PI_CODING_AGENT_DIR when set). API keys go in the keys folder
+next to it (keys/exa.txt, keys/tavily.txt).
 enable/disable/set-spent/reconcile need a running gateway.
 Never paste real provider API keys into shell commands or logs.`;
 

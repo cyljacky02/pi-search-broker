@@ -68,11 +68,11 @@ The design decisions below are backed by the research notes in [`docs/research/`
    ```
 
 2. Start pi. On its first start the extension sets everything up, and never overwrites a file:
-   - `~/.config/pi-search-broker/config.json` (mode 0600), holding a random Gateway token and no Accounts
-   - `~/.config/pi-search-broker/keys/exa.txt` and `keys/tavily.txt`, which contain only instructions
+   - `~/.pi/agent/pi-search-broker/config.json` (mode 0600), holding a random Gateway token and no Accounts
+   - `~/.pi/agent/pi-search-broker/keys/exa.txt` and `keys/tavily.txt`, which contain only instructions
    - in `~/.pi/agent/web-search.json`, `"exaApiKey"` / `"tavilyApiKey"` set to `"$PI_SEARCH_BROKER_TOKEN"` if they are missing or empty. Values that are already set are never changed; if they would bypass the broker, you get a warning with the fix.
 
-   Set `PI_SEARCH_BROKER_CONFIG` to use another config path. The `keys` folder always sits next to the config.
+   The broker's folder lives in pi's agent dir, next to `web-search.json`: `~/.pi/agent`, or `$PI_CODING_AGENT_DIR` when you set that for pi. Set `PI_SEARCH_BROKER_CONFIG` to use another config path. The `keys` folder always sits next to the config.
 
 3. Put your API keys in the key files, one per line, then run `/reload` in pi. The footer shows the remaining credit, for example `search: exa $41.20 (2/3) · tavily 1,840cr (2/2)`.
 
@@ -81,7 +81,7 @@ The design decisions below are backed by the research notes in [`docs/research/`
 A **key file** is a plain text file in the `keys` folder. Each line holds one API key, and each key is one Account. The key file is the only source of its Accounts: edit it, then `/reload`. The decision record is [docs/adr/0001-key-files-own-their-accounts.md](docs/adr/0001-key-files-own-their-accounts.md).
 
 ```text
-~/.config/pi-search-broker/keys/
+~/.pi/agent/pi-search-broker/keys/
 ├── tavily.txt        # Tavily keys on the free plan
 ├── exa.txt           # Exa keys on the free plan
 └── exa-promo.txt     # Exa keys that also have promo or trial credit
@@ -223,7 +223,7 @@ After changing key files, expiry dates or the account list in `config.json`, run
 
 ## Security and accuracy limitations
 
-- Real keys never go into `pool-state.json`, `keys.index.json`, `/status`, logs, error bodies or pi session data. **Key files and `config.json` may contain literal keys**, so keep `~/.config/pi-search-broker` out of cloud sync and Git, or use `$ENV` / `!command` sources in `config.json`.
+- Real keys never go into `pool-state.json`, `keys.index.json`, `/status`, logs, error bodies or pi session data. **Key files and `config.json` may contain literal keys**, so keep `~/.pi/agent/pi-search-broker` out of cloud sync and Git, or use `$ENV` / `!command` sources in `config.json`.
 - `gateway.token` is a secret, too. With the extension it lives only in pi's process environment (`PI_SEARCH_BROKER_TOKEN`); in standalone mode protect the shell profile that exports it.
 - Gateway discovery does not authenticate the Port owner: another local process that impersonates the broker's `/health` response can receive the gateway token when a client connects. Health checks and authenticated requests do not follow redirects, but that does not prevent direct local impersonation.
 - Local numbers are estimates unless the provider reported the cost (`costDollars.total`, `usage.credits`). Balance checks are shown alongside them, never applied automatically.
@@ -239,7 +239,7 @@ After changing key files, expiry dates or the account list in `config.json`, run
 - Months and `resetDay` are UTC.
 - One gateway owns `pool-state.json` at a time. The extension enforces this through the port, so do not run a standalone gateway on a different port against the same config. On graceful shutdown the owner cancels balance checks and waits for in-flight searches to settle before releasing the port; an injected fetch that ignores cancellation and timeouts can delay shutdown indefinitely.
 - Upgrading from 0.2.x: the first gateway of 0.3 or later starts `pool-state.json` from the old `state.json` and never writes the old file, so 0.2.x pi processes that are still open keep working until you `/reload` them. Spend recorded by those older processes after the upgrade is not carried over; check with `/broker reconcile` and `set-spent` if needed.
-- Upgrading from 0.5.x: the config folder is now `~/.config/pi-search-broker` (earlier releases used an older folder name). Move the old folder to that path before starting 0.6; there is no automatic migration. The `import` command is gone: put keys in key files instead. Accounts already in `config.json` keep working.
+- Upgrading from 0.5.x or 0.6.0/0.6.1: the broker's folder is now `~/.pi/agent/pi-search-broker` (0.6.0/0.6.1 used `~/.config/pi-search-broker`; earlier releases an older name under `~/.config`). Move your folder there before starting 0.6.2; there is no automatic migration. The `import` command is gone: put keys in key files instead. Accounts already in `config.json` keep working.
 - Upgrading from 0.3.x or 0.4.x: `/reload` switches to the new extension only when no in-process subagent is still using the broker. Otherwise restart pi, so the new extension does not keep running against the older Port owner module.
 - `/status` and `/broker status` show the most recent request metadata (provider, account, status, request id, cost). They never show queries.
 

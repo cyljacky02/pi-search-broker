@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateConfig, webSearchFragment, resolveSecret } from '../src/config.mjs';
+import { validateConfig, webSearchFragment, resolveSecret, defaultConfigPath } from '../src/config.mjs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { baseUrl } from '../src/control.mjs';
 import { config, exa, tavily, secret } from './helpers.mjs';
 
@@ -46,4 +48,10 @@ test('Credential sources retain their syntax until local Gateway startup', () =>
     accounts: [{ id: 'e', provider: 'exa', apiKey: 'exa-key-aaaa', allocations: [{ id: 'bonus', limit: 10, period: 'once', expires: 'never' }] }]
   });
   assert.equal(never.accounts[0].allocations[0].expires, 'never');
+});
+
+test('The broker folder lives in pi\'s agent dir, unless PI_SEARCH_BROKER_CONFIG names another config', () => {
+  assert.equal(defaultConfigPath({}), join(homedir(), '.pi', 'agent', 'pi-search-broker', 'config.json'));
+  assert.equal(defaultConfigPath({ PI_CODING_AGENT_DIR: join('x', 'agent') }), join('x', 'agent', 'pi-search-broker', 'config.json'));
+  assert.equal(defaultConfigPath({ PI_CODING_AGENT_DIR: join('x', 'agent'), PI_SEARCH_BROKER_CONFIG: join('y', 'c.json') }), join('y', 'c.json'));
 });
