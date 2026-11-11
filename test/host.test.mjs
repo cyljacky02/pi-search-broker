@@ -1043,3 +1043,38 @@ test('doctor helpers mirror pi-web-access resolution rules', () => {
   assert.equal(describeKey('!op read x', 'EXA_API_KEY', env, TOKEN).matches, null);
   assert.equal(piWebSearchConfigPath({ PI_CODING_AGENT_DIR: '/x' }, '/home'), join('/x', 'web-search.json'));
 });
+
+test('doctor: the default provider setting is read the way pi-web-access reads it: lists and "all" run in parallel', async () => {
+  const { configPath, dir, cleanup } = await setup();
+  const home = join(dir, 'home');
+  mkdirSync(join(home, '.pi', 'agent'), { recursive: true });
+  const env = { PI_SEARCH_BROKER_TOKEN: TOKEN };
+  const routing = { searchRouting: { providers: ['exa', 'tavily'], fallbackOn: ['quota', 'transient'] } };
+  try {
+    const config = loadConfig(configPath);
+    const control = offlineControl(config, { statePath: join(dir, 'state.json') });
+    /** The doctor line about the default provider setting, for this web-search.json. */
+    const about = async (pi) => {
+      writeFileSync(join(home, '.pi', 'agent', 'web-search.json'), JSON.stringify({
+        exaApiKey: '$PI_SEARCH_BROKER_TOKEN', tavilyApiKey: '$PI_SEARCH_BROKER_TOKEN', ...pi
+      }));
+      const lines = (await runDoctor({ config, control, env, home })).filter((c) => /"(searchProvider|provider)"/.test(c.message));
+      assert.ok(lines.length <= 1, JSON.stringify(lines));
+      return lines[0] ?? null;
+    };
+    assert.deepEqual(await about({ searchProvider: ['exa', 'tavily'] }), {
+      level: 'info',
+      message: '"searchProvider" runs exa and tavily in parallel: results are merged, and if one fails the others\' results are still returned.'
+    });
+    assert.match((await about({ searchProvider: [' EXA ', 'tavily'], ...routing })).message,
+      /runs exa and tavily in parallel.*if all fail with a fallbackOn kind, the untried searchRouting providers are tried next\.$/);
+    assert.match((await about({ provider: ' ALL ' })).message, /^"provider" runs every available provider in parallel/);
+    assert.equal((await about({ searchProvider: 'tavily' })).level, 'warn', 'one provider: no fallback');
+    assert.equal((await about({ searchProvider: ['exa'] })).level, 'warn', 'a list of one is one provider');
+    assert.equal((await about({ searchProvider: ['exa'], ...routing })).level, 'info', 'a list of one still falls back to searchRouting');
+    assert.match((await about({ searchProvider: 'exa,tavily' })).message, /is not a provider name; pi-web-access uses "auto"/);
+    assert.match((await about({ searchProvider: 'auto', ...routing })).message, /searchRouting is ignored/);
+    assert.deepEqual(await about({}), null, 'nothing set: pi decides');
+    assert.equal((await about({ searchProvider: ['exa', 'exa'] })).level, 'error', 'pi-web-access rejects duplicates');
+  } finally { cleanup(); }
+});

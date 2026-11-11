@@ -1,6 +1,6 @@
 // pi-web-access wiring: "is pi-web-access actually going through the broker?" checks, and filling in the key settings
 // web-search.json lacks (addBrokerKeySources, used by the host on first start).
-// Mirrors pi-web-access 0.47.0 resolution rules (docs/research/pi-web-access.md §2-§4).
+// Mirrors pi-web-access 0.47.0 resolution rules (docs/research/pi-web-access.md §2-§4, and §6 for provider lists).
 // Never prints secret values: only "set / not set / matches the broker token".
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -90,6 +90,45 @@ export function piWiringIssues(pi, env, token) {
   return issues;
 }
 
+/**
+ * What web-search.json's default provider setting does, read as pi-web-access 0.47.0 reads it
+ * (PWA/gemini-search.ts:176-177, 252-268, 288-292, 826-841, 674-743), or null when it is not set:
+ *  - `searchProvider` wins over `provider`; setting either one means `searchRouting` no longer drives default searches;
+ *  - a string is trimmed and lower-cased; one that is not a provider name becomes "auto" (names are not listed
+ *    here, so only text that cannot be a name, such as "exa,tavily", is caught);
+ *  - a list runs its providers in parallel and merges what succeeds; when all fail with a `fallbackOn` kind, the
+ *    untried `searchRouting` providers come next. Duplicates or non-names make pi-web-access reject the file.
+ */
+export function defaultProviderCheck(pi) {
+  const field = Object.hasOwn(pi, 'searchProvider') ? 'searchProvider' : Object.hasOwn(pi, 'provider') ? 'provider' : null;
+  if (!field) return null;
+  const value = pi[field];
+  const routed = Boolean(pi.searchRouting);
+  const thenRouting = routed ? '; if all fail with a fallbackOn kind, the untried searchRouting providers are tried next.' : '.';
+  if (Array.isArray(value)) {
+    const names = value.map((p) => (typeof p === 'string' ? p.trim().toLowerCase() : ''));
+    if (names.some((n) => !n) || new Set(names).size !== names.length) {
+      return { level: 'error', message: `"${field}" must list distinct provider names; pi-web-access rejects web-search.json otherwise.` };
+    }
+    if (names.length > 1) {
+      return { level: 'info', message: `"${field}" runs ${names.join(' and ')} in parallel: results are merged, and if one fails the others' results are still returned${thenRouting}` };
+    }
+    return routed
+      ? { level: 'info', message: `"${field}" runs ${names[0]}; if it fails with a fallbackOn kind, the untried searchRouting providers are tried next.` }
+      : { level: 'warn', message: `"${field}" is set to one provider (${names[0]}); there is no cross-provider fallback.` };
+  }
+  const name = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (name === 'all') {
+    return { level: 'info', message: `"${field}" runs every available provider in parallel: results are merged, and if one fails the others' results are still returned.` };
+  }
+  const ignored = routed ? ' searchRouting is ignored while it is set.' : '';
+  if (name === 'auto') return routed ? { level: 'warn', message: `"${field}" is set to "auto", so pi-web-access uses its built-in order:${ignored} Remove it to use searchRouting.` } : null;
+  if (!/^[a-z0-9-]+$/.test(name)) {
+    return { level: 'warn', message: `"${field}" (${JSON.stringify(value)}) is not a provider name; pi-web-access uses "auto" instead.${ignored} For several providers in parallel, use a list such as ["exa", "tavily"].` };
+  }
+  return { level: 'warn', message: `"${field}" is set to one provider (${name}); it overrides searchRouting and there is no cross-provider fallback.` };
+}
+
 /** Explain an identified Broker whose authenticated control cannot be used, without exposing credentials. */
 export function gatewayControlIssue(health, base, mode) {
   if (health.state !== 'running') return null;
@@ -162,8 +201,8 @@ export async function runDoctor({ config, configError, control, env = process.en
   }
   for (const issue of issues) add(issue.level, issue.message);
 
-  const top = pi.searchProvider ?? pi.provider;
-  if (top !== undefined && top !== 'auto') add('warn', `Top-level "${pi.searchProvider !== undefined ? 'searchProvider' : 'provider'}" is set; it overrides searchRouting and disables cross-provider fallback.`);
+  const providerCheck = defaultProviderCheck(pi);
+  if (providerCheck) add(providerCheck.level, providerCheck.message);
   const fallbackOn = pi.searchRouting?.fallbackOn;
   if (Array.isArray(fallbackOn)) {
     const missing = ['quota', 'transient'].filter((k) => !fallbackOn.includes(k));
