@@ -1043,3 +1043,30 @@ test('doctor helpers mirror pi-web-access resolution rules', () => {
   assert.equal(describeKey('!op read x', 'EXA_API_KEY', env, TOKEN).matches, null);
   assert.equal(piWebSearchConfigPath({ PI_CODING_AGENT_DIR: '/x' }, '/home'), join('/x', 'web-search.json'));
 });
+
+test('doctor: a searchProvider list (or "all") runs in parallel, so it is reported as such, not as lost fallback', async () => {
+  const { configPath, dir, cleanup } = await setup();
+  const home = join(dir, 'home');
+  mkdirSync(join(home, '.pi', 'agent'), { recursive: true });
+  const write = (pi) => writeFileSync(join(home, '.pi', 'agent', 'web-search.json'), JSON.stringify({
+    exaApiKey: '$PI_SEARCH_BROKER_TOKEN', tavilyApiKey: '$PI_SEARCH_BROKER_TOKEN', ...pi
+  }));
+  const env = { PI_SEARCH_BROKER_TOKEN: TOKEN };
+  try {
+    const config = loadConfig(configPath);
+    const control = offlineControl(config, { statePath: join(dir, 'state.json') });
+    const doctor = async (pi) => { write(pi); return runDoctor({ config, control, env, home }); };
+    const parallel = await doctor({ searchProvider: ['exa', 'tavily'] });
+    assert.deepEqual(parallel.filter((c) => /searchProvider/.test(c.message)), [{
+      level: 'info',
+      message: '"searchProvider" runs exa and tavily in parallel: results are merged, and if one fails the others\' results are still returned.'
+    }]);
+    assert.ok(!parallel.some((c) => /disables cross-provider fallback/.test(c.message)));
+    const all = await doctor({ provider: 'all' });
+    assert.match(all.find((c) => /"provider"/.test(c.message)).message, /^"provider" runs every available provider in parallel/);
+    const single = await doctor({ searchProvider: 'tavily' });
+    assert.equal(single.find((c) => /searchProvider/.test(c.message)).level, 'warn', 'one provider still loses fallback');
+    const one = await doctor({ searchProvider: ['exa'] });
+    assert.equal(one.find((c) => /searchProvider/.test(c.message)).level, 'warn', 'a list of one is one provider');
+  } finally { cleanup(); }
+});

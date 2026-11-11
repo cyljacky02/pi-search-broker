@@ -163,7 +163,14 @@ export async function runDoctor({ config, configError, control, env = process.en
   for (const issue of issues) add(issue.level, issue.message);
 
   const top = pi.searchProvider ?? pi.provider;
-  if (top !== undefined && top !== 'auto') add('warn', `Top-level "${pi.searchProvider !== undefined ? 'searchProvider' : 'provider'}" is set; it overrides searchRouting and disables cross-provider fallback.`);
+  const field = pi.searchProvider !== undefined ? 'searchProvider' : 'provider';
+  // A list of providers (or "all") runs them concurrently and merges whatever succeeds (Promise.allSettled in
+  // pi-web-access 0.47.0 gemini-search.ts searchWithProviders): one failing provider does not fail the search.
+  if (top === 'all' || (Array.isArray(top) && top.length > 1)) {
+    add('info', `"${field}" runs ${top === 'all' ? 'every available provider' : top.join(' and ')} in parallel: results are merged, and if one fails the others' results are still returned.`);
+  } else if (top !== undefined && top !== 'auto') {
+    add('warn', `Top-level "${field}" is set; it overrides searchRouting and disables cross-provider fallback.`);
+  }
   const fallbackOn = pi.searchRouting?.fallbackOn;
   if (Array.isArray(fallbackOn)) {
     const missing = ['quota', 'transient'].filter((k) => !fallbackOn.includes(k));
