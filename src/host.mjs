@@ -67,7 +67,7 @@ export class BrokerHost {
    * @param newConfig     settings for a config this host creates on first start, e.g. { port } (tests)
    */
   constructor({
-    configPath = defaultConfigPath(), env = process.env, fetchImpl = fetch, now = () => Date.now(), store = null, logger = null,
+    env = process.env, configPath = defaultConfigPath(env), fetchImpl = fetch, now = () => Date.now(), store = null, logger = null,
     piConfigPath = null, newConfig = {}
   } = {}) {
     // getHost() reads these two on host objects from any module version, so they stay public.

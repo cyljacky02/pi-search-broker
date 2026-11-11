@@ -7,15 +7,15 @@ import { execSync } from 'node:child_process';
 
 /** Product name, reported as the gateway's /health service id. */
 export const SERVICE_NAME = 'pi-search-broker';
-/** Config folder name under ~/.config. */
+/** The broker's folder inside pi's agent dir: config.json, key files and saved state live there. */
 export const CONFIG_DIR_NAME = SERVICE_NAME;
-export const VERSION = '0.6.1';
+export const VERSION = '0.6.2';
 /** Environment variable that carries the local gateway token to pi-web-access ("exaApiKey": "$PI_SEARCH_BROKER_TOKEN"). */
 export const TOKEN_ENV = 'PI_SEARCH_BROKER_TOKEN';
 /** Optional override for the broker config path (used by the CLI default and the pi extension). */
 export const CONFIG_ENV = 'PI_SEARCH_BROKER_CONFIG';
-export const DEFAULT_DIR = join(homedir(), '.config', CONFIG_DIR_NAME);
-export const DEFAULT_CONFIG = join(DEFAULT_DIR, 'config.json');
+/** pi's own override for its agent dir (default ~/.pi/agent), which also holds web-search.json. */
+export const PI_AGENT_DIR_ENV = 'PI_CODING_AGENT_DIR';
 
 /** The Providers the broker can forward to. */
 export const PROVIDER_NAMES = Object.freeze(['exa', 'tavily']);
@@ -73,8 +73,10 @@ export function secretsOf(config) {
   return [config.gateway.token, ...config.accounts.flatMap((a) => [a.apiKey, a.adminKey].filter(Boolean))];
 }
 
+/** $PI_SEARCH_BROKER_CONFIG, else <pi agent dir>/pi-search-broker/config.json (pi's agent dir: ~/.pi/agent). */
 export function defaultConfigPath(env = process.env) {
-  return env[CONFIG_ENV] || DEFAULT_CONFIG;
+  if (env[CONFIG_ENV]) return env[CONFIG_ENV];
+  return join(env[PI_AGENT_DIR_ENV] || join(homedir(), '.pi', 'agent'), CONFIG_DIR_NAME, 'config.json');
 }
 
 function defaultRunCommand(command) {
